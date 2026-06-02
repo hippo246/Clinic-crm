@@ -2276,6 +2276,16 @@ export default function PatientProfile({ patient, auditEntries = [], onBack, onE
     }
   }
 
+  function handlePatientUpdate(updatedPatient) {
+    onEdit?.(updatedPatient);
+  }
+
+  function handleNavigateToPatient(patientId) {
+    // In a real app, this would navigate to the patient's profile
+    console.log("Navigate to patient:", patientId);
+    alert(`Navigating to patient ${patientId} (navigation would happen here)`);
+  }
+
   // Keyboard shortcuts
   useEffect(() => {
     function onKey(e) {
