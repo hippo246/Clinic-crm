@@ -130,6 +130,14 @@ function emptyForm() {
     allergies: "", conditions: [], medications: "",
     alerts: [],
     changeReason: "",
+    // New fields for enhanced functionality
+    initialFollowUpDate: "",
+    initialFollowUpReason: "Routine Check-up",
+    initialNote: "",
+    addFamilyMember: false,
+    familyMemberName: "",
+    familyMemberRelation: "Parent",
+    familyMemberPhone: "",
   };
 }
 
@@ -157,6 +165,14 @@ function patientToForm(p) {
     medications:       (p.medications  || []).join(", "),
     alerts:            p.alerts        || [],
     changeReason:      "",
+    // New fields for enhanced functionality
+    initialFollowUpDate: p.followUpDate || "",
+    initialFollowUpReason: p.followUpReason || "Routine Check-up",
+    initialNote: "",
+    addFamilyMember: false,
+    familyMemberName: "",
+    familyMemberRelation: "Parent",
+    familyMemberPhone: "",
   };
 }
 
@@ -307,11 +323,36 @@ export default function PatientForm({
       family:            isEdit ? patient.family     : [],
       lastVisit:         isEdit ? patient.lastVisit  : new Date().toISOString().split("T")[0],
       nextAppointment:   isEdit ? patient.nextAppointment : null,
-      followUpDate:      isEdit ? patient.followUpDate    : null,
-      followUpReason:    isEdit ? patient.followUpReason  : null,
-      followUpStaff:     isEdit ? patient.followUpStaff   : null,
-      followUpPriority:  isEdit ? patient.followUpPriority : null,
+      followUpDate:      isEdit ? patient.followUpDate    : (form.initialFollowUpDate || null),
+      followUpReason:    isEdit ? patient.followUpReason  : (form.initialFollowUpReason || null),
+      followUpStaff:     isEdit ? patient.followUpStaff   : (currentUser?.name || null),
+      followUpPriority:  isEdit ? patient.followUpPriority : "medium",
+      followUpStatus:    isEdit ? patient.followUpStatus   : "Pending",
     };
+
+    // Add initial note if provided (create mode only)
+    if (!isEdit && form.initialNote.trim()) {
+      patientData.notes = [{
+        id: `note-${Date.now()}`,
+        text: form.initialNote.trim(),
+        author: currentUser?.name || "Staff",
+        timestamp: new Date().toISOString(),
+        pinned: false,
+      }];
+    }
+
+    // Add family member if specified (create mode only)
+    if (!isEdit && form.addFamilyMember && form.familyMemberName.trim()) {
+      patientData.family = [{
+        id: `family-${Date.now()}`,
+        name: form.familyMemberName.trim(),
+        relation: form.familyMemberRelation,
+        patientId: null,
+        phone: form.familyMemberPhone.trim() || null,
+        email: null,
+        isEmergency: false,
+      }];
+    }
 
     // Build audit entries
     const auditEntries = isEdit
@@ -604,6 +645,64 @@ export default function PatientForm({
                     <SelectInput value={form.status} onChange={(v) => set("status", v)} options={STATUSES} />
                   </Field>
                 </Grid>
+
+                {!isEdit && (
+                  <>
+                    <SectionHeading>Initial Follow-Up</SectionHeading>
+                    <Grid>
+                      <Field label="Follow-Up Date">
+                        <input
+                          type="date"
+                          value={form.initialFollowUpDate}
+                          onChange={(e) => set("initialFollowUpDate", e.target.value)}
+                          style={{ width: "100%", padding: "8px 12px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--surface)", color: "var(--text)", fontSize: 13 }}
+                        />
+                      </Field>
+                      <Field label="Follow-Up Reason">
+                        <SelectInput
+                          value={form.initialFollowUpReason}
+                          onChange={(v) => set("initialFollowUpReason", v)}
+                          options={["Routine Check-up", "Post-Visit Follow-Up", "Lab Results Review", "Medication Review", "Symptom Check", "Vaccination Reminder", "Appointment Reminder", "Other"]}
+                        />
+                      </Field>
+                    </Grid>
+
+                    <SectionHeading>Initial Note</SectionHeading>
+                    <Field label="Add an initial note (optional)">
+                      <textarea
+                        value={form.initialNote}
+                        onChange={(e) => set("initialNote", e.target.value)}
+                        placeholder="Add any initial notes about this patient..."
+                        style={{ width: "100%", minHeight: 80, resize: "vertical", padding: "8px 12px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--surface)", color: "var(--text)", fontSize: 13 }}
+                      />
+                    </Field>
+
+                    <SectionHeading>Add Family Member (Optional)</SectionHeading>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                      <input
+                        type="checkbox"
+                        id="addFamily"
+                        checked={form.addFamilyMember}
+                        onChange={(e) => set("addFamilyMember", e.target.checked)}
+                        style={{ width: 16, height: 16 }}
+                      />
+                      <label htmlFor="addFamily" style={{ fontSize: 13 }}>Add a family member now</label>
+                    </div>
+                    {form.addFamilyMember && (
+                      <Grid>
+                        <Field label="Family Member Name">
+                          <TextInput value={form.familyMemberName} onChange={(v) => set("familyMemberName", v)} placeholder="Full name" />
+                        </Field>
+                        <Field label="Relation">
+                          <SelectInput value={form.familyMemberRelation} onChange={(v) => set("familyMemberRelation", v)} options={RELATIONS} />
+                        </Field>
+                        <Field label="Phone">
+                          <TextInput value={form.familyMemberPhone} onChange={(v) => set("familyMemberPhone", v)} placeholder="Contact number" mono />
+                        </Field>
+                      </Grid>
+                    )}
+                  </>
+                )}
 
                 {isEdit && (
                   <>

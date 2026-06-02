@@ -146,7 +146,7 @@ function MissingRequiredDocs({ docs }) {
   );
 }
 
-export default function PatientDocuments({ patient, role = "receptionist" }) {
+export default function PatientDocuments({ patient, role = "receptionist", onPatientUpdate }) {
   const [docs,        setDocs]        = useState(patient.documents || []);
   const [renaming,    setRenaming]    = useState(null); // doc object
   const [deleting,    setDeleting]    = useState(null); // doc object
@@ -170,6 +170,11 @@ export default function PatientDocuments({ patient, role = "receptionist" }) {
     return acc;
   }, {});
 
+  function persistDocs(updatedDocs) {
+    setDocs(updatedDocs);
+    onPatientUpdate?.({ ...patient, documents: updatedDocs });
+  }
+
   function handleUpload(e) {
     const files = Array.from(e.target.files);
     if (!files.length) return;
@@ -185,27 +190,32 @@ export default function PatientDocuments({ patient, role = "receptionist" }) {
         expiry:   null,
         fileName: f.name,
       }));
-      setDocs((prev) => [...newDocs, ...prev]);
+      const updatedDocs = [...newDocs, ...docs];
+      persistDocs(updatedDocs);
       setUploading(false);
     }, 800);
   }
 
   function handleRename(doc, newType) {
-    setDocs((prev) => prev.map((d) => d.id === doc.id ? { ...d, type: newType } : d));
+    const updatedDocs = docs.map((d) => d.id === doc.id ? { ...d, type: newType } : d);
+    persistDocs(updatedDocs);
     setRenaming(null);
   }
 
   function handleDelete(doc) {
-    setDocs((prev) => prev.filter((d) => d.id !== doc.id));
+    const updatedDocs = docs.filter((d) => d.id !== doc.id);
+    persistDocs(updatedDocs);
     setDeleting(null);
   }
 
   function toggleVerified(id) {
-    setDocs((prev) => prev.map((d) => d.id === id ? { ...d, verified: !d.verified } : d));
+    const updatedDocs = docs.map((d) => d.id === id ? { ...d, verified: !d.verified } : d);
+    persistDocs(updatedDocs);
   }
 
   function handleExpiryChange(id, val) {
-    setDocs((prev) => prev.map((d) => d.id === id ? { ...d, expiry: val } : d));
+    const updatedDocs = docs.map((d) => d.id === id ? { ...d, expiry: val } : d);
+    persistDocs(updatedDocs);
   }
 
   // Empty state

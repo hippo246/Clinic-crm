@@ -2719,18 +2719,18 @@ export default function PatientProfile({ patient, auditEntries = [], onBack, onE
 
           {/* Section content */}
           <div style={{ flex: 1, overflow: "auto", padding: 16 }}>
-            {activeSection === "timeline"  && <PatientTimeline   patient={patient} />}
+            {activeSection === "timeline"  && <PatientTimeline   patient={patient} onPatientUpdate={handlePatientUpdate} />}
             {activeSection === "snapshot"  && <HealthSnapshot     patient={patient} acknowledgedAlerts={acknowledgedAlerts} onAcknowledgeAlert={acknowledgeAlert} />}
             {activeSection === "journey"   && <PatientJourneyMap  patient={patient} />}
-            {activeSection === "documents" && <PatientDocuments  patient={patient} role={role} />}
+            {activeSection === "documents" && <PatientDocuments  patient={patient} role={role} onPatientUpdate={handlePatientUpdate} />}
             {activeSection === "notes"     && <PatientNotes notes={localNotes} onNotesChange={setLocalNotes} patient={patient} />}
-            {activeSection === "family"    && <FamilyLinks       patient={patient} />}
-            {activeSection === "followup"  && <FollowUpPanel     patient={patient} />}
-            {activeSection === "consent"   && <ConsentManager    patient={{ ...patient, consents }} role={role} onConsentsChange={setConsents} />}
-            {activeSection === "comms"     && <CommPrefsPanel    patient={{ ...patient, ...(commPrefs || {}) }} onChange={setCommPrefs} />}
+            {activeSection === "family"    && <FamilyLinks       patient={patient} onPatientUpdate={handlePatientUpdate} onNavigateToPatient={handleNavigateToPatient} />}
+            {activeSection === "followup"  && <FollowUpPanel     patient={patient} onPatientUpdate={handlePatientUpdate} />}
+            {activeSection === "consent"   && <ConsentManager    patient={{ ...patient, consents }} role={role} onConsentsChange={(c) => { setConsents(c); handlePatientUpdate({ ...patient, consents: c }); }} />}
+            {activeSection === "comms"     && <CommPrefsPanel    patient={{ ...patient, ...(commPrefs || {}) }} onChange={(p) => { setCommPrefs(p); handlePatientUpdate({ ...patient, ...p }); }} />}
             {activeSection === "readiness" && <VisitReadinessPanel patient={patient} verification={verification} />}
-            {activeSection === "guardian"  && <GuardianPanel     patient={{ ...patient, ...(guardianData || {}) }} onChange={setGuardianData} />}
-            {activeSection === "flags"     && <PatientFlagsPanel patient={{ ...patient, flags: patientFlags ?? patient.flags }} onChange={setPatientFlags} />}
+            {activeSection === "guardian"  && <GuardianPanel     patient={{ ...patient, ...(guardianData || {}) }} onChange={(g) => { setGuardianData(g); handlePatientUpdate({ ...patient, ...g }); }} />}
+            {activeSection === "flags"     && <PatientFlagsPanel patient={{ ...patient, flags: patientFlags ?? patient.flags }} onChange={(f) => { setPatientFlags(f); handlePatientUpdate({ ...patient, flags: f }); }} />}
             {activeSection === "heatmap"   && <ActivityHeatmap   patient={patient} />}
             {activeSection === "audit"     && (canViewAudit
               ? <AuditLog auditEntries={auditEntries} />
