@@ -49,6 +49,39 @@ export interface FamilyMember {
   patientId: string;
 }
 
+export interface Prescription {
+  id: string;
+  medicationName: string;
+  dosage: string;
+  frequency: string;
+  route: string;
+  duration: string;
+  instructions: string;
+  prescribedDate: string;
+  prescribedBy: string;
+  refillsTotal: number;
+  refillsUsed: number;
+  refillsRemaining: number;
+  status: "active" | "completed" | "discontinued";
+  refillHistory?: Array<{
+    date: string;
+    filledBy: string;
+  }>;
+}
+
+export interface LabResult {
+  id: string;
+  testName: string;
+  testType: string;
+  value: number;
+  unit: string;
+  referenceRange: string;
+  date: string;
+  performedBy: string;
+  status: "normal" | "abnormal" | "critical";
+  notes?: string;
+}
+
 export interface Patient {
   id: string;
   firstName: string;
@@ -62,25 +95,64 @@ export interface Patient {
   email: string;
   address: string;
   nationality: string;
+  maritalStatus?: string;
+  occupation?: string;
+  languages?: string;
+  religion?: string;
+  ethnicity?: string;
+  race?: string;
+  preferredLanguage?: string;
+  employmentStatus?: string;
+  educationLevel?: string;
+  livingArrangement?: string;
+  preferredPharmacy?: string;
+  referralSource?: string;
+  primaryCarePhysician?: string;
+  advanceDirectives?: string;
+  advanceCarePlanning?: string;
+  organDonor?: string;
+  bloodDonor?: string;
 
   // Emergency
   emergencyName: string;
   emergencyRelation: string;
   emergencyPhone: string;
+  emergencyContact2?: string;
+  emergencyRelation2?: string;
+  emergencyPhone2?: string;
 
   // Insurance
   insurer: string;
   policyNumber: string | null;
   insuranceExpiry: string | null;
   insuranceStatus: InsuranceStatus;
+  insuranceType?: string;
+  insuranceGroupNumber?: string;
+  insuranceMemberId?: string;
 
   // Medical
   allergies: string;
+  allergiesSeverity?: string;
+  allergiesReaction?: string;
   conditions: string[];
   medications: string[];
   alerts: AlertType[];
   alertsReviewed?: boolean;
   acknowledgedAlerts?: string[];
+  pastIllnesses?: string;
+  pastSurgeries?: string;
+  hospitalizations?: string;
+  familyHistory?: string;
+  socialHistory?: string;
+  smokingStatus?: string;
+  alcoholUse?: string;
+  drugUse?: string;
+  immunizationHistory?: string;
+  vaccinationStatus?: string;
+  dietaryRestrictions?: string;
+  exerciseFrequency?: string;
+  sleepHours?: string;
+  stressLevel?: string;
 
   // Status
   status: PatientStatus;
@@ -110,10 +182,13 @@ export interface Patient {
   documents: PatientDocument[];
   notes: PatientNote[];
   family: FamilyMember[];
+  prescriptions?: Prescription[];
+  labResults?: LabResult[];
 
   // Optional extras
   flags?: Record<string, boolean>;
   consents?: Record<string, boolean>;
+  tags?: string[];
   createdAt?: string;
   updatedAt?: string;
 }

@@ -195,14 +195,15 @@ export function applySmartSearch(patients: Patient[], query: string): Patient[] 
     }
   }
 
+  // Use fuzzy matching for better typo tolerance
   return patients.filter((p) =>
-    p.name.toLowerCase().includes(q) ||
-    p.phone?.includes(q) ||
-    p.id.toLowerCase().includes(q) ||
-    p.doctor?.toLowerCase().includes(q) ||
-    (p.policyNumber && p.policyNumber.toLowerCase().includes(q)) ||
-    p.email?.toLowerCase().includes(q) ||
-    p.bloodGroup?.toLowerCase().includes(q)
+    fuzzyMatch(p.name, q) ||
+    fuzzyMatch(p.phone || "", q) ||
+    fuzzyMatch(p.id, q) ||
+    fuzzyMatch(p.doctor || "", q) ||
+    fuzzyMatch(p.policyNumber || "", q) ||
+    fuzzyMatch(p.email || "", q) ||
+    fuzzyMatch(p.bloodGroup || "", q)
   );
 }
 
@@ -309,33 +310,190 @@ export function detectDuplicates(patients: Patient[]): DuplicateGroup[] {
   return duplicates;
 }
 
-// ─── localStorage persistence ──────────────────────────────────────────────────
+// ─── LocalStorage-based persistence (Frontend-only mode) ───────────────────────
 const STORAGE_KEY = "clinic_crm_patients_v1";
 const AUDIT_KEY   = "clinic_crm_audit_v1";
 
-export function savePatients(patients: Patient[]): void {
+export async function savePatients(patients: Patient[]): Promise<void> {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(patients));
-  } catch { /* storage full — silently ignore */ }
-}
-
-export function loadPatients(): Patient[] | null {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw) as Patient[];
-  } catch {
-    return null;
+  } catch (error) {
+    console.error("Failed to save patients to localStorage:", error);
   }
 }
 
-export function saveAuditMap(map: Record<string, AuditEntry[]>): void {
+export async function loadPatients(): Promise<Patient[]> {
   try {
-    localStorage.setItem(AUDIT_KEY, JSON.stringify(map));
-  } catch { /* ignore */ }
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return [];
+    return JSON.parse(raw) as Patient[];
+  } catch (error) {
+    console.error("Failed to load patients from localStorage:", error);
+    return [];
+  }
 }
 
-export function loadAuditMap(): Record<string, AuditEntry[]> {
+export async function saveAuditMap(map: Record<string, AuditEntry[]>): Promise<void> {
+  try {
+    localStorage.setItem(AUDIT_KEY, JSON.stringify(map));
+  } catch (error) {
+    console.error("Failed to save audit map to localStorage:", error);
+  }
+}
+
+export async function loadAuditMap(): Promise<Record<string, AuditEntry[]>> {
+  try {
+    const raw = localStorage.getItem(AUDIT_KEY);
+    if (!raw) return {};
+    return JSON.parse(raw) as Record<string, AuditEntry[]>;
+  } catch (error) {
+    console.error("Failed to load audit map from localStorage:", error);
+    return {};
+  }
+}
+
+// ─── CSV Export ─────────────────────────────────────────────────────────────────
+export function exportToCSV<T extends Record<string, any>>(
+  data: T[],
+  filename: string,
+  columns?: { key: keyof T; label: string }[]
+): void {
+  if (data.length === 0) {
+    console.warn("No data to export");
+    return;
+  }
+
+  const headers = columns || Object.keys(data[0]).map(key => ({ key, label: String(key) }));
+  const csvHeaders = headers.map(h => h.label).join(",");
+  
+  const csvRows = data.map(row => 
+    headers.map(h => {
+      const value = row[h.key];
+      // Handle nested objects, arrays, and special characters
+      if (value === null || value === undefined) return "";
+      if (typeof value === "object") return JSON.stringify(value).replace(/"/g, '""');
+      return String(value).replace(/"/g, '""');
+    }).join(",")
+  );
+
+  const csvContent = [csvHeaders, ...csvRows].join("\n");
+  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+  const link = document.createElement("a");
+  const url = URL.createObjectURL(blob);
+  
+  link.setAttribute("href", url);
+  link.setAttribute("download", `${filename}.csv`);
+  link.style.visibility = "hidden";
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+export function exportPatientsToCSV(patients: Patient[]): void {
+  const columns = [
+    { key: "id" as keyof Patient, label: "Patient ID" },
+    { key: "name" as keyof Patient, label: "Name" },
+    { key: "phone" as keyof Patient, label: "Phone" },
+    { key: "email" as keyof Patient, label: "Email" },
+    { key: "dob" as keyof Patient, label: "Date of Birth" },
+    { key: "age" as keyof Patient, label: "Age" },
+    { key: "gender" as keyof Patient, label: "Gender" },
+    { key: "bloodGroup" as keyof Patient, label: "Blood Group" },
+    { key: "address" as keyof Patient, label: "Address" },
+    { key: "doctor" as keyof Patient, label: "Assigned Doctor" },
+    { key: "status" as keyof Patient, label: "Status" },
+    { key: "insurer" as keyof Patient, label: "Insurance Provider" },
+    { key: "insuranceStatus" as keyof Patient, label: "Insurance Status" },
+    { key: "insuranceExpiry" as keyof Patient, label: "Insurance Expiry" },
+    { key: "lastVisit" as keyof Patient, label: "Last Visit" },
+    { key: "nextAppointment" as keyof Patient, label: "Next Appointment" },
+    { key: "alerts" as keyof Patient, label: "Medical Alerts" },
+    { key: "conditions" as keyof Patient, label: "Conditions" },
+    { key: "medications" as keyof Patient, label: "Medications" },
+  ];
+  
+  const timestamp = new Date().toISOString().split("T")[0];
+  exportToCSV(patients, `patients_export_${timestamp}`, columns);
+}
+
+export function exportReportsToCSV(patients: Patient[]): void {
+  const reportData = patients.map(p => ({
+    "Patient ID": p.id,
+    "Patient Name": p.name,
+    "Status": p.status,
+    "Doctor": p.doctor,
+    "Age": p.age,
+    "Gender": p.gender,
+    "Insurance": p.insurer,
+    "Insurance Status": p.insuranceStatus,
+    "Insurance Expiry": p.insuranceExpiry,
+    "Last Visit": p.lastVisit,
+    "Next Appointment": p.nextAppointment,
+    "Follow-Up Date": p.followUpDate,
+    "Follow-Up Status": p.followUpStatus,
+    "Alerts": p.alerts?.join(", ") || "",
+    "Conditions": p.conditions?.join(", ") || "",
+    "Phone Verified": p.phoneVerified ? "Yes" : "No",
+    "ID Verified": p.idVerified ? "Yes" : "No",
+    "Consent Signed": p.consentSigned ? "Yes" : "No",
+    "Created At": p.createdAt,
+  }));
+  
+  const timestamp = new Date().toISOString().split("T")[0];
+  exportToCSV(reportData, `clinic_report_${timestamp}`);
+}
+
+// ─── Fuzzy Search with Highlighting ───────────────────────────────────────────────
+export function getHighlightParts(text: string, query: string): Array<{ text: string; highlight: boolean }> {
+  if (!query || !text) return [{ text, highlight: false }];
+  
+  const regex = new RegExp(`(${query.split('').join('.*?')})`, 'gi');
+  const parts: Array<{ text: string; highlight: boolean }> = [];
+  let lastIndex = 0;
+  let match;
+  
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push({ text: text.slice(lastIndex, match.index), highlight: false });
+    }
+    parts.push({ text: match[0], highlight: true });
+    lastIndex = regex.lastIndex;
+  }
+  
+  if (lastIndex < text.length) {
+    parts.push({ text: text.slice(lastIndex), highlight: false });
+  }
+  
+  return parts.length > 0 ? parts : [{ text, highlight: false }];
+}
+
+export function fuzzyMatch(text: string, query: string): boolean {
+  if (!query) return true;
+  if (!text) return false;
+  
+  const textLower = text.toLowerCase();
+  const queryLower = query.toLowerCase();
+  
+  // Exact match
+  if (textLower.includes(queryLower)) return true;
+  
+  // Fuzzy match - allows for typos and partial matches
+  let textIndex = 0;
+  let queryIndex = 0;
+  
+  while (textIndex < textLower.length && queryIndex < queryLower.length) {
+    if (textLower[textIndex] === queryLower[queryIndex]) {
+      queryIndex++;
+    }
+    textIndex++;
+  }
+  
+  // If we matched most of the query characters, consider it a match
+  return queryIndex >= queryLower.length * 0.7;
+}
+
+function loadAuditMapFromLocalStorage(): Record<string, AuditEntry[]> {
   try {
     const raw = localStorage.getItem(AUDIT_KEY);
     if (!raw) return {};

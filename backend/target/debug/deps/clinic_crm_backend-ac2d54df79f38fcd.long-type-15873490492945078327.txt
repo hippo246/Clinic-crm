@@ -1,0 +1,1 @@
+AppError: std::convert::From<deadpool::managed::errors::PoolError<deadpool_postgres::tokio_postgres::Error>>

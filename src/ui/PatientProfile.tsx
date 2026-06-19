@@ -1,5 +1,5 @@
-import React, { useState, useCallback } from "react";
-import type { Patient, AuditEntry, UserRole, TimelineEvent, PatientNote, PatientDocument } from "./types";
+import React, { useState, useCallback, useMemo } from "react";
+import type { Patient, AuditEntry, UserRole, TimelineEvent, PatientNote, PatientDocument, Prescription, LabResult } from "./types";
 import {
   fmtDate, getAvatarColor, getInitials, calcRiskScore,
   calcVisitReadiness, calcNextBestAction, buildSmartSnapshot,
@@ -11,11 +11,21 @@ import {
   RiskBadge, AvatarCircle, VerifiedDot, ConsentBadge,
 } from "./Badges";
 import { can } from "./constants";
+import { AppointmentBooking } from "./components/AppointmentBooking";
+import { ConsultationWorkflow } from "./components/ConsultationWorkflow";
+import { PrescriptionManager } from "./components/PrescriptionManager";
+import { FileUpload } from "./components/FileUpload";
+import { InvoiceGenerator } from "./components/InvoiceGenerator";
+import { PatientCommunication } from "./components/PatientCommunication";
+import { FollowUpScheduler } from "./components/FollowUpScheduler";
+import { ConsentManager } from "./components/ConsentManager";
 
 // ─── Tabs ─────────────────────────────────────────────────────────────────────
 const PROFILE_TABS = [
   { id: "overview",  label: "Overview",   icon: "ti-layout-dashboard" },
   { id: "timeline",  label: "Timeline",   icon: "ti-timeline" },
+  { id: "prescriptions", label: "Prescriptions", icon: "ti-pill" },
+  { id: "labresults", label: "Lab Results", icon: "ti-test-tube" },
   { id: "documents", label: "Documents",  icon: "ti-files" },
   { id: "notes",     label: "Notes",      icon: "ti-notes" },
   { id: "followup",  label: "Follow-Up",  icon: "ti-phone" },
@@ -49,6 +59,16 @@ export default function PatientProfile({
   const [showEmergency,setShowEmergency] = useState(false);
   const [showDelete,   setShowDelete]   = useState(false);
   const [quickAction,  setQuickAction]  = useState<string | null>(null);
+  
+  // Medical workflow modals
+  const [showAppointment, setShowAppointment] = useState(false);
+  const [showConsultation, setShowConsultation] = useState(false);
+  const [showPrescription, setShowPrescription] = useState(false);
+  const [showFileUpload, setShowFileUpload] = useState(false);
+  const [showInvoice, setShowInvoice] = useState(false);
+  const [showCommunication, setShowCommunication] = useState(false);
+  const [showFollowUp, setShowFollowUp] = useState(false);
+  const [showConsent, setShowConsent] = useState(false);
 
   const nba  = calcNextBestAction(patient);
   const risk = calcRiskScore(patient);
@@ -125,6 +145,170 @@ export default function PatientProfile({
   function handleUpdateFollowUp(updates: Partial<Patient>) {
     onUpdatePatient({ ...patient, ...updates }, "follow-up updated");
   }
+
+  // Medical workflow handlers
+  const handleBookAppointment = async (appointment: any) => {
+    try {
+      const { apiClient } = await import('./api');
+      await apiClient.bookAppointment(appointment);
+      setShowAppointment(false);
+      handleAddTimelineEvent({
+        type: 'appointment',
+        label: 'Appointment Booked',
+        icon: 'ti-calendar',
+        color: '#7c4fff',
+        date: new Date().toISOString(),
+        note: `Appointment scheduled for ${appointment.appointment_date}`
+      });
+    } catch (error) {
+      console.error('Failed to book appointment:', error);
+    }
+  };
+
+  const handleStartConsultation = async (consultation: any) => {
+    try {
+      const { apiClient } = await import('./api');
+      await apiClient.startConsultation(consultation);
+      setShowConsultation(false);
+      handleAddTimelineEvent({
+        type: 'consultation',
+        label: 'Consultation Started',
+        icon: 'ti-stethoscope',
+        color: '#00b4a0',
+        date: new Date().toISOString(),
+        note: consultation.chief_complaint
+      });
+    } catch (error) {
+      console.error('Failed to start consultation:', error);
+    }
+  };
+
+  const handleSavePrescriptions = async (prescriptions: any[]) => {
+    try {
+      const { apiClient } = await import('./api');
+      await apiClient.createPrescriptions(prescriptions);
+      setShowPrescription(false);
+      handleAddTimelineEvent({
+        type: 'prescription',
+        label: 'Prescriptions Issued',
+        icon: 'ti-pill',
+        color: '#ff7c4f',
+        date: new Date().toISOString(),
+        note: `${prescriptions.length} medications prescribed`
+      });
+    } catch (error) {
+      console.error('Failed to save prescriptions:', error);
+    }
+  };
+
+  const handleUploadFiles = async (files: File[]) => {
+    try {
+      const { apiClient } = await import('./api');
+      await apiClient.uploadFiles(files, { patient_id: patient.id });
+      setShowFileUpload(false);
+      handleAddTimelineEvent({
+        type: 'report',
+        label: 'Documents Uploaded',
+        icon: 'ti-file-analytics',
+        color: '#4f7cff',
+        date: new Date().toISOString(),
+        note: `${files.length} files uploaded`
+      });
+    } catch (error) {
+      console.error('Failed to upload files:', error);
+    }
+  };
+
+  const handleCreateInvoice = async (invoice: any) => {
+    try {
+      const { apiClient } = await import('./api');
+      await apiClient.createInvoice(invoice);
+      setShowInvoice(false);
+      handleAddTimelineEvent({
+        type: 'note',
+        label: 'Invoice Created',
+        icon: 'ti-receipt',
+        color: '#10b981',
+        date: new Date().toISOString(),
+        note: `Invoice ${invoice.invoice_number} created`
+      });
+    } catch (error) {
+      console.error('Failed to create invoice:', error);
+    }
+  };
+
+  const handleCallPatient = (patientId: string) => {
+    console.log('Calling patient:', patientId);
+    setShowCommunication(false);
+    handleAddTimelineEvent({
+      type: 'note',
+      label: 'Patient Called',
+      icon: 'ti-phone',
+      color: '#7c4fff',
+      date: new Date().toISOString(),
+      note: 'Phone call initiated'
+    });
+  };
+
+  const handleSendMessage = async (message: any) => {
+    try {
+      const { apiClient } = await import('./api');
+      await apiClient.sendCommunication(message);
+      setShowCommunication(false);
+      handleAddTimelineEvent({
+        type: 'note',
+        label: 'Message Sent',
+        icon: 'ti-message',
+        color: '#7c4fff',
+        date: new Date().toISOString(),
+        note: `${message.message_type} message sent to patient`
+      });
+    } catch (error) {
+      console.error('Failed to send message:', error);
+    }
+  };
+
+  const handleScheduleFollowUp = async (followUp: any) => {
+    try {
+      const { apiClient } = await import('./api');
+      await apiClient.scheduleFollowUp(followUp);
+      setShowFollowUp(false);
+      handleUpdateFollowUp({
+        followUpDate: followUp.follow_up_date,
+        followUpReason: followUp.reason
+      });
+      handleAddTimelineEvent({
+        type: 'followup',
+        label: 'Follow-Up Scheduled',
+        icon: 'ti-clock',
+        color: '#f0a500',
+        date: new Date().toISOString(),
+        note: `Follow-up scheduled for ${followUp.follow_up_date}`
+      });
+    } catch (error) {
+      console.error('Failed to schedule follow-up:', error);
+    }
+  };
+
+  const handleSignConsent = async (consent: any) => {
+    try {
+      const { apiClient } = await import('./api');
+      await apiClient.createConsent(consent);
+      setShowConsent(false);
+      handleAddTimelineEvent({
+        type: 'note',
+        label: 'Consent Signed',
+        icon: 'ti-writing',
+        color: '#10b981',
+        date: new Date().toISOString(),
+        note: `${consent.consent_type} consent signed`
+      });
+      // Update patient consent status
+      handleToggleConsent(consent.consent_type);
+    } catch (error) {
+      console.error('Failed to sign consent:', error);
+    }
+  };
 
   const tabCounts: Partial<Record<TabId, number>> = {
     timeline:  (patient.timeline  || []).length,
@@ -304,12 +488,30 @@ export default function PatientProfile({
       {/* ── Tab Content ── */}
       <div style={{ flex: 1, overflow: "auto", background: "var(--bg)" }}>
         <div className="fade-in" key={tab} style={{ padding: 16 }}>
-          {tab === "overview"  && <OverviewTab patient={patient} role={role} onVerificationToggle={handleVerificationToggle} snapshot={snapshot} readiness={readiness} onQuickAction={setQuickAction} />}
+          {tab === "overview"  && (
+            <OverviewTab 
+              patient={patient} 
+              role={role} 
+              onVerificationToggle={handleVerificationToggle} 
+              snapshot={snapshot} 
+              readiness={readiness} 
+              onQuickAction={setQuickAction}
+              onBookAppointment={() => setShowAppointment(true)}
+              onStartConsultation={() => setShowConsultation(true)}
+              onPrescription={() => setShowPrescription(true)}
+              onFileUpload={() => setShowFileUpload(true)}
+              onInvoice={() => setShowInvoice(true)}
+              onCommunication={() => setShowCommunication(true)}
+              onFollowUp={() => setShowFollowUp(true)}
+            />
+          )}
           {tab === "timeline"  && <TimelineTab patient={patient} role={role} onAddEvent={handleAddTimelineEvent} onDeleteEvent={handleDeleteTimelineEvent} />}
-          {tab === "documents" && <DocumentsTab patient={patient} role={role} onAddDoc={handleAddDocument} onDeleteDoc={handleDeleteDocument} />}
+          {tab === "prescriptions" && <PrescriptionHistoryTab patient={patient} role={role} onUpdatePatient={onUpdatePatient} onAddPrescription={() => setShowPrescription(true)} />}
+          {tab === "labresults" && <LabResultsTab patient={patient} role={role} onAddLabResult={() => alert("Lab result modal would open here. For now, please use the Documents tab to upload lab result files.")} />}
+          {tab === "documents" && <DocumentsTab patient={patient} role={role} onAddDoc={handleAddDocument} onDeleteDoc={handleDeleteDocument} onUploadFiles={() => setShowFileUpload(true)} />}
           {tab === "notes"     && <NotesTab patient={patient} role={role} onAddNote={handleAddNote} onDeleteNote={handleDeleteNote} onTogglePin={handleToggleNotePin} />}
-          {tab === "followup"  && <FollowUpTab patient={patient} onUpdate={handleUpdateFollowUp} />}
-          {tab === "consents"  && <ConsentsTab patient={patient} onToggle={handleToggleConsent} />}
+          {tab === "followup"  && <FollowUpTab patient={patient} onUpdate={handleUpdateFollowUp} onScheduleFollowUp={() => setShowFollowUp(true)} />}
+          {tab === "consents"  && <ConsentsTab patient={patient} onToggle={handleToggleConsent} onSignNewConsent={() => setShowConsent(true)} />}
           {tab === "audit"     && <AuditTab entries={auditEntries} />}
         </div>
       </div>
@@ -326,13 +528,84 @@ export default function PatientProfile({
       {quickAction && (
         <QuickActionModal action={quickAction} patient={patient} onClose={() => setQuickAction(null)} />
       )}
+      
+      {/* Medical Workflow Modals */}
+      {showAppointment && (
+        <AppointmentBooking
+          patientId={patient.id}
+          patientName={patient.name}
+          onBookAppointment={handleBookAppointment}
+          onCancel={() => setShowAppointment(false)}
+        />
+      )}
+      {showConsultation && (
+        <ConsultationWorkflow
+          patientId={patient.id}
+          patientName={patient.name}
+          onStartConsultation={handleStartConsultation}
+          onCancel={() => setShowConsultation(false)}
+        />
+      )}
+      {showPrescription && (
+        <PrescriptionManager
+          patientId={patient.id}
+          patientName={patient.name}
+          onSavePrescriptions={handleSavePrescriptions}
+          onCancel={() => setShowPrescription(false)}
+        />
+      )}
+      {showFileUpload && (
+        <FileUpload
+          patientId={patient.id}
+          patientName={patient.name}
+          onUploadFiles={handleUploadFiles}
+          onCancel={() => setShowFileUpload(false)}
+        />
+      )}
+      {showInvoice && (
+        <InvoiceGenerator
+          patientId={patient.id}
+          patientName={patient.name}
+          onCreateInvoice={handleCreateInvoice}
+          onCancel={() => setShowInvoice(false)}
+        />
+      )}
+      {showCommunication && (
+        <PatientCommunication
+          patientId={patient.id}
+          patientName={patient.name}
+          patientPhone={patient.phone}
+          patientEmail={patient.email}
+          onCallPatient={handleCallPatient}
+          onSendMessage={handleSendMessage}
+          onCancel={() => setShowCommunication(false)}
+        />
+      )}
+      {showFollowUp && (
+        <FollowUpScheduler
+          patientId={patient.id}
+          patientName={patient.name}
+          onScheduleFollowUp={handleScheduleFollowUp}
+          onCancel={() => setShowFollowUp(false)}
+        />
+      )}
+      {showConsent && (
+        <ConsentManager
+          patientId={patient.id}
+          patientName={patient.name}
+          onSignConsent={handleSignConsent}
+          onCancel={() => setShowConsent(false)}
+        />
+      )}
     </div>
   );
 }
 
 // ─── Overview Tab ─────────────────────────────────────────────────────────────
 function OverviewTab({
-  patient, role, onVerificationToggle, snapshot, readiness, onQuickAction
+  patient, role, onVerificationToggle, snapshot, readiness, onQuickAction,
+  onBookAppointment, onStartConsultation, onPrescription, onFileUpload,
+  onInvoice, onCommunication, onFollowUp
 }: {
   patient: Patient;
   role: UserRole;
@@ -340,24 +613,31 @@ function OverviewTab({
   snapshot: string;
   readiness: ReturnType<typeof calcVisitReadiness>;
   onQuickAction: (a: string) => void;
+  onBookAppointment?: () => void;
+  onStartConsultation?: () => void;
+  onPrescription?: () => void;
+  onFileUpload?: () => void;
+  onInvoice?: () => void;
+  onCommunication?: () => void;
+  onFollowUp?: () => void;
 }) {
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "1fr 340px", gap: 16, alignItems: "start" }}>
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 340px", gap: 24, alignItems: "start" }}>
       {/* Main col */}
-      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
 
         {/* Snapshot */}
         <div className="card card-padded" style={{
           background: "linear-gradient(135deg, var(--accent-soft) 0%, var(--surface) 100%)",
           border: "1px solid var(--accent)30",
         }}>
-          <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
             <i className="ti ti-sparkles" style={{ fontSize: 16, color: "var(--accent)", flexShrink: 0, marginTop: 1 }} />
             <div>
-              <div style={{ fontSize: "var(--font-xs)", fontWeight: 700, color: "var(--accent)", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 4 }}>
+              <div style={{ fontSize: "var(--font-xs)", fontWeight: 700, color: "var(--accent)", textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: 6 }}>
                 AI Snapshot
               </div>
-              <p style={{ fontSize: "var(--font-sm)", color: "var(--text)", lineHeight: 1.6 }}>
+              <p style={{ fontSize: "var(--font-sm)", color: "var(--text)", lineHeight: 1.7 }}>
                 {snapshot}
               </p>
             </div>
@@ -427,57 +707,177 @@ function OverviewTab({
 
         {/* Quick Actions */}
         <InfoCard title="Quick Actions" icon="ti-bolt" iconBg="var(--purple-bg)" iconColor="var(--purple)">
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
-            {QUICK_ACTIONS.map((a) => (
-              <button key={a.label} onClick={() => onQuickAction(a.label)} style={{
-                display: "flex", flexDirection: "column", alignItems: "center", gap: 6,
-                padding: "12px 8px", borderRadius: "var(--radius)", border: "1px solid var(--border)",
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+            {onBookAppointment && (
+              <button onClick={onBookAppointment} style={{
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
+                padding: "16px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)",
                 background: "var(--surface2)", cursor: "pointer", transition: "all 0.15s",
               }}
               onMouseOver={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface3)"; }}
               onMouseOut={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface2)"; }}
               >
                 <div style={{
-                  width: 32, height: 32, borderRadius: "var(--radius)",
-                  background: a.color + "15", display: "flex", alignItems: "center", justifyContent: "center",
+                  width: 36, height: 36, borderRadius: "var(--radius)",
+                  background: "#2563eb15", display: "flex", alignItems: "center", justifyContent: "center",
                 }}>
-                  <i className={`ti ${a.icon}`} style={{ fontSize: 16, color: a.color }} />
+                  <i className="ti ti-calendar" style={{ fontSize: 18, color: "#2563eb" }} />
                 </div>
-                <span style={{ fontSize: "var(--font-2xs)", fontWeight: 500, color: "var(--muted)", textAlign: "center", lineHeight: 1.3 }}>
-                  {a.label}
+                <span style={{ fontSize: "var(--font-2xs)", fontWeight: 500, color: "var(--muted)", textAlign: "center", lineHeight: 1.4 }}>
+                  Book Appointment
                 </span>
               </button>
-            ))}
+            )}
+            {onStartConsultation && (
+              <button onClick={onStartConsultation} style={{
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
+                padding: "16px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)",
+                background: "var(--surface2)", cursor: "pointer", transition: "all 0.15s",
+              }}
+              onMouseOver={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface3)"; }}
+              onMouseOut={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface2)"; }}
+              >
+                <div style={{
+                  width: 36, height: 36, borderRadius: "var(--radius)",
+                  background: "#10b98115", display: "flex", alignItems: "center", justifyContent: "center",
+                }}>
+                  <i className="ti ti-stethoscope" style={{ fontSize: 18, color: "#10b981" }} />
+                </div>
+                <span style={{ fontSize: "var(--font-2xs)", fontWeight: 500, color: "var(--muted)", textAlign: "center", lineHeight: 1.4 }}>
+                  Start Consultation
+                </span>
+              </button>
+            )}
+            {onPrescription && (
+              <button onClick={onPrescription} style={{
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
+                padding: "16px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)",
+                background: "var(--surface2)", cursor: "pointer", transition: "all 0.15s",
+              }}
+              onMouseOver={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface3)"; }}
+              onMouseOut={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface2)"; }}
+              >
+                <div style={{
+                  width: 36, height: 36, borderRadius: "var(--radius)",
+                  background: "#f59e0b15", display: "flex", alignItems: "center", justifyContent: "center",
+                }}>
+                  <i className="ti ti-pill" style={{ fontSize: 18, color: "#f59e0b" }} />
+                </div>
+                <span style={{ fontSize: "var(--font-2xs)", fontWeight: 500, color: "var(--muted)", textAlign: "center", lineHeight: 1.4 }}>
+                  New Prescription
+                </span>
+              </button>
+            )}
+            {onFileUpload && (
+              <button onClick={onFileUpload} style={{
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
+                padding: "16px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)",
+                background: "var(--surface2)", cursor: "pointer", transition: "all 0.15s",
+              }}
+              onMouseOver={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface3)"; }}
+              onMouseOut={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface2)"; }}
+              >
+                <div style={{
+                  width: 36, height: 36, borderRadius: "var(--radius)",
+                  background: "#8b5cf615", display: "flex", alignItems: "center", justifyContent: "center",
+                }}>
+                  <i className="ti ti-upload" style={{ fontSize: 18, color: "#8b5cf6" }} />
+                </div>
+                <span style={{ fontSize: "var(--font-2xs)", fontWeight: 500, color: "var(--muted)", textAlign: "center", lineHeight: 1.4 }}>
+                  Upload Report
+                </span>
+              </button>
+            )}
+            {onInvoice && (
+              <button onClick={onInvoice} style={{
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
+                padding: "16px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)",
+                background: "var(--surface2)", cursor: "pointer", transition: "all 0.15s",
+              }}
+              onMouseOver={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface3)"; }}
+              onMouseOut={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface2)"; }}
+              >
+                <div style={{
+                  width: 36, height: 36, borderRadius: "var(--radius)",
+                  background: "#ef444415", display: "flex", alignItems: "center", justifyContent: "center",
+                }}>
+                  <i className="ti ti-receipt" style={{ fontSize: 18, color: "#ef4444" }} />
+                </div>
+                <span style={{ fontSize: "var(--font-2xs)", fontWeight: 500, color: "var(--muted)", textAlign: "center", lineHeight: 1.4 }}>
+                  Create Invoice
+                </span>
+              </button>
+            )}
+            {onCommunication && (
+              <button onClick={onCommunication} style={{
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
+                padding: "16px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)",
+                background: "var(--surface2)", cursor: "pointer", transition: "all 0.15s",
+              }}
+              onMouseOver={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface3)"; }}
+              onMouseOut={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface2)"; }}
+              >
+                <div style={{
+                  width: 36, height: 36, borderRadius: "var(--radius)",
+                  background: "#06b6d415", display: "flex", alignItems: "center", justifyContent: "center",
+                }}>
+                  <i className="ti ti-phone" style={{ fontSize: 18, color: "#06b6d4" }} />
+                </div>
+                <span style={{ fontSize: "var(--font-2xs)", fontWeight: 500, color: "var(--muted)", textAlign: "center", lineHeight: 1.4 }}>
+                  Call/Message
+                </span>
+              </button>
+            )}
+            {onFollowUp && (
+              <button onClick={onFollowUp} style={{
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
+                padding: "16px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)",
+                background: "var(--surface2)", cursor: "pointer", transition: "all 0.15s",
+              }}
+              onMouseOver={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface3)"; }}
+              onMouseOut={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface2)"; }}
+              >
+                <div style={{
+                  width: 36, height: 36, borderRadius: "var(--radius)",
+                  background: "#ec489915", display: "flex", alignItems: "center", justifyContent: "center",
+                }}>
+                  <i className="ti ti-calendar-time" style={{ fontSize: 18, color: "#ec4899" }} />
+                </div>
+                <span style={{ fontSize: "var(--font-2xs)", fontWeight: 500, color: "var(--muted)", textAlign: "center", lineHeight: 1.4 }}>
+                  Schedule Follow-up
+                </span>
+              </button>
+            )}
           </div>
         </InfoCard>
       </div>
 
       {/* Side col */}
-      <div style={{ display: "flex", flexDirection: "column", gap: 12, position: "sticky", top: 0 }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 16, position: "sticky", top: 0 }}>
 
         {/* Visit Readiness */}
         <div className="card card-padded">
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
             <span style={{ fontSize: "var(--font-sm)", fontWeight: 700 }}>Visit Readiness</span>
             <span style={{
               fontSize: "var(--font-xs)", fontWeight: 700,
               color: readiness.ready ? "var(--green)" : "var(--amber)",
               background: readiness.ready ? "var(--green-bg)" : "var(--amber-bg)",
-              padding: "2px 6px", borderRadius: "var(--radius-sm)",
+              padding: "4px 8px", borderRadius: "var(--radius-sm)",
             }}>
               {readiness.done}/{readiness.total}
             </span>
           </div>
-          <div className="progress-bar" style={{ marginBottom: 10 }}>
+          <div className="progress-bar" style={{ marginBottom: 12 }}>
             <div className="progress-fill" style={{
               width: `${(readiness.done / readiness.total) * 100}%`,
               background: readiness.ready ? "var(--green)" : "var(--amber)",
             }} />
           </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             {readiness.items.map((item) => (
               <button key={item.key} onClick={() => onVerificationToggle(item.key)} style={{
-                display: "flex", alignItems: "center", gap: 8, padding: "6px 8px",
+                display: "flex", alignItems: "center", gap: 10, padding: "8px 12px",
                 borderRadius: "var(--radius-sm)", border: `1px solid ${item.done ? "var(--green-border)" : "var(--red-border)"}`,
                 background: item.done ? "var(--green-bg)" : "transparent",
                 cursor: "pointer", textAlign: "left", transition: "all 0.15s",
@@ -494,7 +894,7 @@ function OverviewTab({
         {/* Appointments */}
         <div className="card card-padded">
           <div className="section-label">Appointments</div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <span style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>Last Visit</span>
               <span style={{ fontSize: "var(--font-sm)", fontWeight: 600 }}>{fmtDate(patient.lastVisit)}</span>
@@ -522,9 +922,9 @@ function OverviewTab({
         {(patient.family || []).length > 0 && (
           <div className="card card-padded">
             <div className="section-label">Family Members</div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               {(patient.family || []).map((f) => (
-                <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 8px", borderRadius: "var(--radius-sm)", background: "var(--surface2)" }}>
+                <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderRadius: "var(--radius-sm)", background: "var(--surface2)" }}>
                   <AvatarCircle name={f.name} size="sm" />
                   <div>
                     <div style={{ fontSize: "var(--font-sm)", fontWeight: 600 }}>{f.name}</div>
@@ -572,10 +972,28 @@ function TimelineTab({
 }) {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ type: "note", label: "Doctor Note Added", icon: "ti-notes", color: "#7c4fff", note: "", date: new Date().toISOString().split("T")[0], doctor: "" });
+  const [filterType, setFilterType] = useState("All");
+  const [filterDoctor, setFilterDoctor] = useState("All");
+  const [dateRangeFrom, setDateRangeFrom] = useState("");
+  const [dateRangeTo, setDateRangeTo] = useState("");
 
-  const events = [...(patient.timeline || [])].sort(
+  const allEvents = [...(patient.timeline || [])].sort(
     (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
   );
+
+  const filteredEvents = allEvents.filter((ev) => {
+    if (filterType !== "All" && ev.type !== filterType) return false;
+    if (filterDoctor !== "All" && ev.doctor !== filterDoctor) return false;
+    if (dateRangeFrom && new Date(ev.date) < new Date(dateRangeFrom)) return false;
+    if (dateRangeTo && new Date(ev.date) > new Date(dateRangeTo)) return false;
+    return true;
+  });
+
+  const allDoctors = useMemo(() => {
+    const doctors = new Set<string>();
+    allEvents.forEach(ev => { if (ev.doctor) doctors.add(ev.doctor); });
+    return Array.from(doctors).sort();
+  }, [allEvents]);
 
   function submit() {
     onAddEvent({ ...form, date: new Date(form.date) });
@@ -583,16 +1001,57 @@ function TimelineTab({
     setForm({ type: "note", label: "Doctor Note Added", icon: "ti-notes", color: "#7c4fff", note: "", date: new Date().toISOString().split("T")[0], doctor: "" });
   }
 
+  function clearFilters() {
+    setFilterType("All");
+    setFilterDoctor("All");
+    setDateRangeFrom("");
+    setDateRangeTo("");
+  }
+
   return (
-    <div style={{ maxWidth: 700 }}>
+    <div style={{ width: '100%' }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
         <span style={{ fontSize: "var(--font-md)", fontWeight: 700 }}>Clinical Timeline</span>
-        {can(role, "editPatient") && (
-          <button className="btn btn-primary" style={{ fontSize: "var(--font-sm)" }} onClick={() => setShowForm(true)}>
-            <i className="ti ti-plus" style={{ fontSize: 13 }} />
-            Add Event
-          </button>
-        )}
+        <div style={{ display: "flex", gap: 8 }}>
+          {can(role, "editPatient") && (
+            <button className="btn btn-primary" style={{ fontSize: "var(--font-sm)" }} onClick={() => setShowForm(true)}>
+              <i className="ti ti-plus" style={{ fontSize: 13 }} />
+              Add Event
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Timeline Filters */}
+      <div className="card card-padded" style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+          <select value={filterType} onChange={(e) => setFilterType(e.target.value)} style={{ fontSize: "var(--font-sm)", padding: "6px 10px", borderRadius: "var(--radius)", border: "1px solid var(--border)" }}>
+            <option value="All">All Types</option>
+            <option value="note">Doctor Note</option>
+            <option value="appointment">Appointment</option>
+            <option value="consultation">Consultation</option>
+            <option value="prescription">Prescription</option>
+            <option value="report">Report</option>
+            <option value="followup">Follow-Up</option>
+          </select>
+          {allDoctors.length > 0 && (
+            <select value={filterDoctor} onChange={(e) => setFilterDoctor(e.target.value)} style={{ fontSize: "var(--font-sm)", padding: "6px 10px", borderRadius: "var(--radius)", border: "1px solid var(--border)" }}>
+              <option value="All">All Doctors</option>
+              {allDoctors.map(d => <option key={d} value={d}>{d}</option>)}
+            </select>
+          )}
+          <input type="date" value={dateRangeFrom} onChange={(e) => setDateRangeFrom(e.target.value)} placeholder="From" style={{ fontSize: "var(--font-sm)", padding: "6px 10px", borderRadius: "var(--radius)", border: "1px solid var(--border)" }} />
+          <input type="date" value={dateRangeTo} onChange={(e) => setDateRangeTo(e.target.value)} placeholder="To" style={{ fontSize: "var(--font-sm)", padding: "6px 10px", borderRadius: "var(--radius)", border: "1px solid var(--border)" }} />
+          {(filterType !== "All" || filterDoctor !== "All" || dateRangeFrom || dateRangeTo) && (
+            <button className="btn btn-ghost" onClick={clearFilters} style={{ fontSize: "var(--font-sm)" }}>
+              <i className="ti ti-x" style={{ fontSize: 12 }} />
+              Clear
+            </button>
+          )}
+          <span style={{ marginLeft: "auto", fontSize: "var(--font-sm)", color: "var(--muted)" }}>
+            {filteredEvents.length} of {allEvents.length} events
+          </span>
+        </div>
       </div>
 
       {showForm && (
@@ -641,16 +1100,16 @@ function TimelineTab({
         </div>
       )}
 
-      {events.length === 0 ? (
+      {filteredEvents.length === 0 ? (
         <div className="empty-state">
           <i className="ti ti-timeline empty-state-icon" />
           <div className="empty-state-text">No timeline events</div>
-          <div className="empty-state-sub">Add events to track the patient's clinical history</div>
+          <div className="empty-state-sub">{allEvents.length === 0 ? "Add events to track the patient's clinical history" : "Try adjusting your filters"}</div>
         </div>
       ) : (
         <div style={{ position: "relative", paddingLeft: 20 }}>
           <div className="timeline-line" />
-          {events.map((ev, idx) => (
+          {filteredEvents.map((ev, idx) => (
             <div key={ev.id} style={{ display: "flex", gap: 12, marginBottom: 14, position: "relative" }}>
               <div className="timeline-dot" style={{ background: ev.color + "20" }}>
                 <i className={`ti ${ev.icon}`} style={{ fontSize: 13, color: ev.color }} />
@@ -696,12 +1155,13 @@ function TimelineTab({
 
 // ─── Documents Tab ────────────────────────────────────────────────────────────
 function DocumentsTab({
-  patient, role, onAddDoc, onDeleteDoc,
+  patient, role, onAddDoc, onDeleteDoc, onUploadFiles,
 }: {
   patient: Patient;
   role: UserRole;
   onAddDoc: (d: Omit<PatientDocument, "id">) => void;
   onDeleteDoc: (id: string) => void;
+  onUploadFiles: () => void;
 }) {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState({ type: "Medical Report", uploaded: new Date().toISOString().split("T")[0], size: "—", verified: false });
@@ -712,14 +1172,21 @@ function DocumentsTab({
   };
 
   return (
-    <div>
+    <div style={{ width: '100%' }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
         <span style={{ fontSize: "var(--font-md)", fontWeight: 700 }}>Documents</span>
-        {can(role, "editPatient") && (
-          <button className="btn btn-primary" style={{ fontSize: "var(--font-sm)" }} onClick={() => setShowForm(true)}>
-            <i className="ti ti-plus" style={{ fontSize: 13 }} /> Add Document
-          </button>
-        )}
+        <div style={{ display: "flex", gap: 8 }}>
+          {can(role, "editPatient") && (
+            <>
+              <button className="btn btn-primary" style={{ fontSize: "var(--font-sm)" }} onClick={() => setShowForm(true)}>
+                <i className="ti ti-plus" style={{ fontSize: 13 }} /> Add Document
+              </button>
+              <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)" }} onClick={onUploadFiles}>
+                <i className="ti ti-upload" style={{ fontSize: 13 }} /> Upload Files
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
       {showForm && (
@@ -825,7 +1292,7 @@ function NotesTab({
   }
 
   return (
-    <div style={{ maxWidth: 700 }}>
+    <div style={{ width: '100%' }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
         <span style={{ fontSize: "var(--font-md)", fontWeight: 700 }}>Notes</span>
         {can(role, "editPatient") && (
@@ -905,7 +1372,7 @@ function NotesTab({
 }
 
 // ─── Follow-Up Tab ─────────────────────────────────────────────────────────────
-function FollowUpTab({ patient, onUpdate }: { patient: Patient; onUpdate: (u: Partial<Patient>) => void }) {
+function FollowUpTab({ patient, onUpdate, onScheduleFollowUp }: { patient: Patient; onUpdate: (u: Partial<Patient>) => void; onScheduleFollowUp: () => void }) {
   const [notes,   setNotes]   = useState(patient.followUpNotes || "");
   const [status,  setStatus]  = useState(patient.followUpStatus || "Pending");
   const [saved,   setSaved]   = useState(false);
@@ -935,6 +1402,10 @@ function FollowUpTab({ patient, onUpdate }: { patient: Patient; onUpdate: (u: Pa
         <i className="ti ti-phone empty-state-icon" />
         <div className="empty-state-text">No follow-up scheduled</div>
         <div className="empty-state-sub">Follow-up information will appear here when scheduled</div>
+        <button className="btn btn-primary" style={{ marginTop: 16 }} onClick={onScheduleFollowUp}>
+          <i className="ti ti-plus" style={{ fontSize: 13 }} />
+          Schedule Follow-Up
+        </button>
       </div>
     );
   }
@@ -948,7 +1419,7 @@ function FollowUpTab({ patient, onUpdate }: { patient: Patient; onUpdate: (u: Pa
   const current = STATUS_OPTIONS.find((s) => s.id === status) || STATUS_OPTIONS[0];
 
   return (
-    <div style={{ maxWidth: 640 }}>
+    <div style={{ width: '100%' }}>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
         <div className="stat-card">
           <div className="stat-label"><i className="ti ti-calendar" style={{ fontSize: 11, marginRight: 4 }} />Follow-Up Date</div>
@@ -1012,27 +1483,35 @@ function FollowUpTab({ patient, onUpdate }: { patient: Patient; onUpdate: (u: Pa
 }
 
 // ─── Consents Tab ─────────────────────────────────────────────────────────────
-function ConsentsTab({ patient, onToggle }: { patient: Patient; onToggle: (key: string) => void }) {
+function ConsentsTab({ patient, onToggle, onSignNewConsent }: { patient: Patient; onToggle: (key: string) => void; onSignNewConsent?: () => void }) {
   const consents = patient.consents || {};
   const total  = CONSENT_TYPES.length;
   const signed = CONSENT_TYPES.filter((c) => consents[c.key]).length;
   const allOK  = signed === total;
 
   return (
-    <div style={{ maxWidth: 600 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
-        <div className="stat-card" style={{ flex: 1 }}>
-          <div className="stat-label">Signed</div>
-          <div className="stat-value" style={{ color: allOK ? "var(--green)" : "var(--amber)" }}>{signed}/{total}</div>
-        </div>
-        <div style={{ flex: 2 }}>
-          <div className="progress-bar">
-            <div className="progress-fill" style={{ width: `${(signed / total) * 100}%`, background: allOK ? "var(--green)" : "var(--amber)" }} />
+    <div style={{ width: '100%' }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div className="stat-card" style={{ flex: 1 }}>
+            <div className="stat-label">Signed</div>
+            <div className="stat-value" style={{ color: allOK ? "var(--green)" : "var(--amber)" }}>{signed}/{total}</div>
           </div>
-          <p style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginTop: 6 }}>
-            {allOK ? "All consents collected — patient ready to proceed" : `${total - signed} consent${total - signed > 1 ? "s" : ""} still required`}
-          </p>
+          <div style={{ flex: 2 }}>
+            <div className="progress-bar">
+              <div className="progress-fill" style={{ width: `${(signed / total) * 100}%`, background: allOK ? "var(--green)" : "var(--amber)" }} />
+            </div>
+            <p style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginTop: 6 }}>
+              {allOK ? "All consents collected — patient ready to proceed" : `${total - signed} consent${total - signed > 1 ? "s" : ""} still required`}
+            </p>
+          </div>
         </div>
+        {onSignNewConsent && (
+          <button className="btn btn-primary" style={{ fontSize: "var(--font-sm)" }} onClick={onSignNewConsent}>
+            <i className="ti ti-plus" style={{ fontSize: 13 }} />
+            Sign New Consent
+          </button>
+        )}
       </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -1084,7 +1563,7 @@ function AuditTab({ entries }: { entries: AuditEntry[] }) {
   };
 
   return (
-    <div style={{ maxWidth: 700 }}>
+    <div style={{ width: '100%' }}>
       {sorted.length === 0 ? (
         <div className="empty-state">
           <i className="ti ti-history empty-state-icon" />
@@ -1175,6 +1654,326 @@ function EmergencyModal({ patient, onClose }: { patient: Patient; onClose: () =>
           ))}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ─── Prescription History Tab ─────────────────────────────────────────────────
+function PrescriptionHistoryTab({
+  patient, role, onUpdatePatient, onAddPrescription,
+}: {
+  patient: Patient;
+  role: UserRole;
+  onUpdatePatient: (p: Patient, action?: string) => void;
+  onAddPrescription: () => void;
+}) {
+  const [showRefillModal, setShowRefillModal] = useState(false);
+  const [selectedPrescription, setSelectedPrescription] = useState<Prescription | null>(null);
+
+  const prescriptions = patient.prescriptions || [];
+
+  function handleRefill(prescription: Prescription) {
+    setSelectedPrescription(prescription);
+    setShowRefillModal(true);
+  }
+
+  function processRefill() {
+    if (!selectedPrescription) return;
+    
+    const updatedPrescriptions = prescriptions.map(p => {
+      if (p.id === selectedPrescription.id) {
+        return {
+          ...p,
+          refillsUsed: p.refillsUsed + 1,
+          refillsRemaining: p.refillsRemaining - 1,
+          refillHistory: [
+            ...(p.refillHistory || []),
+            { date: new Date().toISOString(), filledBy: "Current User" }
+          ]
+        };
+      }
+      return p;
+    });
+
+    onUpdatePatient(
+      { ...patient, prescriptions: updatedPrescriptions },
+      "prescription refill processed"
+    );
+    setShowRefillModal(false);
+    setSelectedPrescription(null);
+  }
+
+  function getStatusColor(status: string) {
+    switch (status) {
+      case "active": return "var(--green)";
+      case "completed": return "var(--blue)";
+      case "discontinued": return "var(--red)";
+      default: return "var(--muted)";
+    }
+  }
+
+  return (
+    <div style={{ width: '100%' }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+        <span style={{ fontSize: "var(--font-md)", fontWeight: 700 }}>Prescription History</span>
+        {can(role, "editPatient") && (
+          <button className="btn btn-primary" style={{ fontSize: "var(--font-sm)" }} onClick={onAddPrescription}>
+            <i className="ti ti-plus" style={{ fontSize: 13 }} />
+            Add Prescription
+          </button>
+        )}
+      </div>
+
+      {prescriptions.length === 0 ? (
+        <div className="empty-state">
+          <i className="ti ti-pill empty-state-icon" />
+          <div className="empty-state-text">No prescriptions recorded</div>
+          <div className="empty-state-sub">Prescriptions will appear here when added</div>
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {prescriptions.map((rx) => (
+            <div key={rx.id} className="card card-padded" style={{ borderLeft: `4px solid ${getStatusColor(rx.status)}` }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
+                <div>
+                  <div style={{ fontSize: "var(--font-sm)", fontWeight: 700 }}>{rx.medicationName}</div>
+                  <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginTop: 2 }}>
+                    {rx.dosage} · {rx.frequency} · {rx.route}
+                  </div>
+                </div>
+                <span className="badge" style={{ background: `${getStatusColor(rx.status)}15`, color: getStatusColor(rx.status) }}>
+                  {rx.status}
+                </span>
+              </div>
+              
+              <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginBottom: 8 }}>
+                <div><strong>Duration:</strong> {rx.duration}</div>
+                <div><strong>Prescribed:</strong> {fmtDate(rx.prescribedDate)} by {rx.prescribedBy}</div>
+                {rx.instructions && <div><strong>Instructions:</strong> {rx.instructions}</div>}
+              </div>
+
+              <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border)" }}>
+                <div style={{ fontSize: "var(--font-xs)" }}>
+                  <span style={{ color: "var(--muted)" }}>Refills:</span> {rx.refillsRemaining}/{rx.refillsTotal}
+                </div>
+                {rx.status === "active" && rx.refillsRemaining > 0 && can(role, "editPatient") && (
+                  <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px" }} onClick={() => handleRefill(rx)}>
+                    <i className="ti ti-refresh" style={{ fontSize: 12 }} />
+                    Request Refill
+                  </button>
+                )}
+                {rx.refillHistory && rx.refillHistory.length > 0 && (
+                  <div style={{ marginLeft: "auto", fontSize: "var(--font-xs)", color: "var(--muted)" }}>
+                    Last refill: {fmtDate(rx.refillHistory[rx.refillHistory.length - 1].date)}
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Refill Confirmation Modal */}
+      {showRefillModal && selectedPrescription && (
+        <div className="modal-backdrop" onClick={() => setShowRefillModal(false)}>
+          <div className="modal" style={{ maxWidth: 400 }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ padding: "16px 20px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: "var(--font-md)" }}>Confirm Refill</div>
+                <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{selectedPrescription.medicationName}</div>
+              </div>
+              <button className="btn-icon" onClick={() => setShowRefillModal(false)}><i className="ti ti-x" style={{ fontSize: 16 }} /></button>
+            </div>
+            <div style={{ padding: 20 }}>
+              <p style={{ fontSize: "var(--font-sm)", color: "var(--muted)", marginBottom: 16 }}>
+                This will process a refill for <strong>{selectedPrescription.medicationName}</strong>. 
+                {selectedPrescription.refillsRemaining - 1} refill(s) will remain after this.
+              </p>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                <button className="btn btn-ghost" onClick={() => setShowRefillModal(false)}>Cancel</button>
+                <button className="btn btn-primary" onClick={processRefill}>Confirm Refill</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Lab Results Tab ─────────────────────────────────────────────────────────
+function LabResultsTab({
+  patient, role, onAddLabResult,
+}: {
+  patient: Patient;
+  role: UserRole;
+  onAddLabResult: () => void;
+}) {
+  const [selectedTestType, setSelectedTestType] = useState("All");
+  const [showTrendView, setShowTrendView] = useState(false);
+
+  const labResults = patient.labResults || [];
+
+  const testTypes = useMemo(() => {
+    const types = new Set<string>();
+    labResults.forEach(r => types.add(r.testType));
+    return Array.from(types).sort();
+  }, [labResults]);
+
+  const filteredResults = labResults.filter(r => 
+    selectedTestType === "All" || r.testType === selectedTestType
+  );
+
+  const resultsByTestType = useMemo(() => {
+    const grouped: Record<string, LabResult[]> = {};
+    labResults.forEach(r => {
+      if (!grouped[r.testType]) grouped[r.testType] = [];
+      grouped[r.testType].push(r);
+    });
+    // Sort each group by date
+    Object.keys(grouped).forEach(key => {
+      grouped[key].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+    });
+    return grouped;
+  }, [labResults]);
+
+  function getStatusColor(status: string) {
+    switch (status) {
+      case "normal": return "var(--green)";
+      case "abnormal": return "var(--amber)";
+      case "critical": return "var(--red)";
+      default: return "var(--muted)";
+    }
+  }
+
+  function renderTrendChart(testResults: LabResult[]) {
+    if (testResults.length < 2) return null;
+    
+    const maxValue = Math.max(...testResults.map(r => r.value));
+    const minValue = Math.min(...testResults.map(r => r.value));
+    const range = maxValue - minValue || 1;
+
+    return (
+      <div style={{ marginTop: 16, padding: 16, background: "var(--surface2)", borderRadius: "var(--radius)" }}>
+        <div style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 12 }}>Trend Over Time</div>
+        <div style={{ display: "flex", alignItems: "flex-end", gap: 8, height: 100, paddingBottom: 20, borderBottom: "1px solid var(--border)" }}>
+          {testResults.map((r, i) => {
+            const height = ((r.value - minValue) / range) * 80 + 10;
+            return (
+              <div key={r.id} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center" }}>
+                <div style={{ 
+                  width: "100%", 
+                  height: `${height}%`, 
+                  background: getStatusColor(r.status),
+                  borderRadius: "4px 4px 0 0",
+                  minHeight: 4,
+                  transition: "height 0.3s ease"
+                }} />
+                <div style={{ fontSize: "var(--font-2xs)", color: "var(--muted)", marginTop: 4, textAlign: "center" }}>
+                  {new Date(r.date).toLocaleDateString("en-US", { month: "short", day: "numeric" })}
+                </div>
+                <div style={{ fontSize: "var(--font-2xs)", fontWeight: 600, marginTop: 2 }}>
+                  {r.value}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ width: '100%' }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+        <span style={{ fontSize: "var(--font-md)", fontWeight: 700 }}>Lab Results</span>
+        {can(role, "editPatient") && (
+          <button className="btn btn-primary" style={{ fontSize: "var(--font-sm)" }} onClick={onAddLabResult}>
+            <i className="ti ti-plus" style={{ fontSize: 13 }} />
+            Add Lab Result
+          </button>
+        )}
+      </div>
+
+      {/* Filters */}
+      <div className="card card-padded" style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+          <select value={selectedTestType} onChange={(e) => setSelectedTestType(e.target.value)} style={{ fontSize: "var(--font-sm)", padding: "6px 10px", borderRadius: "var(--radius)", border: "1px solid var(--border)" }}>
+            <option value="All">All Test Types</option>
+            {testTypes.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+          <button 
+            className="btn btn-ghost" 
+            onClick={() => setShowTrendView(!showTrendView)}
+            style={{ fontSize: "var(--font-sm)", background: showTrendView ? "var(--accent-soft)" : "transparent", color: showTrendView ? "var(--accent)" : "var(--text)" }}
+          >
+            <i className="ti ti-chart-line" style={{ fontSize: 12 }} />
+            {showTrendView ? "Hide Trends" : "Show Trends"}
+          </button>
+          <span style={{ marginLeft: "auto", fontSize: "var(--font-sm)", color: "var(--muted)" }}>
+            {filteredResults.length} result{filteredResults.length !== 1 ? "s" : ""}
+          </span>
+        </div>
+      </div>
+
+      {labResults.length === 0 ? (
+        <div className="empty-state">
+          <i className="ti ti-test-tube empty-state-icon" />
+          <div className="empty-state-text">No lab results recorded</div>
+          <div className="empty-state-sub">Lab results will appear here when added</div>
+        </div>
+      ) : showTrendView ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {Object.entries(resultsByTestType).map(([testType, results]) => (
+            <div key={testType} className="card card-padded">
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                <div style={{ fontSize: "var(--font-sm)", fontWeight: 700 }}>{testType}</div>
+                <span className="badge" style={{ background: "var(--surface3)", color: "var(--muted)" }}>
+                  {results.length} result{results.length !== 1 ? "s" : ""}
+                </span>
+              </div>
+              {renderTrendChart(results)}
+              <div style={{ marginTop: 12, fontSize: "var(--font-xs)", color: "var(--muted)" }}>
+                Latest: {results[results.length - 1]?.value} {results[results.length - 1]?.unit} · {fmtDate(results[results.length - 1]?.date)}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {filteredResults.map((result) => (
+            <div key={result.id} className="card card-padded" style={{ borderLeft: `4px solid ${getStatusColor(result.status)}` }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
+                <div>
+                  <div style={{ fontSize: "var(--font-sm)", fontWeight: 700 }}>{result.testName}</div>
+                  <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginTop: 2 }}>
+                    {result.testType}
+                  </div>
+                </div>
+                <span className="badge" style={{ background: `${getStatusColor(result.status)}15`, color: getStatusColor(result.status) }}>
+                  {result.status}
+                </span>
+              </div>
+              
+              <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 8 }}>
+                <div style={{ fontSize: 24, fontWeight: 700, color: getStatusColor(result.status) }}>
+                  {result.value}
+                </div>
+                <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>{result.unit}</div>
+                <div style={{ marginLeft: "auto", fontSize: "var(--font-xs)", color: "var(--muted)" }}>
+                  {fmtDate(result.date)}
+                </div>
+              </div>
+
+              <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginBottom: 8 }}>
+                <div><strong>Reference Range:</strong> {result.referenceRange}</div>
+                <div><strong>Performed by:</strong> {result.performedBy}</div>
+                {result.notes && <div><strong>Notes:</strong> {result.notes}</div>}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

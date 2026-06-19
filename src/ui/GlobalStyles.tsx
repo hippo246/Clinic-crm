@@ -89,8 +89,8 @@ export default function GlobalStyles({ dark }: GlobalStylesProps) {
 
       /* ── Buttons ── */
       .btn {
-        display: inline-flex; align-items: center; gap: 6px;
-        padding: 7px 14px; border-radius: var(--radius); font-size: var(--font-sm);
+        display: inline-flex; align-items: center; gap: 8px;
+        padding: 10px 18px; border-radius: var(--radius); font-size: var(--font-sm);
         font-weight: 500; cursor: pointer; border: none; transition: all 0.15s ease;
         white-space: nowrap; line-height: 1.4;
       }
@@ -110,7 +110,7 @@ export default function GlobalStyles({ dark }: GlobalStylesProps) {
       .btn-danger:hover { background: #b91c1c; }
       .btn-success { background: var(--green); color: #fff; }
       .btn-icon {
-        padding: 7px; border-radius: var(--radius);
+        padding: 10px; border-radius: var(--radius);
         background: transparent; border: 1px solid var(--border);
         color: var(--muted); cursor: pointer; transition: all 0.15s;
         display: inline-flex; align-items: center; justify-content: center;
@@ -123,7 +123,7 @@ export default function GlobalStyles({ dark }: GlobalStylesProps) {
       input[type=password], select, textarea {
         background: var(--surface); border: 1px solid var(--border);
         color: var(--text); border-radius: var(--radius);
-        padding: 8px 12px; font-size: var(--font-base);
+        padding: 12px 16px; font-size: var(--font-base);
         outline: none; transition: all 0.15s ease;
         box-shadow: var(--shadow-sm);
       }
@@ -137,9 +137,9 @@ export default function GlobalStyles({ dark }: GlobalStylesProps) {
       .field-label {
         font-size: var(--font-xs); font-weight: 600; color: var(--muted);
         text-transform: uppercase; letter-spacing: 0.06em; display: block;
-        margin-bottom: 5px;
+        margin-bottom: 8px;
       }
-      .field-group { display: flex; flex-direction: column; gap: 0; }
+      .field-group { display: flex; flex-direction: column; gap: 8px; }
 
       /* ── Cards ── */
       .card {
@@ -147,10 +147,10 @@ export default function GlobalStyles({ dark }: GlobalStylesProps) {
         border-radius: var(--radius-lg); box-shadow: var(--shadow-sm);
         overflow: hidden;
       }
-      .card-padded { padding: 16px; }
+      .card-padded { padding: 20px; }
       .panel-head {
-        display: flex; align-items: center; gap: 10px;
-        padding: 12px 16px; border-bottom: 1px solid var(--border);
+        display: flex; align-items: center; gap: 12px;
+        padding: 16px 20px; border-bottom: 1px solid var(--border);
       }
       .panel-title {
         font-size: var(--font-md); font-weight: 700; color: var(--text);
@@ -166,16 +166,16 @@ export default function GlobalStyles({ dark }: GlobalStylesProps) {
 
       /* ── Badges / Chips ── */
       .badge {
-        display: inline-flex; align-items: center; gap: 4px;
-        padding: 3px 9px; border-radius: var(--radius-full);
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 6px 12px; border-radius: var(--radius-full);
         font-size: var(--font-xs); font-weight: 600; white-space: nowrap;
       }
       .badge-dot {
-        width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0;
+        width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
       }
       .tag {
-        display: inline-flex; align-items: center; gap: 3px;
-        padding: 2px 7px; border-radius: var(--radius-sm);
+        display: inline-flex; align-items: center; gap: 4px;
+        padding: 4px 10px; border-radius: var(--radius-sm);
         font-size: var(--font-xs); font-weight: 500;
       }
 
@@ -205,23 +205,24 @@ export default function GlobalStyles({ dark }: GlobalStylesProps) {
       .gap-6  { gap: 6px; }  .gap-8  { gap: 8px; }
       .gap-10 { gap: 10px; } .gap-12 { gap: 12px; }
       .gap-16 { gap: 16px; } .gap-20 { gap: 20px; }
+      .gap-24 { gap: 24px; } .gap-32 { gap: 32px; }
 
       /* ── Section label ── */
       .section-label {
         font-size: var(--font-2xs); font-weight: 700; letter-spacing: 0.08em;
-        text-transform: uppercase; color: var(--muted); margin-bottom: 8px;
+        text-transform: uppercase; color: var(--muted); margin-bottom: 12px;
       }
 
       /* ── Table ── */
       .tbl { width: 100%; border-collapse: collapse; }
       .tbl th {
-        padding: 8px 12px; font-size: var(--font-xs); font-weight: 700;
+        padding: 14px 16px; font-size: var(--font-xs); font-weight: 700;
         color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em;
         border-bottom: 1px solid var(--border); text-align: left;
         white-space: nowrap; background: var(--surface2);
       }
       .tbl td {
-        padding: 10px 12px; font-size: var(--font-sm); border-bottom: 1px solid var(--border);
+        padding: 16px; font-size: var(--font-sm); border-bottom: 1px solid var(--border);
         vertical-align: middle;
       }
       .tbl tr:last-child td { border-bottom: none; }
@@ -258,7 +259,7 @@ export default function GlobalStyles({ dark }: GlobalStylesProps) {
         position: fixed; inset: 0; z-index: 1000;
         background: rgba(0,0,0,0.55);
         display: flex; align-items: center; justify-content: center;
-        padding: 16px; animation: fadeIn 0.15s ease;
+        padding: 24px; animation: fadeIn 0.15s ease;
       }
       .modal {
         background: var(--surface); border: 1px solid var(--border);
@@ -269,46 +270,46 @@ export default function GlobalStyles({ dark }: GlobalStylesProps) {
 
       /* ── Tabs ── */
       .tab-bar {
-        display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none;
-        padding: 4px; background: var(--surface2); border-radius: var(--radius-lg);
+        display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none;
+        padding: 6px; background: #1a1f35; border-radius: var(--radius-lg);
       }
       .tab-bar::-webkit-scrollbar { display: none; }
       .tab-btn {
-        display: inline-flex; align-items: center; gap: 6px;
-        padding: 7px 14px; border-radius: var(--radius); font-size: var(--font-sm);
+        display: inline-flex; align-items: center; gap: 8px;
+        padding: 10px 18px; border-radius: var(--radius); font-size: var(--font-sm);
         font-weight: 500; cursor: pointer; border: none; transition: all 0.15s;
-        background: transparent; color: var(--muted); white-space: nowrap;
+        background: transparent; color: #8b95a5; white-space: nowrap;
       }
-      .tab-btn:hover { background: var(--surface); color: var(--text); }
+      .tab-btn:hover { background: #252a40; color: var(--text); }
       .tab-btn.active {
-        background: var(--surface); color: var(--accent);
+        background: #2d3350; color: var(--accent);
         font-weight: 600; box-shadow: var(--shadow-sm);
       }
 
       /* ── Empty state ── */
       .empty-state {
-        padding: 40px 20px; text-align: center; color: var(--muted);
+        padding: 60px 24px; text-align: center; color: var(--muted);
       }
       .empty-state-icon {
-        font-size: 32px; margin-bottom: 12px; opacity: 0.4;
+        font-size: 40px; margin-bottom: 16px; opacity: 0.4;
         display: block;
       }
-      .empty-state-text { font-size: var(--font-md); margin-bottom: 6px; }
+      .empty-state-text { font-size: var(--font-md); margin-bottom: 8px; }
       .empty-state-sub  { font-size: var(--font-sm); opacity: 0.7; }
 
       /* ── Stat card ── */
       .stat-card {
-        padding: 14px 16px; border-radius: var(--radius-lg);
+        padding: 20px 24px; border-radius: var(--radius-lg);
         border: 1px solid var(--border); background: var(--surface);
         box-shadow: var(--shadow-sm);
       }
       .stat-value { font-size: 24px; font-weight: 800; line-height: 1.1; }
-      .stat-label { font-size: var(--font-xs); color: var(--muted); margin-top: 4px; font-weight: 500; }
+      .stat-label { font-size: var(--font-xs); color: var(--muted); margin-top: 6px; font-weight: 500; }
 
       /* ── Alert banner ── */
       .alert-banner {
-        display: flex; align-items: center; gap: 10px;
-        padding: 10px 16px; border-radius: var(--radius);
+        display: flex; align-items: center; gap: 12px;
+        padding: 14px 20px; border-radius: var(--radius);
         border: 1px solid; font-size: var(--font-sm);
       }
       .alert-critical { background: var(--red-bg); border-color: var(--red-border); color: #991b1b; }
@@ -333,12 +334,155 @@ export default function GlobalStyles({ dark }: GlobalStylesProps) {
       /* ── Responsive ── */
       @media (max-width: 768px) {
         .desktop-only { display: none !important; }
+        
+        /* Mobile-specific adjustments */
+        .crm-root {
+          font-size: 14px;
+        }
+        
+        /* Better touch targets */
+        button, .btn, .btn-icon {
+          min-height: 44px;
+          min-width: 44px;
+        }
+        
+        input, select, textarea {
+          min-height: 44px;
+          font-size: 16px; /* Prevent iOS zoom */
+        }
+        
+        /* Mobile modal adjustments */
+        .modal {
+          width: 100% !important;
+          max-width: none !important;
+          height: 100vh;
+          border-radius: 0;
+        }
+        
+        .modal-backdrop {
+          padding: 0;
+        }
+        
+        /* Mobile table adjustments */
+        .tbl {
+          font-size: 12px;
+        }
+        
+        .tbl th, .tbl td {
+          padding: 8px 6px;
+        }
+        
+        /* Mobile stat cards */
+        .stat-card {
+          padding: 12px;
+        }
+        
+        .stat-value {
+          font-size: 20px;
+        }
+        
+        /* Mobile form adjustments */
+        .field-group {
+          margin-bottom: 16px;
+        }
+        
+        /* Mobile navigation */
+        .crm-root > div:first-of-type {
+          padding: 0 12px;
+          height: 60px;
+        }
+        
+        /* Mobile stats bar */
+        [style*="gridTemplateColumns"] {
+          grid-template-columns: repeat(2, 1fr) !important;
+        }
       }
+      
+      @media (max-width: 480px) {
+        /* Extra small mobile adjustments */
+        .crm-root {
+          font-size: 13px;
+        }
+        
+        /* Stack stat cards on very small screens */
+        [style*="gridTemplateColumns: repeat(3, 1fr)"] {
+          grid-template-columns: repeat(2, 1fr) !important;
+        }
+        
+        /* Hide less important elements */
+        .section-label {
+          font-size: 10px;
+        }
+        
+        /* Compact table rows */
+        .tbl td, .tbl th {
+          padding: 6px 4px;
+        }
+        
+        /* Mobile-friendly modal header */
+        .modal > div:first-child {
+          padding: 12px 16px;
+        }
+        
+        /* Mobile footer buttons */
+        .modal > div:last-child {
+          flex-direction: column;
+          gap: 8px;
+        }
+        
+        .modal > div:last-child > div {
+          width: 100%;
+          justify-content: stretch;
+        }
+        
+        .modal > div:last-child button {
+          flex: 1;
+        }
+      }
+      
       @media (min-width: 769px) {
         .mobile-only { display: none !important; }
       }
+      
       @media (max-width: 1024px) {
         .lg-hide { display: none !important; }
+        
+        /* Tablet adjustments */
+        .modal {
+          max-width: 90vw;
+        }
+      }
+      
+      /* Touch device optimizations */
+      @media (hover: none) and (pointer: coarse) {
+        /* Remove hover effects on touch devices */
+        *:hover {
+          transition: none !important;
+        }
+        
+        /* Better tap feedback */
+        button:active {
+          transform: scale(0.98);
+          opacity: 0.8;
+        }
+        
+        /* Remove focus outlines on touch */
+        *:focus {
+          outline: none;
+        }
+        
+        /* Better touch targets */
+        .tbl-row {
+          min-height: 48px;
+        }
+      }
+      
+      /* Safe area for notched devices */
+      @supports (padding: max(0px)) {
+        .crm-root {
+          padding-left: max(0px, env(safe-area-inset-left));
+          padding-right: max(0px, env(safe-area-inset-right));
+        }
       }
 
       /* ── Tooltip ── */
@@ -358,8 +502,8 @@ export default function GlobalStyles({ dark }: GlobalStylesProps) {
 
       /* ── Sidebar nav ── */
       .sidebar-nav-item {
-        display: flex; align-items: center; gap: 10px;
-        padding: 9px 12px; border-radius: var(--radius); font-size: var(--font-sm);
+        display: flex; align-items: center; gap: 12px;
+        padding: 12px 16px; border-radius: var(--radius); font-size: var(--font-sm);
         font-weight: 500; cursor: pointer; transition: all 0.15s;
         color: var(--muted); border: none; background: transparent; width: 100%;
         text-align: left;
