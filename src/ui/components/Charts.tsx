@@ -3,7 +3,7 @@ import {
   BarChart, Bar, LineChart, Line, PieChart, Pie, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
 } from "recharts";
-import type { Patient } from "../types";
+import type { Patient } from "./types";
 
 const COLORS = ["#2563eb", "#7c3aed", "#00b4a0", "#f97316", "#ec4899", "#22c55e"];
 

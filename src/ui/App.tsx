@@ -4,7 +4,8 @@ import GlobalStyles from "./GlobalStyles";
 import PatientList from "./PatientList";
 import PatientProfile from "./PatientProfile";
 import PatientForm from "./PatientForm";
-import { AppointmentsPage, BillingPage, ReportsPage, SettingsPage } from "./StubPages";
+import { AppointmentsPage } from "./StubPages";
+import BillingPage from "./Billing";
 import Dashboard from "./Dashboard";
 import QueuePage from "./Queue";
 import ConsultationsPage from "./Consultations";
@@ -13,6 +14,9 @@ import DocumentsPage from "./Documents";
 import CommunicationsPage from "./Communications";
 import StaffPage from "./Staff";
 import AuditPage from "./Audit";
+import PrescriptionsPage from "./Prescriptions";
+import ReportsPage from "./Reports";
+import SettingsPage from "./Settings";
 import { ToastProvider, useToast } from "./Toast";
 import { getInitialPatients } from "./mockData";
 import { apiClient } from "./api";
@@ -55,9 +59,314 @@ async function getPatients(): Promise<Patient[]> {
   return getInitialPatients();
 }
 
-// ─── Top Bar ──────────────────────────────────────────────────────────────────
-function TopBar({
-  dark, setDark, activeTab, setActiveTab, userRole, setUserRole, stats, patients, onLogout,
+// ─── Sidebar ──────────────────────────────────────────────────────────────────
+const NAV_SECTIONS = [
+  {
+    label: "Clinic",
+    tabs: ["dashboard", "queue", "consultations", "prescriptions", "lab"] as NavTab[],
+  },
+  {
+    label: "Admin",
+    tabs: ["billing", "documents", "communications", "reports", "patients"] as NavTab[],
+  },
+  {
+    label: "System",
+    tabs: ["staff", "settings", "audit"] as NavTab[],
+  },
+];
+
+function Sidebar({
+  dark, activeTab, setActiveTab, stats, userRole, setUserRole, patients, onLogout, setDark,
+}: {
+  dark: boolean;
+  activeTab: NavTab;
+  setActiveTab: (t: NavTab) => void;
+  stats: ReturnType<typeof getPatientStats>;
+  userRole: UserRole;
+  setUserRole: (r: UserRole) => void;
+  patients: Patient[];
+  onLogout: () => void;
+  setDark: (d: boolean) => void;
+}) {
+  // Tablet viewports (between mobile's bottom-nav and desktop's full sidebar) get a
+  // collapsed icon-only rail instead of either a 224px sidebar or nothing at all.
+  const [railWidth, setRailWidth] = useState<number>(() =>
+    typeof window === "undefined" ? 224 : window.innerWidth <= 1024 ? 68 : 224
+  );
+  useEffect(() => {
+    function onResize() { setRailWidth(window.innerWidth <= 1024 ? 68 : 224); }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  const collapsed = railWidth === 68;
+  const urgentCount = stats.followUpDue + stats.insExpiring;
+
+  return (
+    <div className="desktop-only qpsb-root" style={{
+      width: railWidth, flexShrink: 0,
+      background: dark ? "#0d1117" : "#fafbfc",
+      borderRight: "1px solid var(--border)",
+      display: "flex", flexDirection: "column",
+      height: "100vh", overflow: "hidden",
+      position: "sticky", top: 0, zIndex: 100,
+      transition: "width 0.18s cubic-bezier(0.4, 0, 0.2, 1)",
+    }}>
+      <style>{`
+        .qpsb-root .qpsb-link { position: relative; }
+        .qpsb-root .qpsb-link:focus-visible {
+          outline: 2px solid var(--accent); outline-offset: -2px;
+        }
+        .qpsb-root .qpsb-link .qpsb-active-bar {
+          position: absolute; left: -8px; top: 50%; transform: translateY(-50%);
+          width: 3px; height: 0; border-radius: 0 3px 3px 0;
+          background: linear-gradient(180deg, #2563eb, #7c3aed);
+          transition: height 0.15s ease;
+        }
+        .qpsb-root .qpsb-link.active .qpsb-active-bar { height: 16px; }
+        .qpsb-root .qpsb-link .qpsb-tooltip {
+          position: absolute; left: calc(100% + 10px); top: 50%; transform: translateY(-50%) scale(0.92);
+          background: ${dark ? "#1c2136" : "#111827"}; color: #fff;
+          font-size: 11.5px; font-weight: 600; white-space: nowrap;
+          padding: 5px 9px; border-radius: 6px;
+          opacity: 0; pointer-events: none; transition: opacity 0.12s, transform 0.12s;
+          box-shadow: 0 4px 14px rgba(0,0,0,0.25); z-index: 200;
+        }
+        .qpsb-root .qpsb-link:hover .qpsb-tooltip { opacity: 1; transform: translateY(-50%) scale(1); }
+      `}</style>
+
+      {/* Logo */}
+      <div style={{
+        display: "flex", alignItems: "center", gap: 10,
+        padding: collapsed ? "16px 0 14px" : "16px 16px 14px",
+        justifyContent: collapsed ? "center" : "flex-start",
+        flexShrink: 0,
+        transition: "padding 0.18s ease",
+      }}>
+        <div style={{
+          width: 32, height: 32, borderRadius: 10,
+          background: "linear-gradient(135deg, #2563eb 0%, #7c3aed 100%)",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          flexShrink: 0, boxShadow: "0 2px 8px rgba(37,99,235,0.35)",
+        }}>
+          <i className="ti ti-heart-rate-monitor" style={{ color: "#fff", fontSize: 17 }} />
+        </div>
+        {!collapsed && (
+          <div style={{ overflow: "hidden", whiteSpace: "nowrap" }}>
+            <div style={{ fontWeight: 800, fontSize: 14, letterSpacing: "-0.03em", lineHeight: 1.15 }}>ClinicOS</div>
+            <div style={{ fontSize: 10, color: "var(--muted)", letterSpacing: "0.01em", marginTop: 1 }}>Medical Suite</div>
+          </div>
+        )}
+      </div>
+
+      {/* Urgent badge */}
+      {urgentCount > 0 && (
+        collapsed ? (
+          <div className="qpsb-link" style={{ margin: "0 0 6px", display: "flex", justifyContent: "center" }}>
+            <button
+              onClick={() => setActiveTab("patients")}
+              title={`${urgentCount} need attention`}
+              style={{
+                position: "relative", width: 40, height: 32, border: "none", cursor: "pointer",
+                borderRadius: "var(--radius)",
+                background: dark ? "rgba(217,119,6,0.14)" : "var(--amber-bg)",
+                display: "flex", alignItems: "center", justifyContent: "center",
+              }}
+            >
+              <i className="ti ti-alert-triangle" style={{ fontSize: 15, color: "var(--amber)" }} />
+              <span style={{
+                position: "absolute", top: -3, right: -3,
+                minWidth: 15, height: 15, borderRadius: "50%",
+                background: "var(--red)", color: "#fff", fontSize: 9, fontWeight: 800,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                border: `2px solid ${dark ? "#0d1117" : "#fafbfc"}`,
+              }}>{urgentCount > 9 ? "9+" : urgentCount}</span>
+              <span className="qpsb-tooltip">{urgentCount} need attention</span>
+            </button>
+          </div>
+        ) : (
+          <button onClick={() => setActiveTab("patients")} style={{
+            display: "flex", alignItems: "center", gap: 7,
+            margin: "0 10px 6px", width: "calc(100% - 20px)",
+            padding: "7px 10px", borderRadius: "var(--radius)",
+            background: dark ? "rgba(217,119,6,0.12)" : "var(--amber-bg)",
+            border: "1px solid var(--amber-border)",
+            fontSize: 11, fontWeight: 600, color: "var(--amber)",
+            cursor: "pointer", textAlign: "left",
+            transition: "filter 0.12s",
+          }}
+          onMouseEnter={e => { (e.currentTarget as HTMLElement).style.filter = "brightness(0.97)"; }}
+          onMouseLeave={e => { (e.currentTarget as HTMLElement).style.filter = "none"; }}
+          >
+            <i className="ti ti-alert-triangle" style={{ fontSize: 13, flexShrink: 0 }} />
+            <span>{urgentCount} need attention</span>
+          </button>
+        )
+      )}
+
+      {/* Sectioned nav */}
+      <nav style={{ flex: 1, overflowY: "auto", padding: collapsed ? "4px 10px 8px" : "4px 8px 8px", display: "flex", flexDirection: "column" }}>
+        {NAV_SECTIONS.map((section) => (
+          <div key={section.label} style={{ marginBottom: 2 }}>
+            {!collapsed && (
+              <div style={{
+                fontSize: "9.5px", fontWeight: 700, letterSpacing: "0.1em",
+                textTransform: "uppercase",
+                color: dark ? "rgba(255,255,255,0.28)" : "rgba(0,0,0,0.35)",
+                padding: "12px 8px 4px",
+              }}>
+                {section.label}
+              </div>
+            )}
+            {collapsed && <div style={{ height: 1, background: "var(--border)", margin: "10px 0 8px", opacity: 0.6 }} />}
+            {section.tabs.map((id) => {
+              const tab = NAV_TABS.find((t) => t.id === id)!;
+              const active = activeTab === id;
+              return (
+                <button
+                  key={id}
+                  className={`qpsb-link${active ? " active" : ""}`}
+                  onClick={() => setActiveTab(id)}
+                  title={collapsed ? tab.label : undefined}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 9,
+                    justifyContent: collapsed ? "center" : "flex-start",
+                    padding: collapsed ? "9px 0" : "8px 10px",
+                    marginBottom: 1,
+                    borderRadius: "var(--radius)",
+                    fontSize: 12.5, fontWeight: active ? 600 : 400,
+                    cursor: "pointer", border: "none",
+                    transition: "background 0.12s, color 0.12s",
+                    color: active
+                      ? (dark ? "#93b4ff" : "var(--accent)")
+                      : "var(--muted)",
+                    background: active
+                      ? (dark ? "rgba(37,99,235,0.18)" : "rgba(37,99,235,0.09)")
+                      : "transparent",
+                    width: "100%", textAlign: "left",
+                  }}
+                  onMouseEnter={e => {
+                    if (!active) (e.currentTarget as HTMLElement).style.background = dark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.045)";
+                  }}
+                  onMouseLeave={e => {
+                    if (!active) (e.currentTarget as HTMLElement).style.background = "transparent";
+                  }}
+                >
+                  {!collapsed && <span className="qpsb-active-bar" />}
+                  <i className={`ti ${tab.icon}`} style={{
+                    fontSize: 15, flexShrink: 0,
+                    color: active ? (dark ? "#93b4ff" : "var(--accent)") : "var(--muted)",
+                    opacity: active ? 1 : 0.7,
+                  }} />
+                  {!collapsed && <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{tab.label}</span>}
+                  {collapsed && <span className="qpsb-tooltip">{tab.label}</span>}
+                </button>
+              );
+            })}
+          </div>
+        ))}
+      </nav>
+
+      {/* User footer */}
+      <div style={{
+        padding: collapsed ? "10px 8px 12px" : "10px 12px 12px",
+        borderTop: "1px solid var(--border)",
+        display: "flex", flexDirection: "column", gap: 8,
+        alignItems: collapsed ? "center" : "stretch",
+      }}>
+        {/* Role pill */}
+        {collapsed ? (
+          <div className="qpsb-link" style={{ position: "relative", width: "100%", display: "flex", justifyContent: "center" }}>
+            <div style={{
+              width: 34, height: 28, borderRadius: "var(--radius)",
+              background: dark ? "#1c2136" : "var(--surface2)",
+              border: "1px solid var(--border)",
+              display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13,
+            }}>
+              {userRole === "doctor" ? "🩺" : userRole === "admin" ? "🛡" : "👤"}
+            </div>
+            <span className="qpsb-tooltip" style={{ left: "calc(100% + 6px)" }}>
+              {userRole.charAt(0).toUpperCase() + userRole.slice(1)}
+            </span>
+          </div>
+        ) : (
+          <select
+            value={userRole}
+            onChange={(e) => {
+              const next = e.target.value as UserRole;
+              if (next === userRole) return;
+              if (window.confirm(`Switch active role to ${next.charAt(0).toUpperCase() + next.slice(1)}? This changes what you can view and edit.`)) {
+                setUserRole(next);
+              } else {
+                e.target.value = userRole;
+              }
+            }}
+            style={{
+              width: "100%", fontSize: 11, padding: "5px 8px",
+              borderRadius: "var(--radius)", border: "1px solid var(--border)",
+              background: dark ? "#1c2136" : "var(--surface2)",
+              color: "var(--muted)", cursor: "pointer",
+            }}
+          >
+            <option value="receptionist">👤 Receptionist</option>
+            <option value="doctor">🩺 Doctor</option>
+            <option value="admin">🛡 Admin</option>
+          </select>
+        )}
+
+        {/* Avatar row */}
+        {collapsed ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "center" }}>
+            <div style={{
+              width: 30, height: 30, borderRadius: "50%",
+              background: "linear-gradient(135deg, #2563eb, #7c3aed)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 11, fontWeight: 800, color: "#fff", flexShrink: 0,
+            }} title={CURRENT_USER.name}>
+              {CURRENT_USER.name.split(" ").map((n) => n[0]).join("").slice(0, 2)}
+            </div>
+            <button className="btn-icon" onClick={() => setDark(!dark)} title={dark ? "Light mode" : "Dark mode"}
+              style={{ padding: 5, flexShrink: 0 }}>
+              <i className={`ti ${dark ? "ti-sun" : "ti-moon"}`} style={{ fontSize: 13 }} />
+            </button>
+            <button className="btn-icon" onClick={onLogout} title="Logout"
+              style={{ padding: 5, flexShrink: 0, color: "var(--red)", borderColor: "transparent", background: "transparent" }}>
+              <i className="ti ti-logout" style={{ fontSize: 13 }} />
+            </button>
+          </div>
+        ) : (
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{
+              width: 30, height: 30, borderRadius: "50%",
+              background: "linear-gradient(135deg, #2563eb, #7c3aed)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 11, fontWeight: 800, color: "#fff", flexShrink: 0,
+            }}>
+              {CURRENT_USER.name.split(" ").map((n) => n[0]).join("").slice(0, 2)}
+            </div>
+            <div style={{ flex: 1, overflow: "hidden" }}>
+              <div style={{ fontSize: 11.5, fontWeight: 600, color: "var(--text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                {CURRENT_USER.name}
+              </div>
+              <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 1 }}>{userRole}</div>
+            </div>
+            <button className="btn-icon" onClick={() => setDark(!dark)} title={dark ? "Light mode" : "Dark mode"}
+              style={{ padding: 5, flexShrink: 0 }}>
+              <i className={`ti ${dark ? "ti-sun" : "ti-moon"}`} style={{ fontSize: 13 }} />
+            </button>
+            <button className="btn-icon" onClick={onLogout} title="Logout"
+              style={{ padding: 5, flexShrink: 0, color: "var(--red)", borderColor: "transparent", background: "transparent" }}>
+              <i className="ti ti-logout" style={{ fontSize: 13 }} />
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Content Top Bar ─────────────────────────────────────────────────────────
+function ContentTopBar({
+  dark, setDark, activeTab, setActiveTab, userRole, setUserRole, patients, onLogout,
 }: {
   dark: boolean;
   setDark: (d: boolean) => void;
@@ -65,164 +374,475 @@ function TopBar({
   setActiveTab: (t: NavTab) => void;
   userRole: UserRole;
   setUserRole: (r: UserRole) => void;
-  stats: ReturnType<typeof getPatientStats>;
   patients: Patient[];
   onLogout: () => void;
 }) {
-  const [menuOpen, setMenuOpen] = useState(false);
+  const currentTab = NAV_TABS.find((t) => t.id === activeTab);
+  const [searchVal, setSearchVal] = useState("");
+
+  function handleSearch(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Enter" && searchVal.trim()) {
+      setActiveTab("patients");
+      // let PatientList pick up a global search trigger via Ctrl+K flow
+      setTimeout(() => {
+        const real = document.querySelector<HTMLInputElement>('input[type="search"]:not([data-topbar])');
+        if (real) { real.value = searchVal; real.focus(); real.dispatchEvent(new Event("input", { bubbles: true })); }
+      }, 60);
+    }
+  }
 
   return (
-    <div style={{
-      background: dark ? "#0c0f1a" : "#fff",
-      borderBottom: "1px solid var(--border)",
+    <div className="desktop-only qptb-root" style={{
+      height: 56, flexShrink: 0,
       display: "flex", alignItems: "center",
-      padding: "0 16px", height: 54, flexShrink: 0,
-      gap: 12, position: "relative", zIndex: 100,
+      padding: "0 20px", gap: 10,
+      background: dark ? "#0d1117" : "#fafbfc",
+      borderBottom: "1px solid var(--border)",
     }}>
-      {/* Logo */}
-      <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+      <style>{`
+        .qptb-root .qptb-search input::placeholder { color: var(--muted); opacity: 0.85; }
+        .qptb-root .qptb-search input:focus {
+          background: ${dark ? "rgba(255,255,255,0.07)" : "#ffffff"} !important;
+          border-color: var(--accent) !important;
+          box-shadow: 0 0 0 3px ${dark ? "rgba(37,99,235,0.25)" : "rgba(37,99,235,0.13)"} !important;
+        }
+        .qptb-root .qptb-icon-btn {
+          width: 34px; height: 34px; display: flex; align-items: center; justify-content: center;
+          border-radius: var(--radius); transition: background 0.12s, color 0.12s;
+        }
+        .qptb-root .qptb-icon-btn:hover { background: ${dark ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.05)"}; }
+        .qptb-root .qptb-icon-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+        .qptb-root .qptb-role-select:hover { background: ${dark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.07)"} !important; }
+        .qptb-root .qptb-user-name { transition: opacity 0.15s; }
+        /* Tablet compression: keep every control, just tighten and drop secondary text */
+        @media (max-width: 1100px) {
+          .qptb-root { padding: 0 14px !important; gap: 7px !important; }
+          .qptb-root .qptb-search { max-width: 220px !important; }
+          .qptb-root .qptb-kbd-hint { display: none !important; }
+          .qptb-root .qptb-user-name { display: none !important; }
+          .qptb-root .qptb-breadcrumb-label { display: none !important; }
+        }
+      `}</style>
+
+      {/* Page breadcrumb */}
+      <div className="qptb-breadcrumb" style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
         <div style={{
           width: 28, height: 28, borderRadius: 8,
-          background: "linear-gradient(135deg, #2563eb 0%, #7c3aed 100%)",
+          background: dark ? "rgba(37,99,235,0.15)" : "rgba(37,99,235,0.09)",
           display: "flex", alignItems: "center", justifyContent: "center",
         }}>
-          <i className="ti ti-heart-rate-monitor" style={{ color: "#fff", fontSize: 15 }} />
+          <i className={`ti ${currentTab?.icon}`} style={{ fontSize: 13.5, color: "var(--accent)" }} />
         </div>
-        <span style={{ fontWeight: 800, fontSize: 15, letterSpacing: "-0.02em" }}>
-          ClinicOS
+        <span className="qptb-breadcrumb-label" style={{ fontWeight: 700, fontSize: 13.5, color: "var(--text)", letterSpacing: "-0.01em", whiteSpace: "nowrap" }}>
+          {currentTab?.label}
         </span>
       </div>
 
-      {/* Desktop nav */}
-      <nav style={{
-        display: "flex", gap: 2, flex: 1,
-        overflow: "hidden",
-      }} className="desktop-only">
-        {NAV_TABS.map(({ id, label, icon }) => (
-          <button
-            key={id}
-            onClick={() => setActiveTab(id)}
-            style={{
-              display: "inline-flex", alignItems: "center", gap: 6,
-              padding: "6px 12px", borderRadius: "var(--radius)",
-              fontSize: "var(--font-sm)", fontWeight: activeTab === id ? 600 : 400,
-              cursor: "pointer", border: "none", transition: "all 0.15s",
-              color:      activeTab === id ? "var(--accent)" : "var(--muted)",
-              background: activeTab === id ? "var(--accent-soft)" : "transparent",
-            }}
-          >
-            <i className={`ti ${icon}`} style={{ fontSize: 14 }} />
-            {label}
-          </button>
-        ))}
-      </nav>
+      <div style={{ width: 1, height: 18, background: "var(--border)", margin: "0 4px", flexShrink: 0 }} />
 
-      {/* Right side */}
-      <div style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
-        {/* Urgent badge */}
-        {(stats.followUpDue + stats.insExpiring) > 0 && (
-          <div className="desktop-only" style={{
-            display: "flex", alignItems: "center", gap: 6,
-            padding: "4px 10px", borderRadius: "var(--radius-full)",
-            background: "var(--amber-bg)", border: "1px solid var(--amber-border)",
-            fontSize: "var(--font-xs)", fontWeight: 700, color: "var(--amber)",
-          }}>
-            <span style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--amber)", display: "inline-block" }} />
-            {stats.followUpDue + stats.insExpiring} urgent
-          </div>
-        )}
+      {/* Search */}
+      <div className="qptb-search" style={{ position: "relative", flex: 1, maxWidth: 380, transition: "max-width 0.15s ease" }}>
+        <i className="ti ti-search" style={{
+          position: "absolute", left: 11, top: "50%", transform: "translateY(-50%)",
+          fontSize: 12, color: "var(--muted)", pointerEvents: "none",
+        }} />
+        <input
+          data-topbar="1"
+          type="search"
+          value={searchVal}
+          onChange={e => setSearchVal(e.target.value)}
+          onKeyDown={handleSearch}
+          placeholder="Search… or press Ctrl+K"
+          style={{
+            width: "100%", paddingLeft: 30, paddingRight: 36,
+            height: 34, fontSize: 12.5,
+            background: dark ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.04)",
+            border: "1px solid var(--border)",
+            borderRadius: "var(--radius-full)",
+            boxShadow: "none", color: "var(--text)",
+            transition: "background 0.15s, border-color 0.15s, box-shadow 0.15s",
+            boxSizing: "border-box",
+          }}
+        />
+        <kbd className="qptb-kbd-hint" style={{
+          position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)",
+          fontSize: 9, padding: "1px 5px", borderRadius: 4,
+          background: dark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.07)",
+          color: "var(--muted)", fontFamily: "monospace", letterSpacing: "0.02em",
+          pointerEvents: "none",
+        }}>⌘K</kbd>
+      </div>
 
-        {/* Role selector */}
-        <select
-          value={userRole}
-          onChange={(e) => setUserRole(e.target.value as UserRole)}
-          className="desktop-only"
-          style={{ fontSize: "var(--font-xs)", padding: "5px 8px", borderRadius: "var(--radius)" }}
-        >
-          <option value="receptionist">Receptionist</option>
-          <option value="doctor">Doctor</option>
-          <option value="admin">Admin</option>
-        </select>
+      <div style={{ flex: 1 }} />
 
-        {/* Notifications */}
-        <Notifications patients={patients} />
+      {/* Notifications */}
+      <Notifications patients={patients} />
 
-        {/* Dark toggle */}
-        <button
-          className="btn-icon"
-          onClick={() => setDark(!dark)}
-          title={dark ? "Switch to light mode" : "Switch to dark mode"}
-        >
-          <i className={`ti ${dark ? "ti-sun" : "ti-moon"}`} style={{ fontSize: 15 }} />
-        </button>
+      {/* Dark toggle */}
+      <button className="btn-icon qptb-icon-btn" onClick={() => setDark(!dark)}
+        title={dark ? "Light mode" : "Dark mode"}
+        style={{ border: "none", background: "transparent" }}>
+        <i className={`ti ${dark ? "ti-sun" : "ti-moon"}`} style={{ fontSize: 16, color: "var(--muted)" }} />
+      </button>
 
-        {/* Avatar */}
+      {/* Role badge */}
+      <select
+        className="qptb-role-select"
+        value={userRole}
+        onChange={(e) => {
+          const next = e.target.value as UserRole;
+          if (next === userRole) return;
+          if (window.confirm(`Switch active role to ${next.charAt(0).toUpperCase() + next.slice(1)}? This changes what you can view and edit.`)) {
+            setUserRole(next);
+          } else {
+            e.target.value = userRole;
+          }
+        }}
+        style={{
+          fontSize: 11, padding: "4px 8px",
+          borderRadius: "var(--radius-full)",
+          background: dark ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.05)",
+          border: "1px solid var(--border)",
+          color: "var(--muted)", cursor: "pointer", height: 28,
+          transition: "background 0.12s",
+        }}
+      >
+        <option value="receptionist">Receptionist</option>
+        <option value="doctor">Doctor</option>
+        <option value="admin">Admin</option>
+      </select>
+
+      {/* Avatar + name */}
+      <div style={{ display: "flex", alignItems: "center", gap: 7, cursor: "default", flexShrink: 0 }}>
         <div style={{
-          width: 32, height: 32, borderRadius: "50%",
-          background: "var(--accent-soft)", color: "var(--accent)",
+          width: 28, height: 28, borderRadius: "50%",
+          background: "linear-gradient(135deg, #2563eb, #7c3aed)",
           display: "flex", alignItems: "center", justifyContent: "center",
-          fontSize: 12, fontWeight: 800, cursor: "pointer",
-          border: "2px solid var(--accent)30",
-        }} title={CURRENT_USER.name}>
+          fontSize: 10, fontWeight: 800, color: "#fff",
+          flexShrink: 0,
+        }}>
           {CURRENT_USER.name.split(" ").map((n) => n[0]).join("").slice(0, 2)}
         </div>
+        <span className="qptb-user-name" style={{ fontSize: 12, fontWeight: 600, color: "var(--text)", whiteSpace: "nowrap" }}>{CURRENT_USER.name}</span>
+      </div>
 
-        {/* Logout button */}
-        <button
-          className="btn-icon"
-          onClick={onLogout}
-          title="Logout"
-          style={{
-            padding: "6px",
-            background: "var(--error-bg)",
-            color: "var(--error)",
-            border: "1px solid var(--error-border)",
-            borderRadius: "var(--radius)",
-          }}
-        >
-          <i className="ti ti-logout" style={{ fontSize: 15 }} />
-        </button>
-        </div>
+      {/* Logout */}
+      <button className="btn-icon qptb-icon-btn" onClick={onLogout} title="Logout"
+        style={{ border: "1px solid transparent", background: "transparent", color: "var(--muted)" }}
+        onMouseEnter={e => { (e.currentTarget as HTMLElement).style.color = "var(--red)"; }}
+        onMouseLeave={e => { (e.currentTarget as HTMLElement).style.color = "var(--muted)"; }}>
+        <i className="ti ti-logout" style={{ fontSize: 15 }} />
+      </button>
+    </div>
+  );
+}
 
-        {/* Mobile hamburger */}
-        <button className="btn-icon mobile-only" onClick={() => setMenuOpen((o) => !o)}>
-          <i className="ti ti-menu-2" style={{ fontSize: 16 }} />
-        </button>
+// ─── Mobile Top Bar ───────────────────────────────────────────────────────────
+// ContentTopBar above is desktop-only, which silently dropped search and
+// notifications from the phone UI entirely (dark mode + logout were relocated
+// into the BottomNav "More" sheet separately). This gives phone users a slim
+// equivalent: page title, a search trigger, and the notifications bell.
+function MobileTopBar({
+  dark, activeTab, setActiveTab, patients,
+}: {
+  dark: boolean;
+  activeTab: NavTab;
+  setActiveTab: (t: NavTab) => void;
+  patients: Patient[];
+}) {
+  const currentTab = NAV_TABS.find((t) => t.id === activeTab);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchVal, setSearchVal] = useState("");
 
-      {/* Mobile dropdown */}
-      {menuOpen && (
-        <div className="mobile-only" style={{
-          position: "absolute", top: "100%", left: 0, right: 0,
-          background: dark ? "#0c0f1a" : "#fff",
-          borderBottom: "1px solid var(--border)",
-          padding: "8px 12px", zIndex: 200,
-          boxShadow: "var(--shadow-lg)",
-        }}>
-          {NAV_TABS.map(({ id, label, icon }) => (
-            <button key={id} onClick={() => { setActiveTab(id); setMenuOpen(false); }} style={{
-              display: "flex", alignItems: "center", gap: 10, width: "100%",
-              padding: "10px 12px", borderRadius: "var(--radius)", marginBottom: 2,
-              fontSize: "var(--font-base)", fontWeight: activeTab === id ? 600 : 400,
-              color: activeTab === id ? "var(--accent)" : "var(--text)",
-              background: activeTab === id ? "var(--accent-soft)" : "transparent",
-              border: "none", cursor: "pointer",
+  function handleSearch(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Enter" && searchVal.trim()) {
+      setActiveTab("patients");
+      setTimeout(() => {
+        const real = document.querySelector<HTMLInputElement>('input[type="search"]:not([data-mobiletopbar])');
+        if (real) { real.value = searchVal; real.focus(); real.dispatchEvent(new Event("input", { bubbles: true })); }
+      }, 60);
+      setSearchOpen(false);
+    }
+  }
+
+  return (
+    <div className="mobile-only" style={{
+      height: 52, flexShrink: 0,
+      display: "flex", alignItems: "center",
+      padding: "0 14px", gap: 8,
+      background: dark ? "#0d1117" : "#fafbfc",
+      borderBottom: "1px solid var(--border)",
+    }}>
+      {searchOpen ? (
+        <>
+          <div style={{ position: "relative", flex: 1 }}>
+            <i className="ti ti-search" style={{
+              position: "absolute", left: 11, top: "50%", transform: "translateY(-50%)",
+              fontSize: 12, color: "var(--muted)", pointerEvents: "none",
+            }} />
+            <input
+              data-mobiletopbar="1"
+              type="search"
+              autoFocus
+              value={searchVal}
+              onChange={e => setSearchVal(e.target.value)}
+              onKeyDown={handleSearch}
+              placeholder="Search patients…"
+              style={{
+                width: "100%", paddingLeft: 30, paddingRight: 10,
+                height: 36, fontSize: 13,
+                background: dark ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.04)",
+                border: "1px solid var(--border)",
+                borderRadius: "var(--radius-full)",
+                color: "var(--text)", boxSizing: "border-box",
+              }}
+            />
+          </div>
+          <button className="btn-icon" onClick={() => { setSearchOpen(false); setSearchVal(""); }} style={{ flexShrink: 0 }}>
+            <i className="ti ti-x" style={{ fontSize: 16 }} />
+          </button>
+        </>
+      ) : (
+        <>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flex: 1, minWidth: 0 }}>
+            <div style={{
+              width: 26, height: 26, borderRadius: 8,
+              background: dark ? "rgba(37,99,235,0.15)" : "rgba(37,99,235,0.09)",
+              display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
             }}>
-              <i className={`ti ${icon}`} style={{ fontSize: 16 }} />
-              {label}
-            </button>
-          ))}
-          <div style={{ padding: "8px 12px 4px", borderTop: "1px solid var(--border)", marginTop: 4 }}>
-            <label style={{ fontSize: "var(--font-xs)", color: "var(--muted)", display: "block", marginBottom: 4 }}>Role</label>
-            <select value={userRole} onChange={(e) => setUserRole(e.target.value as UserRole)}
-              style={{ width: "100%", fontSize: "var(--font-sm)" }}>
-              <option value="receptionist">Receptionist</option>
-              <option value="doctor">Doctor</option>
-              <option value="admin">Admin</option>
-            </select>
+              <i className={`ti ${currentTab?.icon}`} style={{ fontSize: 13, color: "var(--accent)" }} />
+            </div>
+            <span style={{ fontWeight: 700, fontSize: 14, color: "var(--text)", letterSpacing: "-0.01em", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {currentTab?.label}
+            </span>
+          </div>
+          <button className="btn-icon" onClick={() => setSearchOpen(true)} title="Search" style={{ flexShrink: 0 }}>
+            <i className="ti ti-search" style={{ fontSize: 16, color: "var(--muted)" }} />
+          </button>
+          <Notifications patients={patients} />
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── Bottom Nav (mobile) ──────────────────────────────────────────────────────
+const BOTTOM_NAV_TABS: NavTab[] = ["dashboard", "queue", "patients", "billing", "consultations"];
+
+function BottomNav({
+  dark, activeTab, setActiveTab, setDark, onLogout,
+}: {
+  dark: boolean;
+  activeTab: NavTab;
+  setActiveTab: (t: NavTab) => void;
+  setDark: (d: boolean) => void;
+  onLogout: () => void;
+}) {
+  const [sheetOpen, setSheetOpen] = useState(false);
+  const [pressed, setPressed] = useState<string | null>(null);
+  const isMoreActive = !BOTTOM_NAV_TABS.includes(activeTab as any);
+
+  function NavBtn({ id, icon, label, onClick }: { id: string; icon: string; label: string; onClick: () => void }) {
+    const active = id === "more" ? (isMoreActive || sheetOpen) : activeTab === id;
+    const isPressed = pressed === id;
+    return (
+      <button
+        onPointerDown={() => setPressed(id)}
+        onPointerUp={() => setPressed(null)}
+        onPointerLeave={() => setPressed(null)}
+        onClick={onClick}
+        style={{
+          flex: 1, display: "flex", flexDirection: "column",
+          alignItems: "center", justifyContent: "center", gap: 3,
+          border: "none", background: "transparent", cursor: "pointer",
+          padding: "6px 2px 4px", WebkitTapHighlightColor: "transparent",
+          transition: "transform 0.08s ease",
+          transform: isPressed ? "scale(0.85)" : "scale(1)",
+        }}>
+        <div style={{
+          width: 48, height: 32,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          borderRadius: 16,
+          background: active
+            ? (dark ? "rgba(37,99,235,0.22)" : "rgba(37,99,235,0.12)")
+            : "transparent",
+          transform: active ? "scale(1)" : "scale(0.92)",
+          transition: "background 0.2s, transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1)",
+        }}>
+          <i className={`ti ${icon}`} style={{
+            fontSize: 22,
+            color: active ? "var(--accent)" : "var(--muted)",
+            transition: "color 0.15s",
+          }} />
+        </div>
+        <span style={{
+          fontSize: 10, lineHeight: 1, letterSpacing: "0.01em",
+          fontWeight: active ? 700 : 500,
+          color: active ? "var(--accent)" : "var(--muted)",
+          transition: "color 0.15s",
+        }}>
+          {label}
+        </span>
+      </button>
+    );
+  }
+
+  return (
+    <>
+      <style>{`
+        @keyframes qpbn-sheet-in {
+          from { opacity: 0; transform: translateY(10px) scale(0.98); }
+          to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        @keyframes qpbn-backdrop-in {
+          from { opacity: 0; } to { opacity: 1; }
+        }
+        .qpbn-sheet-item:hover { filter: brightness(${dark ? 1.12 : 0.97}); }
+        .qpbn-sheet-item:active { transform: scale(0.95); }
+      `}</style>
+
+      {/* Blurred backdrop */}
+      {sheetOpen && (
+        <div className="mobile-only" onClick={() => setSheetOpen(false)} style={{
+          position: "fixed", inset: 0, zIndex: 197,
+          background: "rgba(0,0,0,0.45)",
+          backdropFilter: "blur(4px)", WebkitBackdropFilter: "blur(4px)",
+          animation: "qpbn-backdrop-in 0.18s ease",
+        }} />
+      )}
+
+      {/* More sheet — floating card above nav */}
+      {sheetOpen && (
+        <div className="mobile-only" style={{
+          position: "fixed",
+          bottom: "calc(76px + env(safe-area-inset-bottom))",
+          left: 12, right: 12,
+          background: dark ? "#16192a" : "#ffffff",
+          borderRadius: 22,
+          border: `1px solid ${dark ? "rgba(255,255,255,0.09)" : "rgba(0,0,0,0.07)"}`,
+          boxShadow: "0 16px 48px rgba(0,0,0,0.28), 0 2px 8px rgba(0,0,0,0.1)",
+          zIndex: 198, overflow: "hidden",
+          animation: "qpbn-sheet-in 0.2s cubic-bezier(0.16, 1, 0.3, 1)",
+        }}>
+          {/* Drag handle */}
+          <div style={{ display: "flex", justifyContent: "center", paddingTop: 10, paddingBottom: 2 }}>
+            <div style={{ width: 36, height: 4, borderRadius: 2, background: dark ? "rgba(255,255,255,0.14)" : "rgba(0,0,0,0.1)" }} />
+          </div>
+          <div style={{ padding: "8px 14px 16px" }}>
+            <div style={{
+              fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase",
+              color: dark ? "rgba(255,255,255,0.3)" : "rgba(0,0,0,0.3)",
+              paddingBottom: 10, paddingLeft: 2,
+            }}>Pages</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
+              {NAV_TABS.filter((t) => !BOTTOM_NAV_TABS.includes(t.id as any) && t.id !== "settings" && t.id !== "audit").map(({ id, label, icon }) => {
+                const active = activeTab === id;
+                return (
+                  <button key={id} className="qpbn-sheet-item" onClick={() => { setActiveTab(id); setSheetOpen(false); }}
+                    style={{
+                      display: "flex", flexDirection: "column",
+                      alignItems: "center", gap: 6,
+                      padding: "14px 4px 12px",
+                      borderRadius: 16, border: "none",
+                      fontSize: 10.5, fontWeight: active ? 700 : 500,
+                      color: active ? "var(--accent)" : "var(--muted)",
+                      background: active
+                        ? (dark ? "rgba(37,99,235,0.18)" : "rgba(37,99,235,0.09)")
+                        : (dark ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.04)"),
+                      cursor: "pointer", minHeight: 74,
+                      transition: "background 0.12s, transform 0.1s, filter 0.12s",
+                      WebkitTapHighlightColor: "transparent",
+                    }}>
+                    <i className={`ti ${icon}`} style={{ fontSize: 24, color: active ? "var(--accent)" : "var(--muted)" }} />
+                    <span style={{ textAlign: "center", lineHeight: 1.2, whiteSpace: "nowrap" }}>{label}</span>
+                  </button>
+                );
+              })}
+            </div>
+            {/* System row — smaller, separated, desktop-intent pages accessible but de-emphasised */}
+            <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${dark ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.07)"}`, display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {(["settings", "audit"] as NavTab[]).map((id) => {
+                const tab = NAV_TABS.find((t) => t.id === id)!;
+                const active = activeTab === id;
+                return (
+                  <button key={id} className="qpbn-sheet-item" onClick={() => { setActiveTab(id); setSheetOpen(false); }}
+                    style={{
+                      display: "flex", alignItems: "center", gap: 8,
+                      padding: "10px 14px", borderRadius: 12, border: "none",
+                      fontSize: 12, fontWeight: active ? 700 : 500,
+                      color: active ? "var(--accent)" : "var(--muted)",
+                      background: active
+                        ? (dark ? "rgba(37,99,235,0.18)" : "rgba(37,99,235,0.09)")
+                        : (dark ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.04)"),
+                      cursor: "pointer",
+                      transition: "background 0.12s, filter 0.12s",
+                      WebkitTapHighlightColor: "transparent",
+                    }}>
+                    <i className={`ti ${tab.icon}`} style={{ fontSize: 16, color: active ? "var(--accent)" : "var(--muted)" }} />
+                    {tab.label}
+                  </button>
+                );
+              })}
+              {/* Dark mode toggle — mirrors the desktop sidebar/topbar control, just relocated here on phone */}
+              <button className="qpbn-sheet-item" onClick={() => setDark(!dark)}
+                style={{
+                  display: "flex", alignItems: "center", gap: 8,
+                  padding: "10px 14px", borderRadius: 12, border: "none",
+                  fontSize: 12, fontWeight: 500,
+                  color: "var(--muted)",
+                  background: dark ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.04)",
+                  cursor: "pointer",
+                  transition: "background 0.12s, filter 0.12s",
+                  WebkitTapHighlightColor: "transparent",
+                }}>
+                <i className={`ti ${dark ? "ti-sun" : "ti-moon"}`} style={{ fontSize: 16, color: "var(--muted)" }} />
+                {dark ? "Light mode" : "Dark mode"}
+              </button>
+              {/* Logout — only destructive control in the sheet, kept visually distinct in red */}
+              <button className="qpbn-sheet-item" onClick={() => { setSheetOpen(false); onLogout(); }}
+                style={{
+                  display: "flex", alignItems: "center", gap: 8,
+                  padding: "10px 14px", borderRadius: 12, border: "none",
+                  fontSize: 12, fontWeight: 500,
+                  color: "var(--red)",
+                  background: dark ? "rgba(239,68,68,0.1)" : "rgba(239,68,68,0.07)",
+                  cursor: "pointer",
+                  transition: "background 0.12s, filter 0.12s",
+                  WebkitTapHighlightColor: "transparent",
+                }}>
+                <i className="ti ti-logout" style={{ fontSize: 16, color: "var(--red)" }} />
+                Logout
+              </button>
+            </div>
           </div>
         </div>
       )}
-    </div>
+
+      {/* The bar itself */}
+      <div className="mobile-only" style={{
+        position: "fixed", bottom: 0, left: 0, right: 0,
+        background: dark ? "rgba(13,17,23,0.97)" : "rgba(255,255,255,0.97)",
+        backdropFilter: "saturate(180%) blur(16px)",
+        WebkitBackdropFilter: "saturate(180%) blur(16px)",
+        borderTop: `1px solid ${dark ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.07)"}`,
+        boxShadow: dark ? "0 -4px 20px rgba(0,0,0,0.35)" : "0 -4px 20px rgba(0,0,0,0.06)",
+        display: "flex", alignItems: "stretch",
+        height: "calc(76px + env(safe-area-inset-bottom))",
+        paddingBottom: "env(safe-area-inset-bottom)",
+        zIndex: 200,
+      }}>
+        {BOTTOM_NAV_TABS.map((id) => {
+          const tab = NAV_TABS.find((t) => t.id === id)!;
+          return <NavBtn key={id} id={id} icon={tab.icon} label={tab.label} onClick={() => { setActiveTab(id); setSheetOpen(false); }} />;
+        })}
+        <NavBtn
+          id="more"
+          icon={sheetOpen ? "ti-x" : "ti-grid-dots"}
+          label={sheetOpen ? "Close" : "More"}
+          onClick={() => setSheetOpen((o) => !o)}
+        />
+      </div>
+    </>
   );
 }
 
@@ -401,7 +1021,9 @@ export default function App() {
 function AppInner() {
   const { toast } = useToast();
   const [dark,            setDark]            = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
-  const [activeTab,       setActiveTab]       = useState<NavTab>("dashboard");
+  const [activeTab,       setActiveTab]       = useState<NavTab>(() =>
+    typeof window !== "undefined" && window.innerWidth < 768 ? "dashboard" : "dashboard"
+  );
   const [patients,        setPatients]        = useState<Patient[]>([]);
   const [selectedPatient, setSelectedPatient] = useState<Patient | null>(null);
   const [formMode,        setFormMode]        = useState<"create" | "edit" | null>(null);
@@ -416,9 +1038,7 @@ function AppInner() {
   useEffect(() => {
     async function loadData() {
       try {
-        console.log("Loading patients...");
         const loadedPatients = await getPatients();
-        console.log("Loaded patients:", loadedPatients.length);
         setPatients(loadedPatients);
       } catch (error) {
         console.error("Failed to load patients:", error);
@@ -448,6 +1068,22 @@ function AppInner() {
     }
   }, [patients]);
 
+  // On mobile, if the active tab isn't reachable via the bottom nav or the More sheet
+  // (i.e. it was set while on desktop then the window was resized), snap back to dashboard.
+  // Also runs on mount so a phone-width initial load never lands on a desktop-only default.
+  useEffect(() => {
+    function snapTabForViewport() {
+      if (window.innerWidth < 768) {
+        // Settings is desktop-only UX — phone users shouldn't land there by default
+        // or via a stale cross-device state. Snap to dashboard.
+        setActiveTab((prev) => prev === "settings" ? "dashboard" : prev);
+      }
+    }
+    snapTabForViewport();
+    window.addEventListener("resize", snapTabForViewport);
+    return () => window.removeEventListener("resize", snapTabForViewport);
+  }, []);
+
   // Ctrl+K / Cmd+K → focus search
   useEffect(() => {
     function handler(e: KeyboardEvent) {
@@ -475,11 +1111,85 @@ function AppInner() {
 
   const handleBack = useCallback(() => setSelectedPatient(null), []);
 
+  // Routes Dashboard's quick-action / patient-link clicks to the right tab or patient profile.
+  // Dashboard only knows action ids — it has no router or modal system of its own.
+  const handleDashboardAction = useCallback((actionId: string) => {
+    const [action, patientId] = actionId.split(":");
+
+    // Actions that reference a specific patient (view-patient:<id>, message-patient:<id>, schedule-followup:<id>)
+    if (patientId) {
+      const patient = patients.find((p) => p.id === patientId);
+      if (!patient) {
+        toast("Patient not found", "error");
+        return;
+      }
+      switch (action) {
+        case "view-patient":
+          handleSelect(patient);
+          return;
+        case "message-patient":
+          setActiveTab("communications");
+          return;
+        case "schedule-followup":
+          setActiveTab("queue");
+          return;
+        default:
+          handleSelect(patient);
+          return;
+      }
+    }
+
+    // Tab-level quick actions
+    switch (action) {
+      case "add-patient":
+        setActiveTab("patients");
+        setSelectedPatient(null);
+        setFormMode("create");
+        return;
+      case "book-appointment":
+        // No dedicated Appointments tab wired into NAV_TABS yet — Queue is the closest equivalent for now
+        setActiveTab("queue");
+        return;
+      case "check-in":
+        setActiveTab("queue");
+        return;
+      case "create-invoice":
+      case "collect-payment":
+      case "pending-bills":
+      case "print-receipt":
+        setActiveTab("billing");
+        return;
+      case "start-consult":
+      case "add-note":
+        setActiveTab("consultations");
+        return;
+      case "create-rx":
+        setActiveTab("prescriptions");
+        return;
+      case "view-labs":
+        setActiveTab("lab");
+        return;
+      case "upload-doc":
+        setActiveTab("documents");
+        return;
+      case "send-message":
+        setActiveTab("communications");
+        return;
+      case "view-reports":
+        setActiveTab("reports");
+        return;
+      default:
+        toast(`"${action}" isn't wired up yet`, "error");
+    }
+  }, [patients, handleSelect, toast]);
+
   const handleUpdatePatient = useCallback(async (updated: Patient, action = "edited") => {
     try {
       await apiClient.updatePatient(updated.id, updated);
       setPatients((prev) => prev.map((p) => p.id === updated.id ? updated : p));
-      setSelectedPatient(updated);
+      // Only follow the update into the open profile if it's the patient currently being viewed —
+      // a status change triggered from elsewhere (e.g. Dashboard or Queue) must never swap which chart is on screen
+      setSelectedPatient((prev) => (prev && prev.id === updated.id ? updated : prev));
       const entry = createAuditEntry({
         patientId: updated.id,
         message:   `${CURRENT_USER.name} ${action}: ${updated.name}`,
@@ -495,8 +1205,11 @@ function AppInner() {
   }, [toast]);
 
   const handleDeletePatient = useCallback(async (id: string) => {
+    const p = patients.find((x) => x.id === id);
+    if (!window.confirm(`Permanently delete ${p ? p.name : "this patient"}'s record? This cannot be undone.`)) {
+      return;
+    }
     try {
-      const p = patients.find((x) => x.id === id);
       await apiClient.deletePatient(id);
       setPatients((prev) => prev.filter((x) => x.id !== id));
       setSelectedPatient(null);
@@ -559,6 +1272,9 @@ function AppInner() {
 
   // Handle logout (frontend-only mode - just clears data)
   const handleLogout = async () => {
+    if (!window.confirm("Log out now? Any unsaved changes in open forms will be lost.")) {
+      return;
+    }
     try {
       setPatients([]);
       setAuditMap({});
@@ -584,16 +1300,36 @@ function AppInner() {
   }
 
   return (
-    <div className="crm-root col" style={{ height: "100vh", overflow: "hidden" }}>
+    <div className="crm-root" style={{ height: "100vh", overflow: "hidden", display: "flex", flexDirection: "row" }}>
       <GlobalStyles dark={dark} />
 
-      <TopBar
+      <Sidebar
+        dark={dark}
+        activeTab={activeTab} setActiveTab={setActiveTab}
+        stats={stats}
+        userRole={userRole} setUserRole={setUserRole}
+        patients={patients}
+        onLogout={handleLogout}
+        setDark={setDark}
+      />
+
+      <BottomNav dark={dark} activeTab={activeTab} setActiveTab={setActiveTab} setDark={setDark} onLogout={handleLogout} />
+
+      {/* Main content area */}
+      <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", minWidth: 0 }}>
+
+      <ContentTopBar
         dark={dark} setDark={setDark}
         activeTab={activeTab} setActiveTab={setActiveTab}
         userRole={userRole} setUserRole={setUserRole}
-        stats={stats}
         patients={patients}
         onLogout={handleLogout}
+      />
+
+      <MobileTopBar
+        dark={dark}
+        activeTab={activeTab} setActiveTab={setActiveTab}
+        patients={patients}
       />
 
       {/* Stats bar — only on patients tab, only when not in profile view */}
@@ -604,9 +1340,10 @@ function AppInner() {
         />
       )}
 
-      {/* Ctrl+K hint */}
+      {/* Ctrl+K hint — desktop only; mobile has no physical keyboard for this shortcut, and the
+          fixed-bottom position would otherwise sit on top of the mobile bottom nav bar */}
       {activeTab === "patients" && !selectedPatient && (
-        <div style={{
+        <div className="desktop-only" style={{
           position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)",
           zIndex: 50, pointerEvents: "none",
           background: "var(--surface)", border: "1px solid var(--border)",
@@ -623,25 +1360,25 @@ function AppInner() {
       )}
 
       {/* Page content */}
-      <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+      <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }} className="page-content-wrap">
         {activeTab === "dashboard" && (
           <div style={{ flex: 1, overflow: "auto" }}>
-            <Dashboard patients={patients} />
+            <Dashboard patients={patients} userRole={userRole} onAction={handleDashboardAction} onUpdatePatient={handleUpdatePatient} />
           </div>
         )}
         {activeTab === "queue" && (
           <div style={{ flex: 1, overflow: "auto" }}>
-            <QueuePage patients={patients} />
+            <QueuePage patients={patients} onUpdatePatient={handleUpdatePatient} onAction={handleDashboardAction} />
           </div>
         )}
         {activeTab === "consultations" && (
           <div style={{ flex: 1, overflow: "auto" }}>
-            <ConsultationsPage patients={patients} />
+            <ConsultationsPage patients={patients} onUpdatePatient={handleUpdatePatient} />
           </div>
         )}
         {activeTab === "prescriptions" && (
           <div style={{ flex: 1, overflow: "auto" }}>
-            <AppointmentsPage patients={patients} />
+            <PrescriptionsPage patients={patients} />
           </div>
         )}
         {activeTab === "lab" && (
@@ -721,6 +1458,7 @@ function AppInner() {
       {importOpen && (
         <ImportModal onImport={handleImport} onClose={() => setImportOpen(false)} />
       )}
+      </div>{/* /main content area */}
     </div>
   );
 }

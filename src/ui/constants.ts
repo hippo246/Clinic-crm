@@ -66,14 +66,10 @@ export const ALERT_CONFIG: Record<AlertType, { bg: string; color: string; severi
   "High Risk":       { bg: "#fee2e2", color: "#991b1b", severity: "critical" },
 };
 
-export const ALERT_SEVERITY: Record<AlertType, string> = {
-  "Allergy":         "critical",
-  "Heart Condition": "critical",
-  "Pregnancy":       "critical",
-  "High Risk":       "critical",
-  "Hypertension":    "medium",
-  "Diabetic":        "medium",
-};
+// Derived from ALERT_CONFIG — single source of truth
+export const ALERT_SEVERITY = Object.fromEntries(
+  Object.entries(ALERT_CONFIG).map(([k, v]) => [k, v.severity]),
+) as Record<AlertType, string>;
 
 export const INS_CONFIG: Record<InsuranceStatus, { bg: string; color: string }> = {
   "Active":   { bg: "#dcfce7", color: "#15803d" },
@@ -105,10 +101,10 @@ export const QUICK_ACTIONS = [
   { icon: "ti-receipt",        label: "Create Invoice",      color: "#f59e0b" },
   { icon: "ti-phone",          label: "Call Patient",        color: "#22c55e" },
   { icon: "ti-clock",          label: "Schedule Follow-Up",  color: "#ec4899" },
-  { icon: "ti-message",        label: "Send Message",        color: "#4f7cff" },
+  { icon: "ti-message",        label: "Send Message",        color: "#00b4a0" },
 ] as const;
 
-export const PAGE_SIZE = 20;
+export const PAGE_SIZE = 20 as const;
 
 // RBAC
 export const PERMISSIONS: Record<string, string[]> = {
@@ -122,6 +118,7 @@ export const PERMISSIONS: Record<string, string[]> = {
 };
 
 export function can(role: string, permission: string): boolean {
+  if (!role) return false;
   const allowed = PERMISSIONS[permission];
   if (!allowed) return false;
   return allowed.includes(role);

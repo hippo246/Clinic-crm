@@ -22,6 +22,8 @@ interface PatientListProps {
   onNewPatient: () => void;
   onImport: () => void;
   role: UserRole;
+  onUpdatePatient?: (p: Patient) => void;
+  onDeletePatient?: (id: string) => void;
 }
 
 function QualityBar({ patients, onSearch }: { patients: Patient[]; onSearch: (q: string) => void }) {
@@ -39,7 +41,7 @@ function QualityBar({ patients, onSearch }: { patients: Patient[]; onSearch: (q:
   if (issues.length === 0) return null;
 
   return (
-    <div style={{
+    <div className="pl-quality-bar" style={{
       background: "var(--surface)", borderBottom: "1px solid var(--border)",
       padding: "8px 16px", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap",
     }}>
@@ -52,12 +54,90 @@ function QualityBar({ patients, onSearch }: { patients: Patient[]; onSearch: (q:
           display: "inline-flex", alignItems: "center", gap: 5,
           padding: "3px 10px", borderRadius: "var(--radius-full)", fontSize: "var(--font-xs)", fontWeight: 600,
           background: issue.color + "12", border: `1px solid ${issue.color}35`, color: issue.color,
-          cursor: "pointer",
+          cursor: "pointer", flexShrink: 0, whiteSpace: "nowrap",
         }}>
           <span style={{ fontWeight: 800 }}>{issue.count}</span>
           {issue.label}
         </button>
       ))}
+    </div>
+  );
+}
+
+function CallingScreen({ patient, onClose }: { patient: Patient; onClose: () => void }) {
+  const [callState, setCallState] = useState<"ringing" | "connected">("ringing");
+  const [duration, setDuration] = useState(0);
+  const [muted, setMuted] = useState(false);
+  const [speaker, setSpeaker] = useState(false);
+
+  useEffect(() => {
+    const ringTimer = setTimeout(() => setCallState("connected"), 2400);
+    return () => clearTimeout(ringTimer);
+  }, []);
+
+  useEffect(() => {
+    if (callState !== "connected") return;
+    const interval = setInterval(() => setDuration((d) => d + 1), 1000);
+    return () => clearInterval(interval);
+  }, [callState]);
+
+  const mm = String(Math.floor(duration / 60)).padStart(2, "0");
+  const ss = String(duration % 60).padStart(2, "0");
+
+  return (
+    <div className="modal-backdrop call-backdrop" onClick={onClose}>
+      <div className="modal call-screen" onClick={(e) => e.stopPropagation()}>
+        <div className="call-status-label">
+          {callState === "ringing" ? "Calling…" : "Connected"}
+        </div>
+
+        <div className="call-avatar-wrap">
+          {callState === "ringing" && (
+            <>
+              <span className="call-pulse-ring" style={{ animationDelay: "0s" }} />
+              <span className="call-pulse-ring" style={{ animationDelay: "0.7s" }} />
+            </>
+          )}
+          <AvatarCircle name={patient.name} size="lg" />
+        </div>
+
+        <div className="call-patient-name">{patient.name}</div>
+        <div className="call-patient-number">{patient.phone || "No number on file"}</div>
+        <div className="call-timer">
+          {callState === "ringing" ? "Ringing…" : `${mm}:${ss}`}
+        </div>
+
+        <div className="call-actions-row">
+          <button
+            type="button"
+            className={`call-icon-btn ${muted ? "call-icon-btn-active" : ""}`}
+            onClick={() => setMuted((m) => !m)}
+            title={muted ? "Unmute" : "Mute"}
+          >
+            <i className={`ti ti-microphone${muted ? "-off" : ""}`} />
+          </button>
+          <button
+            type="button"
+            className={`call-icon-btn ${speaker ? "call-icon-btn-active" : ""}`}
+            onClick={() => setSpeaker((s) => !s)}
+            title={speaker ? "Speaker off" : "Speaker on"}
+          >
+            <i className="ti ti-volume" />
+          </button>
+          <a
+            className="call-icon-btn"
+            href={patient.phone ? `tel:${patient.phone}` : undefined}
+            title="Open in phone app"
+            onClick={(e) => { if (!patient.phone) e.preventDefault(); }}
+          >
+            <i className="ti ti-device-mobile" />
+          </a>
+        </div>
+
+        <button type="button" className="call-end-btn" onClick={onClose} title="End call">
+          <i className="ti ti-phone-off" />
+        </button>
+      </div>
     </div>
   );
 }
@@ -69,6 +149,8 @@ export default function PatientList({
   onNewPatient,
   onImport,
   role,
+  onUpdatePatient,
+  onDeletePatient,
 }: PatientListProps) {
   const [search,          setSearch]         = useState("");
   const [filterStatus,    setFilterStatus]   = useState("All");
@@ -96,6 +178,8 @@ export default function PatientList({
   const [newTag, setNewTag] = useState("");
   const [showBulkStatusModal, setShowBulkStatusModal] = useState(false);
   const [bulkStatusTarget, setBulkStatusTarget] = useState<PatientStatus | "">("");
+  const [showBulkDoctorModal, setShowBulkDoctorModal] = useState(false);
+  const [bulkDoctorTarget, setBulkDoctorTarget] = useState("");
   const [showQuickNoteModal, setShowQuickNoteModal] = useState(false);
   const [selectedPatientForNote, setSelectedPatientForNote] = useState<Patient | null>(null);
   const [quickNoteText, setQuickNoteText] = useState("");
@@ -172,6 +256,16 @@ export default function PatientList({
   const [showOfflineMode, setShowOfflineMode] = useState(false);
   const [showComparisonExport, setShowComparisonExport] = useState(false);
   const [showComparisonHistory, setShowComparisonHistory] = useState(false);
+  const [callingPatient, setCallingPatient] = useState<Patient | null>(null);
+  const [isMobile, setIsMobile] = useState(() => typeof window !== "undefined" && window.innerWidth <= 640);
+  const [showMobileFilters, setShowMobileFilters] = useState(false);
+
+  // Track viewport width so the layout can adapt to phone screens
+  useEffect(() => {
+    const handleResize = () => setIsMobile(window.innerWidth <= 640);
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
 
   // Load saved filters from localStorage
   useEffect(() => {
@@ -233,7 +327,8 @@ export default function PatientList({
     }
   }, []);
 
-  // Load dark mode preference from localStorage
+  // Dark mode is managed by App.tsx — PatientList syncs its local preference to localStorage
+  // but does NOT manipulate document.documentElement (App.tsx owns that)
   useEffect(() => {
     const saved = localStorage.getItem("darkMode");
     if (saved) {
@@ -241,16 +336,7 @@ export default function PatientList({
     }
   }, []);
 
-  // Apply dark mode to document
-  useEffect(() => {
-    if (isDarkMode) {
-      document.documentElement.classList.add("dark");
-    } else {
-      document.documentElement.classList.remove("dark");
-    }
-  }, [isDarkMode]);
-
-  // Save dark mode preference to localStorage
+  // Save dark mode preference when changed from within PatientList
   useEffect(() => {
     localStorage.setItem("darkMode", JSON.stringify(isDarkMode));
   }, [isDarkMode]);
@@ -545,24 +631,20 @@ export default function PatientList({
     if (!newTag.trim()) return;
     const updatedTags = [...(patient.tags || []), newTag.trim()];
     const updatedPatient = { ...patient, tags: updatedTags };
-    const index = patients.findIndex(p => p.id === patient.id);
-    if (index !== -1) {
-      patients[index] = updatedPatient;
-      setSelectedPatientForTags(updatedPatient);
-      setFilterStatus(prev => prev);
+    if (onUpdatePatient) {
+      onUpdatePatient(updatedPatient);
     }
+    setSelectedPatientForTags(updatedPatient);
     setNewTag("");
   }
 
   function handleRemoveTag(patient: Patient, tag: string) {
     const updatedTags = (patient.tags || []).filter(t => t !== tag);
     const updatedPatient = { ...patient, tags: updatedTags };
-    const index = patients.findIndex(p => p.id === patient.id);
-    if (index !== -1) {
-      patients[index] = updatedPatient;
-      setSelectedPatientForTags(updatedPatient);
-      setFilterStatus(prev => prev);
+    if (onUpdatePatient) {
+      onUpdatePatient(updatedPatient);
     }
+    setSelectedPatientForTags(updatedPatient);
   }
 
   const allTags = useMemo(() => {
@@ -721,6 +803,11 @@ export default function PatientList({
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const paginated  = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
+  const activeFilterCount = [filterStatus !== "All", filterDoctor !== "All", filterInsurance !== "All", filterRisk !== "All", filterTag !== "All"].filter(Boolean).length;
+
+  // On phone-sized screens, the dense table doesn't fit — fall back to the card layout automatically
+  const effectiveView = isMobile && viewMode === "table" ? "card" : viewMode;
+
   function handleSort(key: keyof Patient) {
     setSortKey((prev) => {
       if (prev === key) { setSortDir((d) => d === "asc" ? "desc" : "asc"); return key; }
@@ -764,30 +851,50 @@ export default function PatientList({
   }
 
   function handleBulkDelete() {
-    if (confirm(`Are you sure you want to delete ${selectedPatients.size} patients?`)) {
+    if (!onDeletePatient) {
+      alert("Delete not available");
+      return;
+    }
+    if (confirm(`Are you sure you want to delete ${selectedPatients.size} patients? This cannot be undone.`)) {
       selectedPatients.forEach(patientId => {
-        const index = patients.findIndex(p => p.id === patientId);
-        if (index !== -1) {
-          patients.splice(index, 1);
-        }
+        onDeletePatient(patientId);
       });
       clearSelection();
-      setFilterStatus(prev => prev);
     }
   }
 
   function handleBulkStatusUpdate() {
     if (!bulkStatusTarget) return;
+    if (!onUpdatePatient) {
+      alert("Update not available");
+      return;
+    }
     selectedPatients.forEach(patientId => {
-      const index = patients.findIndex(p => p.id === patientId);
-      if (index !== -1) {
-        patients[index].status = bulkStatusTarget as PatientStatus;
+      const patient = patients.find(p => p.id === patientId);
+      if (patient) {
+        onUpdatePatient({ ...patient, status: bulkStatusTarget as PatientStatus });
       }
     });
     setShowBulkStatusModal(false);
     setBulkStatusTarget("");
     clearSelection();
-    setFilterStatus(prev => prev);
+  }
+
+  function handleBulkDoctorUpdate() {
+    if (!bulkDoctorTarget) return;
+    if (!onUpdatePatient) {
+      alert("Update not available");
+      return;
+    }
+    selectedPatients.forEach(patientId => {
+      const patient = patients.find(p => p.id === patientId);
+      if (patient) {
+        onUpdatePatient({ ...patient, doctor: bulkDoctorTarget });
+      }
+    });
+    setShowBulkDoctorModal(false);
+    setBulkDoctorTarget("");
+    clearSelection();
   }
 
   function handleQuickAction(action: string, patient: Patient) {
@@ -795,7 +902,8 @@ export default function PatientList({
     switch (action) {
       case "call":
         if (patient.phone) {
-          window.location.href = `tel:${patient.phone}`;
+          setCallingPatient(patient);
+          logAuditTrail("Called patient", patient.id, patient.name);
         } else {
           alert("No phone number available");
         }
@@ -814,12 +922,8 @@ export default function PatientList({
           const date = new Date(newDate);
           if (!isNaN(date.getTime())) {
             const updatedPatient = { ...patient, nextAppointment: date.toISOString() };
-            // Update patient in the list
-            const index = patients.findIndex(p => p.id === patient.id);
-            if (index !== -1) {
-              patients[index] = updatedPatient;
-              // Trigger re-render by updating state
-              setFilterStatus(prev => prev);
+            if (onUpdatePatient) {
+              onUpdatePatient(updatedPatient);
             }
             alert(`Appointment scheduled for ${fmtDate(date)}`);
           } else {
@@ -870,17 +974,163 @@ export default function PatientList({
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
+      <style>{`
+        .pl-toolbar-filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .pl-quick-filter-label { display: inline; }
+        .desktop-only { display: inline; }
+
+        /* Calling screen */
+        .call-backdrop { background: rgba(10, 10, 14, 0.75) !important; }
+        .call-screen {
+          width: 340px;
+          max-width: 340px;
+          background: linear-gradient(160deg, #1c2030 0%, #0c0e16 100%);
+          color: #fff;
+          border-radius: 28px;
+          padding: 40px 28px 32px;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          text-align: center;
+          box-shadow: 0 30px 70px rgba(0,0,0,0.5);
+        }
+        .call-status-label {
+          font-size: 12px;
+          letter-spacing: 1.5px;
+          text-transform: uppercase;
+          opacity: 0.55;
+          margin-bottom: 22px;
+        }
+        .call-avatar-wrap {
+          position: relative;
+          width: 104px;
+          height: 104px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          margin-bottom: 20px;
+        }
+        .call-pulse-ring {
+          position: absolute;
+          inset: 0;
+          border-radius: 50%;
+          border: 2px solid rgba(255,255,255,0.35);
+          animation: call-pulse 1.8s ease-out infinite;
+        }
+        @keyframes call-pulse {
+          0% { transform: scale(0.8); opacity: 0.8; }
+          100% { transform: scale(1.6); opacity: 0; }
+        }
+        .call-patient-name { font-size: 22px; font-weight: 700; }
+        .call-patient-number { font-size: 14px; opacity: 0.6; margin-top: 4px; }
+        .call-timer { font-size: 13px; opacity: 0.45; margin-top: 10px; min-height: 18px; }
+        .call-actions-row { display: flex; gap: 18px; margin-top: 40px; margin-bottom: 30px; }
+        .call-icon-btn {
+          width: 54px;
+          height: 54px;
+          border-radius: 50%;
+          border: none;
+          background: rgba(255,255,255,0.12);
+          color: #fff;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 20px;
+          cursor: pointer;
+          text-decoration: none;
+          transition: transform 0.15s ease, background 0.15s ease;
+        }
+        .call-icon-btn:hover { transform: scale(1.08); background: rgba(255,255,255,0.2); }
+        .call-icon-btn-active { background: #fff !important; color: #111 !important; }
+        .call-end-btn {
+          width: 64px;
+          height: 64px;
+          border-radius: 50%;
+          border: none;
+          background: linear-gradient(135deg, #ff5b5b, #e02424);
+          color: #fff;
+          font-size: 24px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          cursor: pointer;
+          box-shadow: 0 10px 24px rgba(224,36,36,0.45);
+          transition: transform 0.15s ease;
+        }
+        .call-end-btn:hover { transform: scale(1.06); }
+
+        /* Phone-sized screens */
+        @media (max-width: 640px) {
+          .desktop-only { display: none !important; }
+          .pl-hide-mobile { display: none !important; }
+          .pl-toolbar-filters { flex-wrap: wrap; }
+          .pl-toolbar-filters select { min-height: 36px; flex: 1 1 120px; }
+          .pl-select-filters {
+            display: grid !important;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            width: 100%;
+          }
+          .pl-select-filters select {
+            width: 100%;
+            min-width: 0 !important;
+            flex: unset !important;
+          }
+          .pl-toolbar { flex-wrap: wrap; row-gap: 8px; }
+          .pl-toolbar .pl-search { flex: 1 1 100% !important; min-width: unset !important; }
+          .pl-count-row { flex-wrap: wrap; }
+          /* Quick filter pills: tighter on mobile */
+          .pl-qf-btn { padding: 6px 10px !important; font-size: var(--font-xs) !important; }
+
+          /* Data-issues pills scroll sideways instead of wrapping into multiple rows */
+          .pl-quality-bar {
+            flex-wrap: nowrap !important;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            scrollbar-width: none;
+          }
+          .pl-quality-bar::-webkit-scrollbar { display: none; }
+          .pl-quality-bar > span { flex-shrink: 0; }
+
+          /* All modals go full-screen and edge-to-edge on phones */
+          .modal-backdrop { padding: 0 !important; align-items: stretch !important; }
+          .modal {
+            width: 100vw !important;
+            max-width: 100vw !important;
+            height: 100vh !important;
+            max-height: 100vh !important;
+            border-radius: 0 !important;
+            margin: 0 !important;
+          }
+
+          .call-screen {
+            justify-content: center;
+            padding: 60px 24px 40px;
+          }
+
+          .pl-grid-3 { grid-template-columns: 1fr !important; }
+
+          .pl-pagination { justify-content: center !important; }
+          .pl-pagination > div { justify-content: center; width: 100%; }
+
+          /* Hide filter-logic toggle — confusing on small screens */
+          .pl-filter-logic { display: none !important; }
+
+          /* Count row: keep only Export + New Patient on mobile */
+          .pl-count-import, .pl-count-print { display: none !important; }
+        }
+      `}</style>
       {/* Quality bar */}
       <QualityBar patients={patients} onSearch={(q) => { setSearch(q); resetPage(); }} />
 
       {/* Toolbar */}
-      <div style={{
+      <div className="pl-toolbar" style={{
         background: "var(--surface)", borderBottom: "1px solid var(--border)",
         padding: "10px 16px", flexShrink: 0, display: "flex",
         alignItems: "center", gap: 10, flexWrap: "wrap",
       }}>
         {/* Search */}
-        <div style={{ position: "relative", flex: "1 1 220px", minWidth: 180 }}>
+        <div className="pl-search" style={{ position: "relative", flex: "1 1 220px", minWidth: 180 }}>
           <i className="ti ti-search" style={{
             position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)",
             fontSize: 14, color: "var(--muted)", pointerEvents: "none",
@@ -957,8 +1207,9 @@ export default function PatientList({
         </div>
 
         {/* Quick Filters */}
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <div className="pl-toolbar-filters" style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <button
+            className="pl-qf-btn"
             onClick={() => { setQuickFilter(quickFilter === "highRisk" ? null : "highRisk"); resetPage(); }}
             style={{
               padding: "8px 14px",
@@ -972,9 +1223,10 @@ export default function PatientList({
             }}
           >
             <i className="ti ti-alert-triangle" style={{ fontSize: 14, marginRight: 4 }} />
-            High Risk
+            <span className="pl-quick-filter-label">{isMobile ? "Risk" : "High Risk"}</span>
           </button>
           <button
+            className="pl-qf-btn"
             onClick={() => { setQuickFilter(quickFilter === "overdue" ? null : "overdue"); resetPage(); }}
             style={{
               padding: "8px 14px",
@@ -988,9 +1240,10 @@ export default function PatientList({
             }}
           >
             <i className="ti ti-clock" style={{ fontSize: 14, marginRight: 4 }} />
-            Overdue
+            <span className="pl-quick-filter-label">Overdue</span>
           </button>
           <button
+            className="pl-qf-btn"
             onClick={() => { setQuickFilter(quickFilter === "newThisWeek" ? null : "newThisWeek"); resetPage(); }}
             style={{
               padding: "8px 14px",
@@ -1004,11 +1257,43 @@ export default function PatientList({
             }}
           >
             <i className="ti ti-calendar-plus" style={{ fontSize: 14, marginRight: 4 }} />
-            New This Week
+            <span className="pl-quick-filter-label">{isMobile ? "New" : "New This Week"}</span>
           </button>
+
+          {/* Mobile-only: Filters toggle button */}
+          {isMobile && (
+            <button
+              onClick={() => setShowMobileFilters(f => !f)}
+              style={{
+                padding: "6px 10px",
+                borderRadius: "var(--radius)",
+                border: `1px solid ${activeFilterCount > 0 ? "var(--accent)" : "var(--border)"}`,
+                background: activeFilterCount > 0 ? "var(--accent-soft)" : "var(--surface)",
+                color: activeFilterCount > 0 ? "var(--accent)" : "var(--muted)",
+                fontSize: "var(--font-xs)",
+                cursor: "pointer",
+                display: "flex", alignItems: "center", gap: 5,
+                marginLeft: "auto",
+              }}
+            >
+              <i className="ti ti-adjustments-horizontal" style={{ fontSize: 13 }} />
+              Filters
+              {activeFilterCount > 0 && (
+                <span style={{
+                  background: "var(--accent)", color: "#fff",
+                  borderRadius: "var(--radius-full)", fontSize: 10, fontWeight: 700,
+                  padding: "1px 5px", lineHeight: 1.4,
+                }}>
+                  {activeFilterCount}
+                </span>
+              )}
+            </button>
+          )}
         </div>
 
         {/* Filters */}
+        {(!isMobile || showMobileFilters) && (
+        <div className="pl-toolbar-filters pl-select-filters">
         <select value={filterStatus} onChange={(e) => { setFilterStatus(e.target.value); resetPage(); }}
           style={{ fontSize: "var(--font-sm)", minWidth: 110 }}>
           <option value="All">All Statuses</option>
@@ -1040,17 +1325,21 @@ export default function PatientList({
             {allTags.map((t) => <option key={t}>{t}</option>)}
           </select>
         )}
+        </div>
+        )}
 
-        {/* View Toggle */}
-        <div style={{ display: "flex", gap: 4, marginLeft: 8 }}>
-          <button
-            onClick={() => setViewMode("table")}
-            className="btn-icon"
-            title="Table view"
-            style={{ background: viewMode === "table" ? "var(--accent-soft)" : "transparent", color: viewMode === "table" ? "var(--accent)" : "var(--muted)" }}
-          >
-            <i className="ti ti-table" style={{ fontSize: 16 }} />
-          </button>
+        {/* View Toggle — hidden on mobile (view is forced to card) */}
+        <div className="pl-hide-mobile" style={{ display: "flex", gap: 4, marginLeft: 8 }}>
+          {!isMobile && (
+            <button
+              onClick={() => setViewMode("table")}
+              className="btn-icon"
+              title="Table view"
+              style={{ background: viewMode === "table" ? "var(--accent-soft)" : "transparent", color: viewMode === "table" ? "var(--accent)" : "var(--muted)" }}
+            >
+              <i className="ti ti-table" style={{ fontSize: 16 }} />
+            </button>
+          )}
           <button
             onClick={() => setViewMode("card")}
             className="btn-icon"
@@ -1078,7 +1367,7 @@ export default function PatientList({
         </div>
 
         {/* Column Customization */}
-        {viewMode === "table" && (
+        {effectiveView === "table" && (
           <button
             onClick={() => setShowPrintModal(true)}
             className="btn-icon"
@@ -1090,7 +1379,7 @@ export default function PatientList({
         )}
 
         {/* Group By */}
-        {viewMode === "table" && (
+        {effectiveView === "table" && (
           <select
             value={groupBy}
             onChange={(e) => setGroupBy(e.target.value as any)}
@@ -1106,7 +1395,7 @@ export default function PatientList({
 
         {/* Filter Logic Toggle */}
         {(filterStatus !== "All" || filterDoctor !== "All" || filterInsurance !== "All" || filterRisk !== "All" || filterTag !== "All") && (
-          <div style={{ display: "flex", alignItems: "center", gap: 4, marginLeft: 8, fontSize: "var(--font-xs)", color: "var(--muted)" }}>
+          <div className="pl-filter-logic" style={{ display: "flex", alignItems: "center", gap: 4, marginLeft: 8, fontSize: "var(--font-xs)", color: "var(--muted)" }}>
             <span>Filter Logic:</span>
             <button
               onClick={() => setFilterLogic(filterLogic === "AND" ? "OR" : "AND")}
@@ -1135,7 +1424,7 @@ export default function PatientList({
         )}
 
         <button 
-          className="btn-icon" 
+          className="btn-icon pl-hide-mobile" 
           onClick={() => setShowPrintModal(true)}
           title="Print"
         >
@@ -1143,15 +1432,15 @@ export default function PatientList({
         </button>
 
         <button 
-          className="btn-icon" 
+          className="btn-icon pl-hide-mobile" 
           onClick={() => setShowExportModal(true)}
-          title="Export"
+          title="Export options"
         >
-          <i className="ti ti-download" style={{ fontSize: 16 }} />
+          <i className="ti ti-adjustments-horizontal" style={{ fontSize: 16 }} />
         </button>
 
         <button 
-          className="btn-icon" 
+          className="btn-icon pl-hide-mobile" 
           onClick={() => setShowBulkActions(!showBulkActions)}
           title="Bulk Actions"
         >
@@ -1195,7 +1484,7 @@ export default function PatientList({
         )}
 
         <button 
-          className="btn-icon" 
+          className="btn-icon pl-hide-mobile" 
           onClick={() => setShowSaveFilterModal(true)}
           title="Save current filter"
           style={{ color: "var(--muted)" }}
@@ -1203,7 +1492,7 @@ export default function PatientList({
           <i className="ti ti-bookmark-plus" style={{ fontSize: 14 }} />
         </button>
 
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+        <div className="pl-count-row" style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{ fontSize: "var(--font-sm)", color: "var(--muted)", whiteSpace: "nowrap" }}>
             {filtered.length} patient{filtered.length !== 1 ? "s" : ""}
           </span>
@@ -1217,11 +1506,11 @@ export default function PatientList({
               {dupeCount} Duplicate{dupeCount > 1 ? "s" : ""}
             </button>
           )}
-          <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)" }} onClick={onImport}>
+          <button className="btn btn-ghost pl-count-import" style={{ fontSize: "var(--font-sm)" }} onClick={onImport}>
             <i className="ti ti-file-import" style={{ fontSize: 14 }} />
             <span className="desktop-only">Import</span>
           </button>
-          <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)" }} onClick={() => setShowPrintModal(true)}>
+          <button className="btn btn-ghost pl-count-print" style={{ fontSize: "var(--font-sm)" }} onClick={() => setShowPrintModal(true)}>
             <i className="ti ti-printer" style={{ fontSize: 14 }} />
             <span className="desktop-only">Print</span>
           </button>
@@ -1381,7 +1670,7 @@ export default function PatientList({
             <i className="ti ti-tag" style={{ fontSize: 14 }} />
             Assign Tags
           </button>
-          <button className="btn btn-ghost" onClick={() => alert("Bulk assign doctor functionality would be implemented here")} style={{ fontSize: "var(--font-sm)" }}>
+          <button className="btn btn-ghost" onClick={() => setShowBulkDoctorModal(true)} style={{ fontSize: "var(--font-sm)" }}>
             <i className="ti ti-user" style={{ fontSize: 14 }} />
             Assign Doctor
           </button>
@@ -1401,7 +1690,7 @@ export default function PatientList({
 
       {/* Table or Card View */}
       <div style={{ flex: 1, overflow: "auto" }}>
-        {viewMode === "table" ? (
+        {effectiveView === "table" ? (
           <table className="tbl" style={{ minWidth: 900 }}>
           <thead>
             <tr>
@@ -1528,12 +1817,29 @@ export default function PatientList({
             <PatientTimeline patients={filtered} />
           </div>
         ) : (
-          <div style={{ padding: "0 16px" }}>
+          <div style={{ padding: isMobile ? "8px" : "0 16px" }}>
             {paginated.length === 0 ? (
               <div className="empty-state">
                 <i className="ti ti-users empty-state-icon" />
                 <div className="empty-state-text">No patients found</div>
                 <div className="empty-state-sub">Try adjusting your search or filters</div>
+              </div>
+            ) : isMobile ? (
+              /* Mobile: compact grouped list — shows ~8 patients per screen */
+              <div style={{
+                background: "var(--surface)", border: "1px solid var(--border)",
+                borderRadius: "var(--radius-lg)", overflow: "hidden",
+              }}>
+                {paginated.map((p) => (
+                  <PatientCard
+                    key={p.id}
+                    patient={p}
+                    selected={selectedPatients.has(p.id)}
+                    onSelect={() => togglePatientSelection(p.id)}
+                    onQuickAction={(action) => handleQuickAction(action, p)}
+                    isMobile
+                  />
+                ))}
               </div>
             ) : (
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 16 }}>
@@ -1554,25 +1860,27 @@ export default function PatientList({
 
       {/* Pagination */}
       {totalPages > 1 && (
-        <div style={{
+        <div className="pl-pagination" style={{
           background: "var(--surface)", borderTop: "1px solid var(--border)",
           padding: "10px 16px", display: "flex", alignItems: "center",
-          justifyContent: "space-between", flexShrink: 0,
+          justifyContent: "space-between", flexShrink: 0, flexWrap: "wrap", gap: 8,
         }}>
           <span style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>
             Page {page} of {totalPages} · {filtered.length} records
           </span>
-          <div style={{ display: "flex", gap: 4 }}>
+          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
             <button className="btn btn-ghost" style={{ padding: "5px 10px", fontSize: "var(--font-sm)" }}
               disabled={page === 1} onClick={() => setPage((p) => p - 1)}>
               <i className="ti ti-chevron-left" style={{ fontSize: 13 }} />
             </button>
-            {Array.from({ length: Math.min(totalPages, 7) }, (_, i) => {
+            {Array.from({ length: Math.min(totalPages, isMobile ? 5 : 7) }, (_, i) => {
+              const maxButtons = isMobile ? 5 : 7;
+              const edgeBuffer = isMobile ? 2 : 3;
               let p_num = i + 1;
-              if (totalPages > 7) {
-                if (page <= 4) p_num = i + 1;
-                else if (page >= totalPages - 3) p_num = totalPages - 6 + i;
-                else p_num = page - 3 + i;
+              if (totalPages > maxButtons) {
+                if (page <= edgeBuffer + 1) p_num = i + 1;
+                else if (page >= totalPages - edgeBuffer) p_num = totalPages - maxButtons + 1 + i;
+                else p_num = page - edgeBuffer + i;
               }
               return (
                 <button key={p_num} onClick={() => setPage(p_num)}
@@ -1712,6 +2020,38 @@ export default function PatientList({
                     </button>
                   ))}
                 </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Doctor Assignment Modal */}
+      {showBulkDoctorModal && (
+        <div className="modal-backdrop" onClick={() => setShowBulkDoctorModal(false)}>
+          <div className="modal" style={{ maxWidth: 400 }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ padding: "16px 20px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: "var(--font-md)" }}>Assign Doctor</div>
+                <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{selectedPatients.size} patients selected</div>
+              </div>
+              <button className="btn-icon" onClick={() => setShowBulkDoctorModal(false)}><i className="ti ti-x" style={{ fontSize: 16 }} /></button>
+            </div>
+            <div style={{ padding: 20 }}>
+              <div style={{ marginBottom: 12 }}>
+                <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Assign to Doctor</label>
+                <select
+                  value={bulkDoctorTarget}
+                  onChange={(e) => setBulkDoctorTarget(e.target.value)}
+                  style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)" }}
+                >
+                  <option value="">Select doctor...</option>
+                  {DOCTORS.map((d) => <option key={d} value={d}>{d}</option>)}
+                </select>
+              </div>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                <button className="btn btn-ghost" onClick={() => setShowBulkDoctorModal(false)}>Cancel</button>
+                <button className="btn btn-primary" onClick={handleBulkDoctorUpdate} disabled={!bulkDoctorTarget}>Assign Doctor</button>
               </div>
             </div>
           </div>
@@ -2109,8 +2449,8 @@ export default function PatientList({
 
       {/* Export Modal */}
       {showExportModal && (
-        <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
-          <div style={{ background: "var(--surface)", borderRadius: "var(--radius)", padding: 24, width: "100%", maxWidth: 600 }}>
+        <div className="modal-backdrop" onClick={() => setShowExportModal(false)}>
+          <div className="modal" style={{ maxWidth: 600, position: "relative" }} onClick={(e) => e.stopPropagation()}>
             <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0, marginBottom: 16 }}>Export Patients</h2>
             <button onClick={() => setShowExportModal(false)} style={{ position: "absolute", top: 16, right: 16, background: "none", border: "none", fontSize: "1.5rem", cursor: "pointer" }}>×</button>
             <div style={{ marginBottom: 16 }}>
@@ -2123,7 +2463,7 @@ export default function PatientList({
             </div>
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
               <button className="btn btn-ghost" onClick={() => setShowExportModal(false)}>Cancel</button>
-              <button className="btn btn-primary" onClick={() => { setShowExportModal(false); }}>Export</button>
+              <button className="btn btn-primary" onClick={() => { exportPatientsToCSV(filtered); setShowExportModal(false); }}>Export</button>
             </div>
           </div>
         </div>
@@ -2140,7 +2480,7 @@ export default function PatientList({
 
       {/* Onboarding Checklist Modal */}
       {showOnboardingChecklist && (
-        <div className="modal-overlay" onClick={() => setShowOnboardingChecklist(false)}>
+        <div className="modal-backdrop" onClick={() => setShowOnboardingChecklist(false)}>
           <div className="modal" style={{ maxWidth: 500, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Patient Onboarding Checklist</h2>
@@ -2203,7 +2543,7 @@ export default function PatientList({
 
       {/* Audit Trail Modal */}
       {showAuditTrail && (
-        <div className="modal-overlay" onClick={() => setShowAuditTrail(false)}>
+        <div className="modal-backdrop" onClick={() => setShowAuditTrail(false)}>
           <div className="modal" style={{ maxWidth: 600, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Audit Trail</h2>
@@ -2245,7 +2585,7 @@ export default function PatientList({
 
       {/* Tag Colors Modal */}
       {showTagColors && (
-        <div className="modal-overlay" onClick={() => setShowTagColors(false)}>
+        <div className="modal-backdrop" onClick={() => setShowTagColors(false)}>
           <div className="modal" style={{ maxWidth: 500, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Tag Colors</h2>
@@ -2294,7 +2634,7 @@ export default function PatientList({
 
       {/* Keyboard Shortcuts Modal */}
       {showKeyboardShortcuts && (
-        <div className="modal-overlay" onClick={() => setShowKeyboardShortcuts(false)}>
+        <div className="modal-backdrop" onClick={() => setShowKeyboardShortcuts(false)}>
           <div className="modal" style={{ maxWidth: 500, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Keyboard Shortcuts</h2>
@@ -2340,7 +2680,7 @@ export default function PatientList({
 
       {/* Bulk Actions Modal */}
       {showBulkActions && (
-        <div className="modal-overlay" onClick={() => setShowBulkActions(false)}>
+        <div className="modal-backdrop" onClick={() => setShowBulkActions(false)}>
           <div className="modal" style={{ maxWidth: 500, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Bulk Actions</h2>
@@ -2423,7 +2763,7 @@ export default function PatientList({
 
       {/* Accessibility Help Modal */}
       {showAccessibilityHelp && (
-        <div className="modal-overlay" onClick={() => setShowAccessibilityHelp(false)}>
+        <div className="modal-backdrop" onClick={() => setShowAccessibilityHelp(false)}>
           <div className="modal" style={{ maxWidth: 500, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Accessibility Help</h2>
@@ -2464,7 +2804,7 @@ export default function PatientList({
 
       {/* Export Options Modal */}
       {showExportOptions && (
-        <div className="modal-overlay" onClick={() => setShowExportOptions(false)}>
+        <div className="modal-backdrop" onClick={() => setShowExportOptions(false)}>
           <div className="modal" style={{ maxWidth: 500, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Export Options</h2>
@@ -2542,7 +2882,7 @@ export default function PatientList({
 
       {/* Medication Adherence Modal */}
       {showMedicationAdherence && (
-        <div className="modal-overlay" onClick={() => setShowMedicationAdherence(false)}>
+        <div className="modal-backdrop" onClick={() => setShowMedicationAdherence(false)}>
           <div className="modal" style={{ maxWidth: 600, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Medication Adherence</h2>
@@ -2583,7 +2923,7 @@ export default function PatientList({
 
       {/* Lab Results Modal */}
       {showLabResults && (
-        <div className="modal-overlay" onClick={() => setShowLabResults(false)}>
+        <div className="modal-backdrop" onClick={() => setShowLabResults(false)}>
           <div className="modal" style={{ maxWidth: 700, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Lab Results</h2>
@@ -2658,7 +2998,7 @@ export default function PatientList({
 
       {/* Patient Journey Modal */}
       {showPatientJourney && (
-        <div className="modal-overlay" onClick={() => setShowPatientJourney(false)}>
+        <div className="modal-backdrop" onClick={() => setShowPatientJourney(false)}>
           <div className="modal" style={{ maxWidth: 800, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Patient Journey</h2>
@@ -2729,7 +3069,7 @@ export default function PatientList({
 
       {/* Bulk Messaging Modal */}
       {showBulkMessaging && (
-        <div className="modal-overlay" onClick={() => setShowBulkMessaging(false)}>
+        <div className="modal-backdrop" onClick={() => setShowBulkMessaging(false)}>
           <div className="modal" style={{ maxWidth: 600, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Bulk Messaging</h2>
@@ -2775,7 +3115,7 @@ export default function PatientList({
 
       {/* Version History Modal */}
       {showVersionHistory && (
-        <div className="modal-overlay" onClick={() => setShowVersionHistory(false)}>
+        <div className="modal-backdrop" onClick={() => setShowVersionHistory(false)}>
           <div className="modal" style={{ maxWidth: 700, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Version History</h2>
@@ -2837,7 +3177,7 @@ export default function PatientList({
 
       {/* Approval Workflows Modal */}
       {showApprovalWorkflows && (
-        <div className="modal-overlay" onClick={() => setShowApprovalWorkflows(false)}>
+        <div className="modal-backdrop" onClick={() => setShowApprovalWorkflows(false)}>
           <div className="modal" style={{ maxWidth: 700, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Approval Workflows</h2>
@@ -2890,7 +3230,7 @@ export default function PatientList({
 
       {/* Recent Actions Modal */}
       {showRecentActions && (
-        <div className="modal-overlay" onClick={() => setShowRecentActions(false)}>
+        <div className="modal-backdrop" onClick={() => setShowRecentActions(false)}>
           <div className="modal" style={{ maxWidth: 600, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Recent Actions</h2>
@@ -2929,7 +3269,7 @@ export default function PatientList({
 
       {/* Filter Templates Modal */}
       {showFilterTemplates && (
-        <div className="modal-overlay" onClick={() => setShowFilterTemplates(false)}>
+        <div className="modal-backdrop" onClick={() => setShowFilterTemplates(false)}>
           <div className="modal" style={{ maxWidth: 600, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Filter Templates</h2>
@@ -2972,7 +3312,7 @@ export default function PatientList({
 
       {/* Tag Hierarchy Modal */}
       {showTagHierarchy && (
-        <div className="modal-overlay" onClick={() => setShowTagHierarchy(false)}>
+        <div className="modal-backdrop" onClick={() => setShowTagHierarchy(false)}>
           <div className="modal" style={{ maxWidth: 600, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Tag Hierarchy</h2>
@@ -3024,7 +3364,7 @@ export default function PatientList({
 
       {/* Tag Suggestions Modal */}
       {showTagSuggestions && (
-        <div className="modal-overlay" onClick={() => setShowTagSuggestions(false)}>
+        <div className="modal-backdrop" onClick={() => setShowTagSuggestions(false)}>
           <div className="modal" style={{ maxWidth: 600, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Tag Suggestions</h2>
@@ -3077,7 +3417,7 @@ export default function PatientList({
 
       {/* Export Timeline Modal */}
       {showExportTimeline && (
-        <div className="modal-overlay" onClick={() => setShowExportTimeline(false)}>
+        <div className="modal-backdrop" onClick={() => setShowExportTimeline(false)}>
           <div className="modal" style={{ maxWidth: 500, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Export Timeline</h2>
@@ -3134,7 +3474,7 @@ export default function PatientList({
 
       {/* Signature Capture Modal */}
       {showSignatureCapture && (
-        <div className="modal-overlay" onClick={() => setShowSignatureCapture(false)}>
+        <div className="modal-backdrop" onClick={() => setShowSignatureCapture(false)}>
           <div className="modal" style={{ maxWidth: 500, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Signature Capture</h2>
@@ -3194,7 +3534,7 @@ export default function PatientList({
 
       {/* Context Menus Modal */}
       {showContextMenus && (
-        <div className="modal-overlay" onClick={() => setShowContextMenus(false)}>
+        <div className="modal-backdrop" onClick={() => setShowContextMenus(false)}>
           <div className="modal" style={{ maxWidth: 500, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Context Menus</h2>
@@ -3239,7 +3579,7 @@ export default function PatientList({
 
       {/* Drag and Drop Modal */}
       {showDragDrop && (
-        <div className="modal-overlay" onClick={() => setShowDragDrop(false)}>
+        <div className="modal-backdrop" onClick={() => setShowDragDrop(false)}>
           <div className="modal" style={{ maxWidth: 500, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Drag and Drop Reordering</h2>
@@ -3321,7 +3661,7 @@ export default function PatientList({
 
       {/* Notification Rules Modal */}
       {showNotificationRules && (
-        <div className="modal-overlay" onClick={() => setShowNotificationRules(false)}>
+        <div className="modal-backdrop" onClick={() => setShowNotificationRules(false)}>
           <div className="modal" style={{ maxWidth: 600, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Automated Notification Rules</h2>
@@ -3375,7 +3715,7 @@ export default function PatientList({
 
       {/* Filter Analytics Modal */}
       {showFilterAnalytics && (
-        <div className="modal-overlay" onClick={() => setShowFilterAnalytics(false)}>
+        <div className="modal-backdrop" onClick={() => setShowFilterAnalytics(false)}>
           <div className="modal" style={{ maxWidth: 600, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Filter Analytics</h2>
@@ -3427,7 +3767,7 @@ export default function PatientList({
 
       {/* Custom Shortcuts Modal */}
       {showCustomShortcuts && (
-        <div className="modal-overlay" onClick={() => setShowCustomShortcuts(false)}>
+        <div className="modal-backdrop" onClick={() => setShowCustomShortcuts(false)}>
           <div className="modal" style={{ maxWidth: 600, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Custom Action Shortcuts</h2>
@@ -3485,7 +3825,7 @@ export default function PatientList({
 
       {/* Filter Sharing Modal */}
       {showFilterSharing && (
-        <div className="modal-overlay" onClick={() => setShowFilterSharing(false)}>
+        <div className="modal-backdrop" onClick={() => setShowFilterSharing(false)}>
           <div className="modal" style={{ maxWidth: 600, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Filter Sharing</h2>
@@ -3529,7 +3869,7 @@ export default function PatientList({
 
       {/* Offline Mode Modal */}
       {showOfflineMode && (
-        <div className="modal-overlay" onClick={() => setShowOfflineMode(false)}>
+        <div className="modal-backdrop" onClick={() => setShowOfflineMode(false)}>
           <div className="modal" style={{ maxWidth: 500, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Offline Mode</h2>
@@ -3600,7 +3940,7 @@ export default function PatientList({
 
       {/* Comparison Export Modal */}
       {showComparisonExport && (
-        <div className="modal-overlay" onClick={() => setShowComparisonExport(false)}>
+        <div className="modal-backdrop" onClick={() => setShowComparisonExport(false)}>
           <div className="modal" style={{ maxWidth: 500, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Export Comparison to PDF</h2>
@@ -3662,7 +4002,7 @@ export default function PatientList({
 
       {/* Comparison History Modal */}
       {showComparisonHistory && (
-        <div className="modal-overlay" onClick={() => setShowComparisonHistory(false)}>
+        <div className="modal-backdrop" onClick={() => setShowComparisonHistory(false)}>
           <div className="modal" style={{ maxWidth: 600, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Comparison History</h2>
@@ -3721,6 +4061,11 @@ export default function PatientList({
             </div>
           </div>
         </div>
+      )}
+
+      {/* Calling Screen */}
+      {callingPatient && (
+        <CallingScreen patient={callingPatient} onClose={() => setCallingPatient(null)} />
       )}
     </div>
   );
@@ -4043,7 +4388,7 @@ function PatientDashboard({ patients }: { patients: Patient[] }) {
             
             return (
               <>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16 }}>
+                <div className="pl-grid-3" style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16 }}>
                   <div style={{ textAlign: "center", padding: 16, background: "var(--surface2)", borderRadius: "var(--radius-sm)" }}>
                     <div style={{ fontSize: "var(--font-2xl)", fontWeight: 700, color: "var(--green)" }}>{onTimeCount}</div>
                     <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>On Time</div>
@@ -4114,7 +4459,7 @@ function PatientTimeline({ patients }: { patients: Patient[] }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
-      <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+      <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
         {[
           { value: "all", label: "All Time" },
           { value: "7d", label: "7 Days" },
@@ -4138,7 +4483,7 @@ function PatientTimeline({ patients }: { patients: Patient[] }) {
         ))}
       </div>
 
-      <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+      <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
         {[
           { value: "all", label: "All Severity" },
           { value: "high", label: "High Risk" },
@@ -4305,13 +4650,67 @@ function PatientCard({
   selected,
   onSelect,
   onQuickAction,
+  isMobile = false,
 }: {
   patient: Patient;
   selected: boolean;
   onSelect: () => void;
   onQuickAction: (action: string) => void;
+  isMobile?: boolean;
 }) {
   const risk = calcRiskScore(p);
+
+  /* ── Mobile: compact list row (contacts-app style) ── */
+  if (isMobile) {
+    return (
+      <div
+        onClick={() => onQuickAction("profile")}
+        style={{
+          display: "flex", alignItems: "center", gap: 12,
+          padding: "11px 14px", cursor: "pointer",
+          borderBottom: "1px solid var(--border)",
+          transition: "background 0.1s",
+          WebkitTapHighlightColor: "transparent",
+        }}
+      >
+        <AvatarCircle name={p.name} size="sm" />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{
+            fontSize: "var(--font-sm)", fontWeight: 700, color: "var(--text)",
+            whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+          }}>
+            {p.name}
+          </div>
+          <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginTop: 1 }}>
+            {p.age}y · {p.gender} · {p.doctor}
+          </div>
+          {(p.alerts || []).length > 0 && (
+            <div style={{ display: "flex", gap: 4, marginTop: 3 }}>
+              {(p.alerts || []).slice(0, 2).map(a => <AlertChip key={a} alert={a} />)}
+              {(p.alerts || []).length > 2 && (
+                <span style={{ fontSize: "var(--font-2xs)", color: "var(--muted)" }}>
+                  +{(p.alerts || []).length - 2}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4, flexShrink: 0 }}>
+          <StatusBadge status={p.status} />
+          <span className="badge" style={{
+            fontSize: "var(--font-2xs)", padding: "1px 6px",
+            background: risk.level === "Critical" ? "var(--red-bg)" : risk.level === "High" ? "var(--amber-bg)" : risk.level === "Medium" ? "var(--blue-bg)" : "var(--green-bg)",
+            color: risk.level === "Critical" ? "var(--red)" : risk.level === "High" ? "var(--amber)" : risk.level === "Medium" ? "var(--blue)" : "var(--green)",
+          }}>
+            {risk.level}
+          </span>
+        </div>
+        <i className="ti ti-chevron-right" style={{ fontSize: 13, color: "var(--border)", flexShrink: 0 }} />
+      </div>
+    );
+  }
+
+  /* ── Desktop: full card ── */
   return (
     <div
       className="card card-padded"
@@ -4392,36 +4791,16 @@ function PatientCard({
       </div>
 
       <div style={{ display: "flex", gap: 8, borderTop: "1px solid var(--border)", paddingTop: 12 }}>
-        <button
-          onClick={(e) => { e.stopPropagation(); onQuickAction("call"); }}
-          className="btn-icon"
-          style={{ flex: 1 }}
-          title="Call"
-        >
+        <button onClick={(e) => { e.stopPropagation(); onQuickAction("call"); }} className="btn-icon" style={{ flex: 1 }} title="Call">
           <i className="ti ti-phone" style={{ fontSize: 14 }} />
         </button>
-        <button
-          onClick={(e) => { e.stopPropagation(); onQuickAction("email"); }}
-          className="btn-icon"
-          style={{ flex: 1 }}
-          title="Email"
-        >
+        <button onClick={(e) => { e.stopPropagation(); onQuickAction("email"); }} className="btn-icon" style={{ flex: 1 }} title="Email">
           <i className="ti ti-mail" style={{ fontSize: 14 }} />
         </button>
-        <button
-          onClick={(e) => { e.stopPropagation(); onQuickAction("schedule"); }}
-          className="btn-icon"
-          style={{ flex: 1 }}
-          title="Schedule"
-        >
+        <button onClick={(e) => { e.stopPropagation(); onQuickAction("schedule"); }} className="btn-icon" style={{ flex: 1 }} title="Schedule">
           <i className="ti ti-calendar" style={{ fontSize: 14 }} />
         </button>
-        <button
-          onClick={(e) => { e.stopPropagation(); onQuickAction("note"); }}
-          className="btn-icon"
-          style={{ flex: 1 }}
-          title="Add Note"
-        >
+        <button onClick={(e) => { e.stopPropagation(); onQuickAction("note"); }} className="btn-icon" style={{ flex: 1 }} title="Add Note">
           <i className="ti ti-note" style={{ fontSize: 14 }} />
         </button>
       </div>
@@ -4867,7 +5246,7 @@ function RemindersModal({ reminders, onClose, onToggleComplete }: {
   const completedReminders = reminders.filter(r => r.completed);
   
   return (
-    <div className="modal-overlay" onClick={onClose}>
+    <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" style={{ maxWidth: 500, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
           <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Reminders</h2>

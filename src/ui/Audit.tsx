@@ -3,6 +3,9 @@ import { fmtDate } from "./utils";
 
 export default function AuditPage() {
   const [activeTab, setActiveTab] = useState<"login" | "edits" | "deleted" | "permissions" | "suspicious">("login");
+  const [dateRange, setDateRange] = useState("7d");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [selectedUser, setSelectedUser] = useState("All");
 
   const loginLogs = [
     { id: 1, user: "Dr. Sarah Johnson", email: "sarah.johnson@clinic.com", ip: "192.168.1.100", timestamp: new Date(Date.now() - 5 * 60 * 1000).toISOString(), status: "success" },
@@ -98,6 +101,18 @@ export default function AuditPage() {
           <TabButton active={activeTab === "permissions"} onClick={() => setActiveTab("permissions")}>Permission Changes</TabButton>
           <TabButton active={activeTab === "suspicious"} onClick={() => setActiveTab("suspicious")}>Suspicious Activity</TabButton>
         </div>
+      </div>
+
+      {/* Filters */}
+      <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
+        <input type="text" placeholder="Search..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} style={{ padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)", flex: 1 }} />
+        <select value={dateRange} onChange={(e) => setDateRange(e.target.value)} style={{ padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)" }}>
+          <option value="24h">Last 24h</option>
+          <option value="7d">Last 7 days</option>
+          <option value="30d">Last 30 days</option>
+          <option value="all">All time</option>
+        </select>
+        <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)" }}><i className="ti ti-download" style={{ fontSize: 12 }} /> Export</button>
       </div>
 
       {/* Tab Content */}

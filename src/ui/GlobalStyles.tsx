@@ -331,6 +331,15 @@ export default function GlobalStyles({ dark }: GlobalStylesProps) {
       /* ── Mono ── */
       .mono { font-family: 'JetBrains Mono', monospace; }
 
+      /* ── Mobile bottom nav padding ── */
+      @media (max-width: 768px) {
+        .page-content-wrap {
+          padding-bottom: calc(76px + env(safe-area-inset-bottom));
+        }
+        /* Prevent tap highlight on nav buttons */
+        button { -webkit-tap-highlight-color: transparent; }
+      }
+
       /* ── Responsive ── */
       @media (max-width: 768px) {
         .desktop-only { display: none !important; }
@@ -384,12 +393,6 @@ export default function GlobalStyles({ dark }: GlobalStylesProps) {
         /* Mobile form adjustments */
         .field-group {
           margin-bottom: 16px;
-        }
-        
-        /* Mobile navigation */
-        .crm-root > div:first-of-type {
-          padding: 0 12px;
-          height: 60px;
         }
         
         /* Mobile stats bar */

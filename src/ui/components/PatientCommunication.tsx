@@ -60,7 +60,19 @@ export function PatientCommunication({ patientId, patientName, patientPhone, pat
       justifyContent: 'center',
       zIndex: 1000,
     }}>
-      <div style={{
+      <style>{`
+        @media (max-width: 640px) {
+          .pc-modal {
+            width: 100vw !important;
+            max-width: 100vw !important;
+            height: 100dvh !important;
+            max-height: 100dvh !important;
+            border-radius: 0 !important;
+            margin: 0 !important;
+          }
+        }
+      `}</style>
+      <div className="pc-modal" style={{
         background: 'white',
         borderRadius: '12px',
         padding: '2rem',

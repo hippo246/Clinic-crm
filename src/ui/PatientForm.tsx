@@ -212,7 +212,20 @@ export default function PatientForm({ mode, patient, onSave, onClose, role }: Pa
 
   return (
     <div className="modal-backdrop">
-      <div className="modal" style={{ width: "100%", maxWidth: 800 }}>
+      <div className="modal pf-modal" style={{ width: "100%", maxWidth: 800 }}>
+        <style>{`
+          @media (max-width: 640px) {
+            .pf-modal { max-width: 100% !important; width: 100% !important; margin: 0 !important; border-radius: 0 !important; height: 100dvh; display: flex; flex-direction: column; }
+            .pf-modal .pf-body { flex: 1; overflow-y: auto; }
+            .pf-modal .pf-footer { position: sticky; bottom: 0; }
+            .pf-tabs button { padding: 10px 10px !important; font-size: 11px !important; }
+            .pf-tabs button span.pf-tab-label { display: none; }
+            .pf-form-row { grid-template-columns: 1fr !important; }
+            .pf-modal input, .pf-modal select, .pf-modal textarea { min-height: 40px; font-size: 16px !important; }
+            .pf-step-label { display: none; }
+            .pf-steps { gap: 6px !important; }
+          }
+        `}</style>
         {/* Header */}
         <div style={{
           padding: "16px 20px", borderBottom: "1px solid var(--border)",
@@ -245,7 +258,7 @@ export default function PatientForm({ mode, patient, onSave, onClose, role }: Pa
 
         {/* Progress bar */}
         <div style={{ padding: "12px 20px", background: "var(--surface2)" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div className="pf-steps" style={{ display: "flex", alignItems: "center", gap: 12 }}>
             {SECTIONS.map((s, i) => (
               <React.Fragment key={s.id}>
                 <div style={{
@@ -254,8 +267,8 @@ export default function PatientForm({ mode, patient, onSave, onClose, role }: Pa
                   fontSize: "var(--font-xs)", fontWeight: i <= currentSectionIndex ? 600 : 400,
                 }}>
                   <i className={`ti ${i < currentSectionIndex ? "ti-circle-check-filled" : s.icon}`} style={{ fontSize: 12 }} />
-                  {s.label}
-                  {s.required && <span style={{ color: "var(--red)" }}>*</span>}
+                  <span className="pf-step-label">{s.label}</span>
+                  {s.required && <span className="pf-step-label" style={{ color: "var(--red)" }}>*</span>}
                 </div>
                 {i < SECTIONS.length - 1 && (
                   <div style={{
@@ -272,7 +285,7 @@ export default function PatientForm({ mode, patient, onSave, onClose, role }: Pa
         </div>
 
         {/* Sections */}
-        <div style={{ display: "flex", gap: 0, borderBottom: "1px solid var(--border)", padding: "0 20px" }}>
+        <div className="pf-tabs" style={{ display: "flex", gap: 0, borderBottom: "1px solid var(--border)", padding: "0 20px" }}>
           {SECTIONS.map(({ id, label, icon }) => (
             <button key={id} onClick={() => setSection(id)} style={{
               display: "inline-flex", alignItems: "center", gap: 6,
@@ -282,13 +295,13 @@ export default function PatientForm({ mode, patient, onSave, onClose, role }: Pa
               background: "none", border: "none", cursor: "pointer", transition: "all 0.15s",
             }}>
               <i className={`ti ${icon}`} style={{ fontSize: 13 }} />
-              {label}
+              <span className="pf-tab-label">{label}</span>
             </button>
           ))}
         </div>
 
         {/* Form body */}
-        <div style={{ padding: "20px", maxHeight: "calc(80vh - 200px)", overflowY: "auto" }}>
+        <div className="pf-body" style={{ padding: "20px", maxHeight: "calc(80vh - 200px)", overflowY: "auto" }}>
           {section === "personal" && (
             <FormSection>
               <FormRow>
@@ -821,10 +834,10 @@ export default function PatientForm({ mode, patient, onSave, onClose, role }: Pa
         </div>
 
         {/* Footer */}
-        <div style={{
+        <div className="pf-footer" style={{
           padding: "14px 20px", borderTop: "1px solid var(--border)",
           display: "flex", alignItems: "center", justifyContent: "space-between",
-          background: "var(--surface2)",
+          background: "var(--surface2)", flexWrap: "wrap", gap: 8,
         }}>
           <div style={{ display: "flex", gap: 8 }}>
             <button 
@@ -864,7 +877,7 @@ function FormSection({ children }: { children: React.ReactNode }) {
 }
 
 function FormRow({ children }: { children: React.ReactNode }) {
-  return <div style={{ display: "grid", gridTemplateColumns: `repeat(${React.Children.count(children)}, 1fr)`, gap: 12 }}>{children}</div>;
+  return <div className="pf-form-row" style={{ display: "grid", gridTemplateColumns: `repeat(${React.Children.count(children)}, 1fr)`, gap: 12 }}>{children}</div>;
 }
 
 function Field({ label, error, touched, children }: { label: string; error?: string; touched?: boolean; children: React.ReactNode }) {

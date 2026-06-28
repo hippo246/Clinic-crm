@@ -320,6 +320,24 @@ export default function PatientProfile({
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
+      <style>{`
+        .pp-identity { padding: 14px 16px 10px; display: flex; align-items: flex-start; gap: 12; }
+        .pp-identity .pp-actions { display: flex; gap: 6px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+        .pp-tabs { padding: 0 16px; display: flex; gap: 2px; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+        .pp-tabs::-webkit-scrollbar { display: none; }
+        .pp-tab-content { padding: 16px; }
+        @media (max-width: 640px) {
+          .pp-identity { flex-wrap: wrap; padding: 10px 12px 8px !important; }
+          .pp-identity .pp-actions { width: 100%; justify-content: flex-start; margin-top: 4px; }
+          .pp-identity .pp-actions .btn { min-height: 36px; }
+          .pp-tab-content { padding: 10px !important; }
+          .pp-tabs button { padding: 8px 10px !important; font-size: 11px !important; }
+          .pp-tabs button .pp-tab-label { display: none; }
+          .pp-tabs button i { font-size: 16px !important; }
+          /* On small screens keep only Age+Blood in the meta row; DOB/ID/Doctor are secondary */
+          .pp-meta-id, .pp-meta-doctor { display: none !important; }
+        }
+      `}</style>
       {/* ── Header ── */}
       <div style={{
         background: "var(--surface)", borderBottom: "1px solid var(--border)",
@@ -357,7 +375,7 @@ export default function PatientProfile({
         )}
 
         {/* Identity row */}
-        <div style={{ padding: "14px 16px 10px", display: "flex", alignItems: "flex-start", gap: 12 }}>
+        <div className="pp-identity" style={{ padding: "14px 16px 10px", display: "flex", alignItems: "flex-start", gap: 12 }}>
           <button className="btn btn-ghost" onClick={onBack} style={{ padding: "6px 10px", fontSize: "var(--font-sm)", flexShrink: 0 }}>
             <i className="ti ti-arrow-left" style={{ fontSize: 14 }} />
             <span className="desktop-only">Back</span>
@@ -389,13 +407,13 @@ export default function PatientProfile({
             </div>
             <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginTop: 4 }}>
               {[
-                { label: "ID",      value: patient.id,           icon: "ti-id" },
-                { label: "Age",     value: `${patient.age}y · ${patient.gender}`, icon: "ti-user" },
-                { label: "DOB",     value: fmtDate(patient.dob), icon: "ti-calendar" },
-                { label: "Blood",   value: patient.bloodGroup,   icon: "ti-droplet" },
-                { label: "Doctor",  value: patient.doctor,       icon: "ti-stethoscope" },
-              ].map(({ label, value, icon }) => (
-                <span key={label} style={{ fontSize: "var(--font-xs)", color: "var(--muted)", display: "flex", alignItems: "center", gap: 4 }}>
+                { label: "ID",      value: patient.id,           icon: "ti-id",          cls: "pp-meta-id" },
+                { label: "Age",     value: `${patient.age}y · ${patient.gender}`, icon: "ti-user", cls: "" },
+                { label: "DOB",     value: fmtDate(patient.dob), icon: "ti-calendar",    cls: "desktop-only" },
+                { label: "Blood",   value: patient.bloodGroup,   icon: "ti-droplet",     cls: "" },
+                { label: "Doctor",  value: patient.doctor,       icon: "ti-stethoscope", cls: "pp-meta-doctor" },
+              ].map(({ label, value, icon, cls }) => (
+                <span key={label} className={cls} style={{ fontSize: "var(--font-xs)", color: "var(--muted)", display: "flex", alignItems: "center", gap: 4 }}>
                   <i className={`ti ${icon}`} style={{ fontSize: 11 }} />
                   <strong style={{ color: "var(--text)" }}>{value}</strong>
                 </span>
@@ -411,7 +429,7 @@ export default function PatientProfile({
           </div>
 
           {/* Right actions */}
-          <div style={{ display: "flex", gap: 6, flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end" }}>
+          <div className="pp-actions" style={{ display: "flex", gap: 6, flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end" }}>
             <button className="btn btn-ghost" onClick={() => setShowEmergency(true)} style={{ fontSize: "var(--font-sm)" }}>
               <i className="ti ti-emergency-bed" style={{ fontSize: 14, color: "var(--red)" }} />
               <span className="desktop-only">Emergency</span>
@@ -451,7 +469,7 @@ export default function PatientProfile({
         )}
 
         {/* Tab bar */}
-        <div style={{ padding: "0 16px", display: "flex", gap: 2, overflowX: "auto" }}>
+        <div className="pp-tabs" style={{ padding: "0 16px", display: "flex", gap: 2, overflowX: "auto" }}>
           {PROFILE_TABS.map(({ id, label, icon }) => (
             <button
               key={id}
@@ -469,7 +487,7 @@ export default function PatientProfile({
               }}
             >
               <i className={`ti ${icon}`} style={{ fontSize: 13 }} />
-              {label}
+              <span className="pp-tab-label">{label}</span>
               {tabCounts[id] !== undefined && tabCounts[id]! > 0 && (
                 <span style={{
                   fontSize: "var(--font-2xs)", fontWeight: 700, padding: "1px 5px",
@@ -487,7 +505,7 @@ export default function PatientProfile({
 
       {/* ── Tab Content ── */}
       <div style={{ flex: 1, overflow: "auto", background: "var(--bg)" }}>
-        <div className="fade-in" key={tab} style={{ padding: 16 }}>
+        <div className="fade-in pp-tab-content" key={tab} style={{ padding: 16 }}>
           {tab === "overview"  && (
             <OverviewTab 
               patient={patient} 

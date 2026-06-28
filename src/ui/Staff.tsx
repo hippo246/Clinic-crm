@@ -13,7 +13,28 @@ interface StaffMember {
   permissions: string[];
 }
 
+interface Schedule {
+  id: string;
+  staffId: string;
+  staffName: string;
+  date: string;
+  startTime: string;
+  endTime: string;
+  type: "consultation" | "surgery" | "admin" | "break";
+}
+
+interface PerformanceMetrics {
+  staffId: string;
+  staffName: string;
+  patientsSeen: number;
+  avgConsultTime: number;
+  patientSatisfaction: number;
+  onTimeRate: number;
+  completedTasks: number;
+}
+
 export default function StaffPage() {
+  const [activeTab, setActiveTab] = useState<"staff" | "schedule" | "performance" | "permissions">("staff");
   const [showAddStaff, setShowAddStaff] = useState(false);
   const [selectedStaff, setSelectedStaff] = useState<StaffMember | null>(null);
 
@@ -99,18 +120,30 @@ export default function StaffPage() {
         <StatCard label="Active" value={staff.filter(s => s.status === "active").length} color="var(--green)" icon="ti-check" bg="var(--green-bg)" />
       </div>
 
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
-        <div style={{ display: "flex", gap: 8 }}>
-          <FilterButton active>All Staff</FilterButton>
-          <FilterButton>Doctors</FilterButton>
-          <FilterButton>Receptionists</FilterButton>
-          <FilterButton>Nurses</FilterButton>
+      {/* Tab Navigation */}
+      <div style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", gap: 8, borderBottom: "1px solid var(--border)", paddingBottom: 8 }}>
+          <TabButton active={activeTab === "staff"} onClick={() => setActiveTab("staff")}>Staff List</TabButton>
+          <TabButton active={activeTab === "schedule"} onClick={() => setActiveTab("schedule")}>Schedule</TabButton>
+          <TabButton active={activeTab === "performance"} onClick={() => setActiveTab("performance")}>Performance</TabButton>
+          <TabButton active={activeTab === "permissions"} onClick={() => setActiveTab("permissions")}>Permissions</TabButton>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowAddStaff(true)}>
-          <i className="ti ti-plus" style={{ fontSize: 14, marginRight: 4 }} />
-          Add Staff Member
-        </button>
       </div>
+
+      {activeTab === "staff" && (
+        <>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+            <div style={{ display: "flex", gap: 8 }}>
+              <FilterButton active>All Staff</FilterButton>
+              <FilterButton>Doctors</FilterButton>
+              <FilterButton>Receptionists</FilterButton>
+              <FilterButton>Nurses</FilterButton>
+            </div>
+            <button className="btn btn-primary" onClick={() => setShowAddStaff(true)}>
+              <i className="ti ti-plus" style={{ fontSize: 14, marginRight: 4 }} />
+              Add Staff Member
+            </button>
+          </div>
 
       {/* Staff List */}
       <div className="card" style={{ overflow: "hidden" }}>
@@ -165,13 +198,60 @@ export default function StaffPage() {
           </tbody>
         </table>
       </div>
+      </>
+      )}
 
-      {/* Permissions Matrix */}
-      <div className="card card-padded" style={{ marginTop: 24 }}>
-        <div className="section-label" style={{ marginBottom: 12 }}>
-          <i className="ti ti-lock" style={{ marginRight: 4 }} />
-          Role Permissions
+      {activeTab === "schedule" && (
+        <div className="card card-padded" style={{ marginBottom: 24 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+            <div className="section-label" style={{ margin: 0 }}>
+              <i className="ti ti-calendar" style={{ marginRight: 4 }} />
+              Staff Schedule
+            </div>
+            <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)" }}>
+              <i className="ti ti-plus" style={{ fontSize: 12, marginRight: 4 }} />
+              Add Schedule
+            </button>
+          </div>
+          <div style={{ textAlign: "center", padding: 32, color: "var(--muted)" }}>
+            <i className="ti ti-calendar" style={{ fontSize: 32, marginBottom: 8 }} />
+            <div>Schedule management coming soon</div>
+            <div style={{ fontSize: "var(--font-xs)", marginTop: 4 }}>Manage staff shifts, appointments, and availability</div>
+          </div>
         </div>
+      )}
+
+      {activeTab === "performance" && (
+        <div className="card card-padded" style={{ marginBottom: 24 }}>
+          <div className="section-label" style={{ marginBottom: 12 }}>
+            <i className="ti ti-chart-line" style={{ marginRight: 4 }} />
+            Performance Metrics
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 12 }}>
+            {doctors.map(doc => (
+              <div key={doc.id} style={{
+                padding: 16, background: "var(--surface2)", borderRadius: "var(--radius)",
+                border: "1px solid var(--border)"
+              }}>
+                <div style={{ fontSize: "var(--font-sm)", fontWeight: 700, marginBottom: 12 }}>{doc.name}</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  <MetricCard label="Patients Seen" value="24" color="var(--blue)" />
+                  <MetricCard label="Avg Time" value="15m" color="var(--green)" />
+                  <MetricCard label="Satisfaction" value="4.8" color="var(--amber)" />
+                  <MetricCard label="On-Time" value="95%" color="var(--purple)" />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {activeTab === "permissions" && (
+        <div className="card card-padded" style={{ marginBottom: 24 }}>
+          <div className="section-label" style={{ marginBottom: 12 }}>
+            <i className="ti ti-lock" style={{ marginRight: 4 }} />
+            Role Permissions
+          </div>
         <table className="tbl">
           <thead>
             <tr>
@@ -208,6 +288,7 @@ export default function StaffPage() {
           </tbody>
         </table>
       </div>
+      )}
 
       {/* Activity Tracking */}
       <div className="card card-padded" style={{ marginTop: 24 }}>
@@ -308,6 +389,36 @@ function FilterButton({ active, children }: { active?: boolean; children: React.
     >
       {children}
     </button>
+  );
+}
+
+function TabButton({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        padding: "8px 16px",
+        borderRadius: "var(--radius)",
+        border: "none",
+        background: active ? "var(--accent-soft)" : "transparent",
+        color: active ? "var(--accent)" : "var(--muted)",
+        fontSize: "var(--font-sm)",
+        fontWeight: active ? 600 : 400,
+        cursor: "pointer",
+        transition: "all 0.15s",
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function MetricCard({ label, value, color }: { label: string; value: string; color: string }) {
+  return (
+    <div style={{ padding: 12, background: "var(--surface3)", borderRadius: "var(--radius)" }}>
+      <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: "var(--font-md)", fontWeight: 700, color }}>{value}</div>
+    </div>
   );
 }
 

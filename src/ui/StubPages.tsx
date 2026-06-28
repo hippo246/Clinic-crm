@@ -7,10 +7,14 @@ import {
   DoctorWorkloadChart,
   InsuranceChart,
   RiskDistributionChart
-} from "./components/Charts";
+} from "./Charts";
+
+function getInitials(name: string): string {
+  return name.split(" ").filter(Boolean).map(n => n[0]).join("").slice(0, 2).toUpperCase();
+}
 
 // ─── Appointments ─────────────────────────────────────────────────────────────
-export function AppointmentsPage({ patients }: { patients: Patient[] }) {
+export function AppointmentsPage({ patients, onUpdatePatient, onViewPatient }: { patients: Patient[]; onUpdatePatient?: (patient: Patient) => void; onViewPatient?: (patient: Patient) => void }) {
   const [currentDate, setCurrentDate] = useState(new Date());
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
   const [showNewAppointmentModal, setShowNewAppointmentModal] = useState(false);
@@ -34,18 +38,26 @@ export function AppointmentsPage({ patients }: { patients: Patient[] }) {
       return;
     }
 
-    const [hours, minutes] = appointmentTime.split(":");
+    const [hoursStr, minutesStr] = appointmentTime.split(":");
+    const hours = parseInt(hoursStr, 10);
+    const minutes = parseInt(minutesStr, 10);
+    if (Number.isNaN(hours) || Number.isNaN(minutes)) {
+      alert("Please enter a valid time");
+      return;
+    }
     const appointmentDateTime = new Date(selectedDate);
-    appointmentDateTime.setHours(parseInt(hours), parseInt(minutes), 0, 0);
+    appointmentDateTime.setHours(hours, minutes, 0, 0);
 
     const updatedPatient = {
       ...selectedPatientForAppointment,
       nextAppointment: appointmentDateTime.toISOString()
     };
 
-    const index = patients.findIndex(p => p.id === selectedPatientForAppointment.id);
-    if (index !== -1) {
-      patients[index] = updatedPatient;
+    // patients is owned by the parent; ask it to apply the update rather than mutating the prop in place
+    if (onUpdatePatient) {
+      onUpdatePatient(updatedPatient);
+    } else if (process.env.NODE_ENV !== "production") {
+      console.warn("AppointmentsPage: no onUpdatePatient handler provided — appointment was not persisted");
     }
 
     setShowNewAppointmentModal(false);
@@ -60,20 +72,29 @@ export function AppointmentsPage({ patients }: { patients: Patient[] }) {
   const firstDayOfMonth = new Date(currentDate.getFullYear(), currentDate.getMonth(), 1).getDay();
   const monthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
-  const getAppointmentsForDate = (date: Date) => {
-    return patients.filter(p => {
-      if (!p.nextAppointment) return false;
-      const appointmentDate = new Date(p.nextAppointment);
-      return appointmentDate.toDateString() === date.toDateString();
-    });
-  };
+  const appointmentsByDate = React.useMemo(() => {
+    const map = new Map<string, Patient[]>();
+    for (const p of patients) {
+      if (!p.nextAppointment) continue;
+      const d = new Date(p.nextAppointment);
+      if (isNaN(d.getTime())) continue;
+      const key = d.toDateString();
+      const list = map.get(key);
+      if (list) list.push(p); else map.set(key, [p]);
+    }
+    return map;
+  }, [patients]);
+
+  const getAppointmentsForDate = (date: Date) => appointmentsByDate.get(date.toDateString()) ?? [];
 
   const goToPreviousMonth = () => {
     setCurrentDate(new Date(currentDate.getFullYear(), currentDate.getMonth() - 1, 1));
+    setSelectedDate(null);
   };
 
   const goToNextMonth = () => {
     setCurrentDate(new Date(currentDate.getFullYear(), currentDate.getMonth() + 1, 1));
+    setSelectedDate(null);
   };
 
   const goToToday = () => {
@@ -93,7 +114,13 @@ export function AppointmentsPage({ patients }: { patients: Patient[] }) {
     calendarDays.push(
       <div
         key={day}
+        role="button"
+        tabIndex={0}
+        aria-label={`${monthNames[currentDate.getMonth()]} ${day}, ${appointments.length} appointment${appointments.length === 1 ? "" : "s"}`}
+        aria-pressed={!!isSelected}
+        className="calendar-day-cell"
         onClick={() => setSelectedDate(date)}
+        onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setSelectedDate(date); } }}
         style={{
           padding: 8,
           minHeight: 80,
@@ -103,8 +130,6 @@ export function AppointmentsPage({ patients }: { patients: Patient[] }) {
           borderRadius: "var(--radius)",
           transition: "all 0.15s",
         }}
-        onMouseEnter={(e) => e.currentTarget.style.borderColor = "var(--accent)"}
-        onMouseLeave={(e) => e.currentTarget.style.borderColor = "var(--border)"}
       >
         <div style={{
           fontSize: "var(--font-sm)",
@@ -194,6 +219,9 @@ export function AppointmentsPage({ patients }: { patients: Patient[] }) {
       </div>
 
       {/* Calendar Grid */}
+      <style>{`
+        .calendar-day-cell:hover, .calendar-day-cell:focus-visible { border-color: var(--accent) !important; }
+      `}</style>
       <div style={{
         display: "grid",
         gridTemplateColumns: "repeat(7, 1fr)",
@@ -252,7 +280,7 @@ export function AppointmentsPage({ patients }: { patients: Patient[] }) {
                     fontSize: 12,
                     fontWeight: 700,
                   }}>
-                    {p.name.split(" ").map(n => n[0]).join("").slice(0, 2)}
+                    {getInitials(p.name)}
                   </div>
                   <div style={{ flex: 1 }}>
                     <div style={{ fontSize: "var(--font-sm)", fontWeight: 600 }}>{p.name}</div>
@@ -260,7 +288,7 @@ export function AppointmentsPage({ patients }: { patients: Patient[] }) {
                       {p.doctor} · {p.status}
                     </div>
                   </div>
-                  <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)" }} onClick={() => alert(`View details for ${p.name} - This would navigate to the patient profile page.`)}>
+                  <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)" }} onClick={() => onViewPatient ? onViewPatient(p) : alert(`View details for ${p.name} - patient profile navigation isn't wired up yet.`)}>
                     View Details
                   </button>
                 </div>
@@ -349,16 +377,11 @@ export function AppointmentsPage({ patients }: { patients: Patient[] }) {
             <div style={{ padding: 20 }}>
               <div style={{ marginBottom: 12 }}>
                 <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Patient</label>
-                <select
+                <PatientSelect
+                  patients={patients}
                   value={selectedPatientForAppointment?.id || ""}
-                  onChange={(e) => setSelectedPatientForAppointment(patients.find(p => p.id === e.target.value) || null)}
-                  style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)" }}
-                >
-                  <option value="">Select patient...</option>
-                  {patients.map(p => (
-                    <option key={p.id} value={p.id}>{p.name} ({p.id})</option>
-                  ))}
-                </select>
+                  onChange={(p) => setSelectedPatientForAppointment(p)}
+                />
               </div>
               <div style={{ marginBottom: 12 }}>
                 <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Date</label>
@@ -439,11 +462,17 @@ export function BillingPage({ patients }: { patients: Patient[] }) {
       return;
     }
 
+    const amount = parseFloat(invoiceAmount);
+    if (Number.isNaN(amount) || amount <= 0) {
+      alert("Please enter a valid amount greater than 0");
+      return;
+    }
+
     const newInvoice = {
       id: `inv-${Date.now()}`,
       patientId: selectedPatientForInvoice.id,
       patientName: selectedPatientForInvoice.name,
-      amount: parseFloat(invoiceAmount),
+      amount,
       description: invoiceDescription,
       dueDate: invoiceDueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0],
       status: "pending",
@@ -451,8 +480,18 @@ export function BillingPage({ patients }: { patients: Patient[] }) {
     };
 
     // Store invoice in localStorage
-    const existingInvoices = JSON.parse(localStorage.getItem("clinic_crm_invoices") || "[]");
-    localStorage.setItem("clinic_crm_invoices", JSON.stringify([...existingInvoices, newInvoice]));
+    try {
+      let existingInvoices: any[] = [];
+      try {
+        existingInvoices = JSON.parse(localStorage.getItem("clinic_crm_invoices") || "[]");
+      } catch {
+        existingInvoices = [];
+      }
+      localStorage.setItem("clinic_crm_invoices", JSON.stringify([...existingInvoices, newInvoice]));
+    } catch {
+      alert("Could not save the invoice locally (storage may be full or disabled). The invoice was not created.");
+      return;
+    }
 
     setShowInvoiceModal(false);
     setSelectedPatientForInvoice(null);
@@ -515,7 +554,7 @@ export function BillingPage({ patients }: { patients: Patient[] }) {
             <div key={name} style={{ display: "flex", alignItems: "center", gap: 12 }}>
               <span style={{ fontSize: "var(--font-sm)", width: 140, flexShrink: 0 }}>{name}</span>
               <div style={{ flex: 1, height: 8, background: "var(--border)", borderRadius: 4, overflow: "hidden" }}>
-                <div style={{ height: "100%", background: "var(--accent)", borderRadius: 4, width: `${(count / patients.length) * 100}%`, transition: "width 0.5s ease" }} />
+                <div style={{ height: "100%", background: "var(--accent)", borderRadius: 4, width: `${patients.length > 0 ? (count / patients.length) * 100 : 0}%`, transition: "width 0.5s ease" }} />
               </div>
               <span style={{ fontSize: "var(--font-sm)", color: "var(--muted)", width: 40, textAlign: "right" }}>{count}</span>
             </div>
@@ -534,16 +573,11 @@ export function BillingPage({ patients }: { patients: Patient[] }) {
             <div style={{ padding: 20 }}>
               <div style={{ marginBottom: 12 }}>
                 <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Patient</label>
-                <select
+                <PatientSelect
+                  patients={patients}
                   value={selectedPatientForInvoice?.id || ""}
-                  onChange={(e) => setSelectedPatientForInvoice(patients.find(p => p.id === e.target.value) || null)}
-                  style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)" }}
-                >
-                  <option value="">Select patient...</option>
-                  {patients.map(p => (
-                    <option key={p.id} value={p.id}>{p.name} ({p.id})</option>
-                  ))}
-                </select>
+                  onChange={(p) => setSelectedPatientForInvoice(p)}
+                />
               </div>
               <div style={{ marginBottom: 12 }}>
                 <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Amount ($)</label>
@@ -642,7 +676,7 @@ function QualityReport({ patients }: { patients: Patient[] }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
       {items.map(({ label, count }) => {
-        const pct = Math.round((count / patients.length) * 100);
+        const pct = patients.length > 0 ? Math.round((count / patients.length) * 100) : 0;
         return (
           <div key={label} style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <span style={{ fontSize: "var(--font-xs)", width: 130, flexShrink: 0, color: "var(--muted)" }}>{label}</span>
@@ -658,13 +692,32 @@ function QualityReport({ patients }: { patients: Patient[] }) {
 }
 
 // ─── Settings ─────────────────────────────────────────────────────────────────
+type UserRole = "receptionist" | "doctor" | "admin";
+
+interface RolePermissionRow {
+  permission: string;
+  receptionist: boolean;
+  doctor: boolean;
+  admin: boolean;
+}
+
+const ROLE_PERMISSIONS: RolePermissionRow[] = [
+  { permission: "View Medical Info",   receptionist: false, doctor: true,  admin: true },
+  { permission: "View Billing",        receptionist: true,  doctor: false, admin: true },
+  { permission: "Edit Patient",        receptionist: true,  doctor: true,  admin: true },
+  { permission: "Delete Document",     receptionist: false, doctor: false, admin: true },
+  { permission: "Edit Medical Alerts", receptionist: false, doctor: true,  admin: true },
+  { permission: "View Audit Log",      receptionist: false, doctor: false, admin: true },
+  { permission: "Delete Patient",      receptionist: false, doctor: false, admin: true },
+];
+
 export function SettingsPage({
   dark, setDark, role, setRole,
 }: {
   dark: boolean;
   setDark: (d: boolean) => void;
-  role: string;
-  setRole: (r: any) => void;
+  role: UserRole;
+  setRole: (r: UserRole) => void;
 }) {
   return (
     <div style={{ padding: 24, maxWidth: 700 }}>
@@ -684,7 +737,7 @@ export function SettingsPage({
           label="Current Role"
           description="Simulates role-based access control"
         >
-          <select value={role} onChange={(e) => setRole(e.target.value)} style={{ fontSize: "var(--font-sm)" }}>
+          <select value={role} onChange={(e) => setRole(e.target.value as UserRole)} style={{ fontSize: "var(--font-sm)" }}>
             <option value="receptionist">Receptionist</option>
             <option value="doctor">Doctor</option>
             <option value="admin">Admin</option>
@@ -703,20 +756,12 @@ export function SettingsPage({
               </tr>
             </thead>
             <tbody>
-              {[
-                ["View Medical Info",    false, true,  true],
-                ["View Billing",         true,  false, true],
-                ["Edit Patient",         true,  true,  true],
-                ["Delete Document",      false, false, true],
-                ["Edit Medical Alerts",  false, true,  true],
-                ["View Audit Log",       false, false, true],
-                ["Delete Patient",       false, false, true],
-              ].map(([perm, rec, doc, adm]) => (
-                <tr key={perm as string}>
-                  <td style={{ fontSize: "var(--font-sm)" }}>{perm as string}</td>
-                  <td><PermDot on={rec as boolean} /></td>
-                  <td><PermDot on={doc as boolean} /></td>
-                  <td><PermDot on={adm as boolean} /></td>
+              {ROLE_PERMISSIONS.map(({ permission, receptionist, doctor, admin }) => (
+                <tr key={permission}>
+                  <td style={{ fontSize: "var(--font-sm)" }}>{permission}</td>
+                  <td><PermDot on={receptionist} /></td>
+                  <td><PermDot on={doctor} /></td>
+                  <td><PermDot on={admin} /></td>
                 </tr>
               ))}
             </tbody>
@@ -786,6 +831,21 @@ function PermDot({ on }: { on: boolean }) {
     <span style={{ color: on ? "var(--green)" : "var(--border)", fontSize: 16 }}>
       <i className={`ti ${on ? "ti-circle-check-filled" : "ti-circle-x"}`} />
     </span>
+  );
+}
+
+function PatientSelect({ patients, value, onChange }: { patients: Patient[]; value: string; onChange: (patient: Patient | null) => void }) {
+  return (
+    <select
+      value={value}
+      onChange={(e) => onChange(patients.find(p => p.id === e.target.value) || null)}
+      style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)" }}
+    >
+      <option value="">Select patient...</option>
+      {patients.map(p => (
+        <option key={p.id} value={p.id}>{p.name} ({p.id})</option>
+      ))}
+    </select>
   );
 }
 
