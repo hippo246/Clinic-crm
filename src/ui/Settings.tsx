@@ -29,6 +29,35 @@ function useFieldFocus() {
   return { onFocus, onBlur };
 }
 
+// ─── Storage key constants ─────────────────────────────────────────────────────
+const PATIENTS_KEY        = "clinic_crm_patients_v1";
+const LEGACY_PATIENTS_KEY = "clinic_crm_patients";
+const AUDIT_KEY           = "clinic_crm_audit_v1";
+const INVOICES_KEY        = "clinic_crm_invoices";
+const PRESCRIPTIONS_KEY   = "clinic_crm_prescriptions";
+const DOCUMENTS_KEY       = "clinic_crm_documents";
+const COMMUNICATIONS_KEY  = "clinic_crm_communications";
+const SETTINGS_KEY        = "clinic_crm_settings";
+const LAST_BACKUP_KEY     = "clinic_crm_last_backup";
+
+// ─── Safe JSON read helper ─────────────────────────────────────────────────────
+function readJSON<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+// ─── Read patients with v1 → legacy fallback ───────────────────────────────────
+function readPatientsForExport(): any[] {
+  const v1 = readJSON<any[]>(PATIENTS_KEY, []);
+  if (v1.length > 0) return v1;
+  return readJSON<any[]>(LEGACY_PATIENTS_KEY, []);
+}
+
 function FieldLabel({ children }: { children: React.ReactNode }) {
   return (
     <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 6, display: "block", color: "var(--fg)" }}>
@@ -62,7 +91,7 @@ export default function SettingsPage({
 }) {
   const [activeTab, setActiveTab] = useState<"clinic" | "templates" | "invoice" | "prescription" | "notifications" | "backup">("clinic");
   const [settings, setSettings] = useState(() => {
-    const saved = localStorage.getItem("clinic_crm_settings");
+    const saved = localStorage.getItem(SETTINGS_KEY);
     const base = {
       clinicName: "City Medical Center",
       clinicAddress: "123 Healthcare Ave, Medical District",
@@ -106,9 +135,11 @@ export default function SettingsPage({
     return base;
   });
   const [saveStatus, setSaveStatus] = useState<"idle" | "saved" | "unsaved">("idle");
-  const [lastBackup, setLastBackup] = useState<string>(localStorage.getItem("clinic_crm_last_backup") || "Never");
+  const [lastBackup, setLastBackup] = useState<string>(localStorage.getItem(LAST_BACKUP_KEY) || "Never");
   const [storageUsage, setStorageUsage] = useState<string>("");
   const [toast, setToast] = useState<{ msg: string; type: "success" | "error" | "info" } | null>(null);
+  const [importMode, setImportMode] = useState<"replace" | "merge">("replace");
+  const [healthTick, setHealthTick] = useState(0); // increment to re-render health counts
   const isMounted = React.useRef(false);
 
   const showToast = (msg: string, type: "success" | "error" | "info" = "info") => {
@@ -124,6 +155,7 @@ export default function SettingsPage({
       }
       setStorageUsage(total < 1024 ? `${total} B` : total < 1048576 ? `${(total / 1024).toFixed(1)} KB` : `${(total / 1048576).toFixed(2)} MB`);
     } catch { setStorageUsage("Unknown"); }
+    setHealthTick(t => t + 1);
   };
 
   // Track unsaved changes — skip first mount
@@ -138,7 +170,7 @@ export default function SettingsPage({
   }, [activeTab]);
 
   const handleSave = () => {
-    localStorage.setItem("clinic_crm_settings", JSON.stringify(settings));
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
     setSaveStatus("saved");
     calcStorage();
     showToast("Settings saved successfully", "success");
@@ -155,35 +187,39 @@ export default function SettingsPage({
   };
 
   const handleExportPatients = () => {
-    const patients = JSON.parse(localStorage.getItem("clinic_crm_patients") || "[]");
+    const patients = readPatientsForExport();
     downloadCSV(`patients-${new Date().toISOString().slice(0,10)}.csv`, patients);
   };
 
   const handleExportAppointments = () => {
-    const patients = JSON.parse(localStorage.getItem("clinic_crm_patients") || "[]");
+    const patients = readPatientsForExport();
     const appts = patients.filter((p: any) => p.nextAppointment).map((p: any) => ({ id: p.id, name: p.name, doctor: p.doctor, nextAppointment: p.nextAppointment, status: p.status }));
     downloadCSV(`appointments-${new Date().toISOString().slice(0,10)}.csv`, appts);
   };
 
   const handleExportInvoices = () => {
-    const invoices = JSON.parse(localStorage.getItem("clinic_crm_invoices") || "[]");
+    const invoices = JSON.parse(localStorage.getItem(INVOICES_KEY) || "[]");
     downloadCSV(`invoices-${new Date().toISOString().slice(0,10)}.csv`, invoices);
   };
 
   const handleExportAllJSON = () => {
     const allData = {
-      patients: JSON.parse(localStorage.getItem("clinic_crm_patients") || "[]"),
-      invoices: JSON.parse(localStorage.getItem("clinic_crm_invoices") || "[]"),
-      prescriptions: JSON.parse(localStorage.getItem("clinic_crm_prescriptions") || "[]"),
+      patients:       readPatientsForExport(),
+      audit:          readJSON<any[]>(AUDIT_KEY, []),
+      invoices:       readJSON<any[]>(INVOICES_KEY, []),
+      prescriptions:  readJSON<any[]>(PRESCRIPTIONS_KEY, []),
+      documents:      readJSON<any[]>(DOCUMENTS_KEY, []),
+      communications: readJSON<any[]>(COMMUNICATIONS_KEY, []),
       settings,
-      exportedAt: new Date().toISOString(),
+      exportedAt:     new Date().toISOString(),
+      appVersion:     "frontend-local-v1",
     };
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([JSON.stringify(allData, null, 2)], { type: "application/json" }));
     a.download = `clinic-backup-${new Date().toISOString().slice(0,10)}.json`; a.click();
     const ts = new Date().toLocaleString();
     setLastBackup(ts);
-    localStorage.setItem("clinic_crm_last_backup", ts);
+    localStorage.setItem(LAST_BACKUP_KEY, ts);
   };
 
   const handleImport = () => {
@@ -195,16 +231,104 @@ export default function SettingsPage({
       reader.onload = (ev) => {
         try {
           const data = JSON.parse(ev.target?.result as string);
-          if (data.patients) localStorage.setItem("clinic_crm_patients", JSON.stringify(data.patients));
-          if (data.invoices) localStorage.setItem("clinic_crm_invoices", JSON.stringify(data.invoices));
-          if (data.prescriptions) localStorage.setItem("clinic_crm_prescriptions", JSON.stringify(data.prescriptions));
-          if (data.settings) { localStorage.setItem("clinic_crm_settings", JSON.stringify(data.settings)); setSettings(s => ({ ...s, ...data.settings })); }
-          showToast("Import successful — reload to see all changes", "success");
+          const summaryParts: string[] = [];
+
+          // Helper: merge two arrays by id, appending items without id
+          const mergeById = (existing: any[], incoming: any[]): any[] => {
+            const map = new Map<string, any>();
+            for (const item of existing) { if (item.id != null) map.set(String(item.id), item); }
+            const noId: any[] = [];
+            for (const item of incoming) {
+              if (item.id != null) map.set(String(item.id), item);
+              else noId.push(item);
+            }
+            return [...map.values(), ...noId];
+          };
+
+          // Helper: save one array section
+          const saveSection = (key: string, incoming: any[], label: string) => {
+            if (!Array.isArray(incoming)) return;
+            let final: any[];
+            if (importMode === "merge") {
+              const existing = readJSON<any[]>(key, []);
+              final = mergeById(existing, incoming);
+            } else {
+              final = incoming;
+            }
+            localStorage.setItem(key, JSON.stringify(final));
+            summaryParts.push(`${final.length} ${label}`);
+          };
+
+          if (data.patients && Array.isArray(data.patients)) {
+            saveSection(PATIENTS_KEY, data.patients, "patients");
+            localStorage.removeItem(LEGACY_PATIENTS_KEY);
+          }
+          if (data.audit && Array.isArray(data.audit))          saveSection(AUDIT_KEY,           data.audit,          "audit entries");
+          if (data.invoices && Array.isArray(data.invoices))    saveSection(INVOICES_KEY,        data.invoices,       "invoices");
+          if (data.prescriptions && Array.isArray(data.prescriptions)) saveSection(PRESCRIPTIONS_KEY, data.prescriptions, "prescriptions");
+          if (data.documents && Array.isArray(data.documents))  saveSection(DOCUMENTS_KEY,       data.documents,      "documents");
+          if (data.communications && Array.isArray(data.communications)) saveSection(COMMUNICATIONS_KEY, data.communications, "communications");
+          if (data.settings && typeof data.settings === "object") {
+            const merged = importMode === "merge" ? { ...settings, ...data.settings } : data.settings;
+            localStorage.setItem(SETTINGS_KEY, JSON.stringify(merged));
+            setSettings((s: typeof settings) => ({ ...s, ...merged }));
+          }
+
+          calcStorage();
+          const summary = summaryParts.length > 0 ? summaryParts.join(", ") : "no sections";
+          showToast(`Import complete (${importMode}): ${summary} restored.`, "success");
         } catch { showToast("Invalid backup file. Please select a valid JSON backup.", "error"); }
       };
       reader.readAsText(file);
     };
     input.click();
+  };
+
+  const handleMigrateLegacy = () => {
+    const v1 = readJSON<any[]>(PATIENTS_KEY, []);
+    if (v1.length > 0) { showToast("v1 already has patients — migration skipped.", "info"); return; }
+    const legacy = readJSON<any[]>(LEGACY_PATIENTS_KEY, []);
+    if (legacy.length === 0) { showToast("No legacy patient data found.", "info"); return; }
+    localStorage.setItem(PATIENTS_KEY, JSON.stringify(legacy));
+    calcStorage();
+    showToast(`Migrated ${legacy.length} patients to clinic_crm_patients_v1.`, "success");
+  };
+
+  const handleExportSummary = () => {
+    const counts = [
+      { label: "Patients",       count: readJSON<any[]>(PATIENTS_KEY,       []).length },
+      { label: "Audit entries",  count: readJSON<any[]>(AUDIT_KEY,          []).length },
+      { label: "Invoices",       count: readJSON<any[]>(INVOICES_KEY,       []).length },
+      { label: "Prescriptions",  count: readJSON<any[]>(PRESCRIPTIONS_KEY,  []).length },
+      { label: "Documents",      count: readJSON<any[]>(DOCUMENTS_KEY,      []).length },
+      { label: "Communications", count: readJSON<any[]>(COMMUNICATIONS_KEY, []).length },
+    ];
+    const legacyCount = readJSON<any[]>(LEGACY_PATIENTS_KEY, []).length;
+    const lines = [
+      "Clinic CRM — Backup Summary",
+      "=".repeat(40),
+      `Exported at: ${new Date().toLocaleString()}`,
+      `Storage used: ${storageUsage || "unknown"}`,
+      "",
+      "Data Counts:",
+      ...counts.map(c => `  ${c.label.padEnd(20)} ${c.count}`),
+      ...(legacyCount > 0 ? [`  Legacy patients     ${legacyCount} (clinic_crm_patients — unmigrated)`] : []),
+      "",
+      "Keys included in full JSON backup:",
+      `  ${PATIENTS_KEY}`,
+      `  ${AUDIT_KEY}`,
+      `  ${INVOICES_KEY}`,
+      `  ${PRESCRIPTIONS_KEY}`,
+      `  ${DOCUMENTS_KEY}`,
+      `  ${COMMUNICATIONS_KEY}`,
+      `  ${SETTINGS_KEY}`,
+    ];
+    const txt = lines.join("\n");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([txt], { type: "text/plain" }));
+    a.download = `clinic-backup-summary-${new Date().toISOString().slice(0,10)}.txt`;
+    a.click();
+    showToast("Backup summary downloaded.", "success");
   };
 
   const handleClearData = (key: string, label: string) => {
@@ -681,6 +805,61 @@ export default function SettingsPage({
               </div>
             )}
             <div style={{ height: 1, background: "var(--border)", margin: "8px 0" }} />
+
+            {/* ── Data Health ── */}
+            <div>
+              <div style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 10 }}>
+                <i className="ti ti-heart-rate-monitor" style={{ fontSize: 13, marginRight: 4 }} />
+                Data Health
+              </div>
+              {(() => {
+                void healthTick; // reference so re-renders on tick
+                const legacyPatients = readJSON<any[]>(LEGACY_PATIENTS_KEY, []);
+                const v1Patients     = readJSON<any[]>(PATIENTS_KEY, []);
+                const showLegacyWarning = legacyPatients.length > 0 && v1Patients.length === 0;
+                const healthRows = [
+                  { label: "Patients",       count: v1Patients.length },
+                  { label: "Audit entries",  count: readJSON<any[]>(AUDIT_KEY, []).length },
+                  { label: "Invoices",       count: readJSON<any[]>(INVOICES_KEY, []).length },
+                  { label: "Prescriptions",  count: readJSON<any[]>(PRESCRIPTIONS_KEY, []).length },
+                  { label: "Documents",      count: readJSON<any[]>(DOCUMENTS_KEY, []).length },
+                  { label: "Communications", count: readJSON<any[]>(COMMUNICATIONS_KEY, []).length },
+                ];
+                return (
+                  <>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 8, marginBottom: 10 }}>
+                      {healthRows.map(({ label, count }) => (
+                        <div key={label} style={{ textAlign: "center", padding: "10px 4px", background: "var(--surface2)", borderRadius: "var(--radius)", border: "1px solid var(--border)" }}>
+                          <div style={{ fontSize: "var(--font-xl)", fontWeight: 800 }}>{count}</div>
+                          <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{label}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginBottom: showLegacyWarning ? 10 : 0 }}>
+                      Storage used: <strong>{storageUsage || "—"}</strong>
+                    </div>
+                    {showLegacyWarning && (
+                      <div style={{ padding: "10px 12px", background: "var(--amber-bg)", border: "1px solid var(--amber-border)", borderRadius: "var(--radius)", display: "flex", alignItems: "flex-start", gap: 8 }}>
+                        <i className="ti ti-alert-triangle" style={{ fontSize: 14, color: "var(--amber)", marginTop: 1, flexShrink: 0 }} />
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: "var(--font-xs)", fontWeight: 600, color: "var(--amber)", marginBottom: 6 }}>
+                            Legacy patient data detected ({legacyPatients.length} patients in <code>clinic_crm_patients</code>)
+                          </div>
+                          <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={handleMigrateLegacy}>
+                            <i className="ti ti-database-import" style={{ fontSize: 12, marginRight: 4 }} />
+                            Migrate Legacy Patients
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
+            </div>
+
+            <div style={{ height: 1, background: "var(--border)", margin: "8px 0" }} />
+
+            {/* ── Export ── */}
             <div>
               <div style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 8 }}>Export Data</div>
               <div className="settings-export-row" style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -700,11 +879,38 @@ export default function SettingsPage({
                   <i className="ti ti-download" style={{ fontSize: 12, marginRight: 4 }} />
                   Export All Data (JSON)
                 </button>
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)" }} onClick={handleExportSummary}>
+                  <i className="ti ti-file-description" style={{ fontSize: 12, marginRight: 4 }} />
+                  Export Backup Summary
+                </button>
               </div>
             </div>
             <div style={{ height: 1, background: "var(--border)", margin: "8px 0" }} />
+
+            {/* ── Import ── */}
             <div>
               <div style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 8 }}>Import Data</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
+                <span style={{ fontSize: "var(--font-xs)", color: "var(--muted)", whiteSpace: "nowrap" }}>Import mode:</span>
+                {(["replace", "merge"] as const).map(mode => (
+                  <button
+                    key={mode}
+                    onClick={() => setImportMode(mode)}
+                    style={{
+                      fontSize: "var(--font-xs)", padding: "4px 12px", borderRadius: "var(--radius)",
+                      border: `1px solid ${importMode === mode ? "var(--accent)" : "var(--border)"}`,
+                      background: importMode === mode ? "var(--accent-soft)" : "var(--surface2)",
+                      color: importMode === mode ? "var(--accent)" : "var(--muted)",
+                      cursor: "pointer", fontWeight: importMode === mode ? 600 : 400,
+                    }}
+                  >
+                    {mode === "replace" ? "Replace existing data" : "Merge with existing data"}
+                  </button>
+                ))}
+                <span style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>
+                  {importMode === "replace" ? "Each imported section overwrites existing data." : "Items are merged by id; missing sections are untouched."}
+                </span>
+              </div>
               <div className="settings-export-row" style={{ display: "flex" }}>
                 <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)" }} onClick={handleImport}>
                   <i className="ti ti-upload" style={{ fontSize: 12, marginRight: 4 }} />
@@ -712,41 +918,21 @@ export default function SettingsPage({
                 </button>
               </div>
             </div>
-            <div style={{ padding: 14, background: "var(--surface2)", borderRadius: "var(--radius)", border: "1px solid var(--border)" }}>
-              <div style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 10 }}>Data Summary</div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 8 }}>
-                {[
-                  { label: "Patients", key: "clinic_crm_patients" },
-                  { label: "Invoices", key: "clinic_crm_invoices" },
-                  { label: "Prescriptions", key: "clinic_crm_prescriptions" },
-                ].map(({ label, key }) => {
-                  const count = (() => { try { return JSON.parse(localStorage.getItem(key) || "[]").length; } catch { return 0; } })();
-                  return (
-                    <div key={key} style={{ textAlign: "center", padding: "10px 4px", background: "var(--surface3)", borderRadius: "var(--radius)" }}>
-                      <div style={{ fontSize: "var(--font-xl)", fontWeight: 800 }}>{count}</div>
-                      <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{label}</div>
-                    </div>
-                  );
-                })}
-              </div>
-              <div style={{ marginTop: 10, fontSize: "var(--font-xs)", color: "var(--muted)" }}>
-                Total storage used: <strong>{storageUsage}</strong>
-              </div>
-            </div>
+
             <div style={{ height: 1, background: "var(--border)", margin: "8px 0" }} />
             <div>
               <div style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, color: "var(--red, #e53e3e)" }}>Danger Zone</div>
               <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginBottom: 8 }}>Permanently delete stored data. Make sure to export a backup first.</div>
               <div className="settings-export-row" style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)", color: "var(--red, #e53e3e)", borderColor: "var(--red, #e53e3e)" }} onClick={() => handleClearData("clinic_crm_patients", "Patients")}>
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)", color: "var(--red, #e53e3e)", borderColor: "var(--red, #e53e3e)" }} onClick={() => { handleClearData(PATIENTS_KEY, "Patients"); localStorage.removeItem(LEGACY_PATIENTS_KEY); }}>
                   <i className="ti ti-trash" style={{ fontSize: 12, marginRight: 4 }} />
                   Clear Patients
                 </button>
-                <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)", color: "var(--red, #e53e3e)", borderColor: "var(--red, #e53e3e)" }} onClick={() => handleClearData("clinic_crm_invoices", "Invoices")}>
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)", color: "var(--red, #e53e3e)", borderColor: "var(--red, #e53e3e)" }} onClick={() => handleClearData(INVOICES_KEY, "Invoices")}>
                   <i className="ti ti-trash" style={{ fontSize: 12, marginRight: 4 }} />
                   Clear Invoices
                 </button>
-                <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)", color: "var(--red, #e53e3e)", borderColor: "var(--red, #e53e3e)" }} onClick={() => handleClearData("clinic_crm_prescriptions", "Prescriptions")}>
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)", color: "var(--red, #e53e3e)", borderColor: "var(--red, #e53e3e)" }} onClick={() => handleClearData(PRESCRIPTIONS_KEY, "Prescriptions")}>
                   <i className="ti ti-trash" style={{ fontSize: 12, marginRight: 4 }} />
                   Clear Prescriptions
                 </button>

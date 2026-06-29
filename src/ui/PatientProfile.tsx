@@ -19,6 +19,7 @@ import { InvoiceGenerator } from "./components/InvoiceGenerator";
 import { PatientCommunication } from "./components/PatientCommunication";
 import { FollowUpScheduler } from "./components/FollowUpScheduler";
 import { ConsentManager } from "./components/ConsentManager";
+import { useToast } from "./Toast";
 
 // ─── Tabs ─────────────────────────────────────────────────────────────────────
 const PROFILE_TABS = [
@@ -69,12 +70,60 @@ export default function PatientProfile({
   const [showCommunication, setShowCommunication] = useState(false);
   const [showFollowUp, setShowFollowUp] = useState(false);
   const [showConsent, setShowConsent] = useState(false);
+  const [activeWorkflowLoading, setActiveWorkflowLoading] = useState<string | null>(null);
+
+  const { toast } = useToast();
 
   const nba  = calcNextBestAction(patient);
   const risk = calcRiskScore(patient);
   const readiness = calcVisitReadiness(patient);
   const snapshot  = buildSmartSnapshot(patient);
   const avatarBg  = getAvatarColor(patient.name);
+
+  // ── Local helpers ──────────────────────────────────────────────────────────
+  function appendTimeline(event: Omit<TimelineEvent, "id">, basePatient?: Patient): Patient {
+    const base = basePatient ?? patient;
+    const newEvent: TimelineEvent = { ...event, id: `tl-${Date.now()}-${Math.random().toString(36).slice(2, 7)}` };
+    return { ...base, timeline: [...(base.timeline || []), newEvent] };
+  }
+
+  function appendTimelineOnce(event: Omit<TimelineEvent, "id">, basePatient?: Patient, dedupeWindowMs = 3000): Patient {
+    const base = basePatient ?? patient;
+    const cutoff = Date.now() - dedupeWindowMs;
+    const isDupe = (base.timeline || []).some(
+      (e) =>
+        e.type === event.type &&
+        e.label === event.label &&
+        e.note === event.note &&
+        new Date(e.date).getTime() >= cutoff,
+    );
+    if (isDupe) return base;
+    const newEvent: TimelineEvent = { ...event, id: `tl-${Date.now()}-${Math.random().toString(36).slice(2, 7)}` };
+    return { ...base, timeline: [...(base.timeline || []), newEvent] };
+  }
+
+  function formatFileSize(bytes: number): string {
+    if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(1)} MB`;
+    if (bytes >= 1_024) return `${(bytes / 1_024).toFixed(0)} KB`;
+    return `${bytes} B`;
+  }
+
+  function savePatientUpdate(updated: Patient, action: string, successMessage?: string) {
+    onUpdatePatient(updated, action);
+    if (successMessage) toast({ title: successMessage, variant: "success" });
+  }
+
+  function closeAllWorkflowModals() {
+    setShowAppointment(false);
+    setShowConsultation(false);
+    setShowPrescription(false);
+    setShowFileUpload(false);
+    setShowInvoice(false);
+    setShowCommunication(false);
+    setShowFollowUp(false);
+    setShowConsent(false);
+    setQuickAction(null);
+  }
 
   function handleVerificationToggle(key: string) {
     const updated = { ...patient, [key]: !patient[key as keyof Patient] };
@@ -142,180 +191,450 @@ export default function PatientProfile({
     onUpdatePatient({ ...patient, consents, consentSigned: allSigned }, "consent updated");
   }
 
+  function handleAcknowledgeAlerts() {
+    const now = new Date().toISOString();
+    const criticalAlerts = (patient.alerts || []).filter(
+      (a) => ALERT_SEVERITY[a as keyof typeof ALERT_SEVERITY] === "critical",
+    );
+    let updated = appendTimelineOnce({
+      type: "note",
+      label: "Medical Alerts Acknowledged",
+      icon: "ti-shield-check",
+      color: "#10b981",
+      date: now,
+      note: `Acknowledged: ${criticalAlerts.join(", ")}`,
+    });
+    updated = { ...updated, alertsReviewed: true, acknowledgedAlerts: criticalAlerts, updatedAt: now } as Patient;
+    savePatientUpdate(updated, "alerts acknowledged", "Alerts acknowledged");
+  }
+
+  function handleCopyPatientId() {
+    if (!navigator?.clipboard) { console.warn("Clipboard API not available"); return; }
+    navigator.clipboard.writeText(patient.id).then(
+      () => toast({ title: "Patient ID copied", variant: "success" }),
+      () => console.warn("Failed to copy patient ID"),
+    );
+  }
+
   function handleUpdateFollowUp(updates: Partial<Patient>) {
     onUpdatePatient({ ...patient, ...updates }, "follow-up updated");
   }
 
   // Medical workflow handlers
   const handleBookAppointment = async (appointment: any) => {
+    if (activeWorkflowLoading) return;
+    // Validation
+    if (!appointment.appointment_date || isNaN(Date.parse(appointment.appointment_date))) {
+      toast({ title: "A valid appointment date is required", variant: "error" });
+      return;
+    }
+    setActiveWorkflowLoading("appointment");
+    const now = new Date().toISOString();
+    const nextAppointment = `${appointment.appointment_date}${appointment.appointment_time ? " " + appointment.appointment_time : ""}`;
+    const tlNote = [
+      appointment.appointment_date,
+      appointment.appointment_time,
+      appointment.appointment_type,
+      appointment.reason,
+    ].filter(Boolean).join(" · ");
+    let backendOk = true;
     try {
       const { apiClient } = await import('./api');
-      await apiClient.bookAppointment(appointment);
-      setShowAppointment(false);
-      handleAddTimelineEvent({
+      if (typeof apiClient.bookAppointment === "function") {
+        await apiClient.bookAppointment(appointment);
+      }
+    } catch (error) {
+      console.error('Failed to book appointment (backend):', error);
+      backendOk = false;
+    }
+    try {
+      let updated = appendTimelineOnce({
         type: 'appointment',
         label: 'Appointment Booked',
         icon: 'ti-calendar',
         color: '#7c4fff',
-        date: new Date().toISOString(),
-        note: `Appointment scheduled for ${appointment.appointment_date}`
+        date: now,
+        note: tlNote || `Appointment scheduled for ${appointment.appointment_date}`,
       });
-    } catch (error) {
-      console.error('Failed to book appointment:', error);
+      updated = { ...updated, nextAppointment, status: "Scheduled" as Patient["status"], updatedAt: now };
+      savePatientUpdate(updated, "appointment booked", backendOk ? "Appointment booked" : undefined);
+      if (!backendOk) toast({ title: "Saved locally. Backend sync unavailable.", variant: "warning" });
+      setShowAppointment(false);
+      setQuickAction(null);
+    } catch (err) {
+      console.error('Failed to book appointment:', err);
+      toast({ title: "Failed to book appointment", variant: "error" });
+    } finally {
+      setActiveWorkflowLoading(null);
     }
   };
 
   const handleStartConsultation = async (consultation: any) => {
+    if (activeWorkflowLoading) return;
+    if (!consultation.chief_complaint && !consultation.diagnosis && !consultation.treatment_plan) {
+      toast({ title: "Chief complaint, diagnosis, or treatment plan is required", variant: "error" });
+      return;
+    }
+    setActiveWorkflowLoading("consultation");
+    const now = new Date().toISOString();
+    const tlNote = [consultation.chief_complaint, consultation.diagnosis]
+      .filter(Boolean).join(" · ") || "Consultation recorded";
+    let backendOk = true;
     try {
       const { apiClient } = await import('./api');
-      await apiClient.startConsultation(consultation);
-      setShowConsultation(false);
-      handleAddTimelineEvent({
+      if (typeof apiClient.startConsultation === "function") {
+        await apiClient.startConsultation(consultation);
+      }
+    } catch (error) {
+      console.error('Failed to start consultation (backend):', error);
+      backendOk = false;
+    }
+    try {
+      let updated = appendTimelineOnce({
         type: 'consultation',
         label: 'Consultation Started',
         icon: 'ti-stethoscope',
         color: '#00b4a0',
-        date: new Date().toISOString(),
-        note: consultation.chief_complaint
+        date: now,
+        note: tlNote,
       });
-    } catch (error) {
-      console.error('Failed to start consultation:', error);
+      updated = { ...updated, status: "Active" as Patient["status"], lastVisit: now, updatedAt: now };
+      savePatientUpdate(updated, "consultation started", backendOk ? "Consultation started" : undefined);
+      if (!backendOk) toast({ title: "Saved locally. Backend sync unavailable.", variant: "warning" });
+      setShowConsultation(false);
+      setQuickAction(null);
+    } catch (err) {
+      console.error('Failed to start consultation:', err);
+      toast({ title: "Failed to start consultation", variant: "error" });
+    } finally {
+      setActiveWorkflowLoading(null);
     }
   };
 
   const handleSavePrescriptions = async (prescriptions: any[]) => {
+    if (activeWorkflowLoading) return;
+    const validRx = prescriptions.filter((rx) => !!(rx.medication ?? rx.name ?? "").trim());
+    if (validRx.length === 0) {
+      toast({ title: "At least one medication name is required", variant: "error" });
+      return;
+    }
+    setActiveWorkflowLoading("prescription");
+    const now = new Date().toISOString();
+    const normalizedRx: Prescription[] = validRx.map((rx, i) => ({
+      id: rx.id ?? `rx-${Date.now()}-${i}`,
+      medication: rx.medication ?? rx.name ?? "",
+      dosage: rx.dosage ?? "",
+      frequency: rx.frequency ?? "",
+      duration: rx.duration ?? "",
+      prescribedBy: rx.prescribedBy ?? rx.prescribed_by ?? "",
+      date: rx.date ?? now,
+      status: rx.status ?? "Active",
+      ...rx,
+    }));
+    const firstName = normalizedRx[0]?.medication ?? "";
+    const tlNote = `${normalizedRx.length} medication${normalizedRx.length !== 1 ? "s" : ""}${firstName ? ` · ${firstName}` : ""}`;
+    let backendOk = true;
     try {
       const { apiClient } = await import('./api');
-      await apiClient.createPrescriptions(prescriptions);
-      setShowPrescription(false);
-      handleAddTimelineEvent({
+      if (typeof apiClient.createPrescriptions === "function") {
+        await apiClient.createPrescriptions(validRx);
+      }
+    } catch (error) {
+      console.error('Failed to save prescriptions (backend):', error);
+      backendOk = false;
+    }
+    try {
+      let updated = appendTimelineOnce({
         type: 'prescription',
-        label: 'Prescriptions Issued',
+        label: 'Prescription Saved',
         icon: 'ti-pill',
         color: '#ff7c4f',
-        date: new Date().toISOString(),
-        note: `${prescriptions.length} medications prescribed`
+        date: now,
+        note: tlNote,
       });
-    } catch (error) {
-      console.error('Failed to save prescriptions:', error);
+      updated = {
+        ...updated,
+        prescriptions: [...(patient.prescriptions || []), ...normalizedRx],
+        updatedAt: now,
+      };
+      savePatientUpdate(updated, "prescriptions saved", backendOk ? "Prescription saved" : undefined);
+      if (!backendOk) toast({ title: "Saved locally. Backend sync unavailable.", variant: "warning" });
+      setShowPrescription(false);
+      setQuickAction(null);
+    } catch (err) {
+      console.error('Failed to save prescriptions:', err);
+      toast({ title: "Failed to save prescription", variant: "error" });
+    } finally {
+      setActiveWorkflowLoading(null);
     }
   };
 
   const handleUploadFiles = async (files: File[]) => {
+    if (activeWorkflowLoading) return;
+    if (!files || files.length === 0) {
+      toast({ title: "At least one file is required", variant: "error" });
+      return;
+    }
+    setActiveWorkflowLoading("fileupload");
+    const now = new Date().toISOString();
+    const newDocs: PatientDocument[] = files.map((f, i) => ({
+      id: `doc-${Date.now()}-${i}`,
+      name: f.name,
+      type: (f.type || "other") as PatientDocument["type"],
+      uploaded: now,
+      size: formatFileSize(f.size),
+      verified: false,
+    }));
+    const tlNote = `${files.length} file${files.length !== 1 ? "s" : ""} uploaded`;
+    let backendOk = true;
     try {
       const { apiClient } = await import('./api');
-      await apiClient.uploadFiles(files, { patient_id: patient.id });
-      setShowFileUpload(false);
-      handleAddTimelineEvent({
+      if (typeof apiClient.uploadFiles === "function") {
+        await apiClient.uploadFiles(files, { patient_id: patient.id });
+      }
+    } catch (error) {
+      console.error('Failed to upload files (backend):', error);
+      backendOk = false;
+    }
+    try {
+      let updated = appendTimelineOnce({
         type: 'report',
         label: 'Documents Uploaded',
         icon: 'ti-file-analytics',
         color: '#4f7cff',
-        date: new Date().toISOString(),
-        note: `${files.length} files uploaded`
+        date: now,
+        note: tlNote,
       });
-    } catch (error) {
-      console.error('Failed to upload files:', error);
+      const allDocs = [...(patient.documents || []), ...newDocs];
+      updated = { ...updated, documents: allDocs, documentsComplete: allDocs.length > 0, updatedAt: now };
+      savePatientUpdate(updated, "documents uploaded", backendOk ? "Documents uploaded" : undefined);
+      if (!backendOk) toast({ title: "Saved locally. Backend sync unavailable.", variant: "warning" });
+      setShowFileUpload(false);
+      setQuickAction(null);
+    } catch (err) {
+      console.error('Failed to upload files:', err);
+      toast({ title: "Failed to upload documents", variant: "error" });
+    } finally {
+      setActiveWorkflowLoading(null);
     }
   };
 
   const handleCreateInvoice = async (invoice: any) => {
+    if (activeWorkflowLoading) return;
+    const items = invoice.items ?? invoice.line_items ?? [];
+    if (!items || items.length === 0) {
+      toast({ title: "At least one invoice item is required", variant: "error" });
+      return;
+    }
+    setActiveWorkflowLoading("invoice");
+    const now = new Date().toISOString();
+    const tlNote = [
+      invoice.invoice_number ? `#${invoice.invoice_number}` : null,
+      invoice.total != null ? `Total: ${invoice.total}` : null,
+    ].filter(Boolean).join(" · ") || "Invoice created";
+    let backendOk = true;
     try {
       const { apiClient } = await import('./api');
-      await apiClient.createInvoice(invoice);
-      setShowInvoice(false);
-      handleAddTimelineEvent({
+      if (typeof apiClient.createInvoice === "function") {
+        await apiClient.createInvoice(invoice);
+      }
+    } catch (error) {
+      console.error('Failed to create invoice (backend):', error);
+      backendOk = false;
+    }
+    try {
+      const updated = appendTimelineOnce({
         type: 'note',
         label: 'Invoice Created',
         icon: 'ti-receipt',
         color: '#10b981',
-        date: new Date().toISOString(),
-        note: `Invoice ${invoice.invoice_number} created`
+        date: now,
+        note: tlNote,
       });
-    } catch (error) {
-      console.error('Failed to create invoice:', error);
+      savePatientUpdate({ ...updated, updatedAt: now }, "invoice created", backendOk ? "Invoice created" : undefined);
+      if (!backendOk) toast({ title: "Saved locally. Backend sync unavailable.", variant: "warning" });
+      setShowInvoice(false);
+      setQuickAction(null);
+    } catch (err) {
+      console.error('Failed to create invoice:', err);
+      toast({ title: "Failed to create invoice", variant: "error" });
+    } finally {
+      setActiveWorkflowLoading(null);
     }
   };
 
   const handleCallPatient = (patientId: string) => {
-    console.log('Calling patient:', patientId);
-    setShowCommunication(false);
-    handleAddTimelineEvent({
+    if (!patient.phone) {
+      toast({ title: "No phone number on record", variant: "error" });
+      return;
+    }
+    const now = new Date().toISOString();
+    let updated = appendTimelineOnce({
       type: 'note',
       label: 'Patient Called',
       icon: 'ti-phone',
       color: '#7c4fff',
-      date: new Date().toISOString(),
-      note: 'Phone call initiated'
+      date: now,
+      note: `Phone call initiated to ${patient.phone}`,
     });
+    updated = {
+      ...updated,
+      callAttempts: (patient.callAttempts ?? 0) + 1,
+      lastContacted: now,
+      updatedAt: now,
+    };
+    savePatientUpdate(updated, "call logged", "Call logged");
+    setShowCommunication(false);
+    setQuickAction(null);
+    // Open tel link after saving so we don't lose the update if the page navigates
+    window.open(`tel:${patient.phone}`, "_self");
   };
 
   const handleSendMessage = async (message: any) => {
+    if (activeWorkflowLoading) return;
+    const content = message.content ?? message.body ?? message.message ?? "";
+    if (!content.trim()) {
+      toast({ title: "Message content is required", variant: "error" });
+      return;
+    }
+    setActiveWorkflowLoading("message");
+    const now = new Date().toISOString();
+    const channel = message.message_type ?? message.channel ?? "Message";
+    const tlNote = `${channel} sent to patient`;
+    let backendOk = true;
     try {
       const { apiClient } = await import('./api');
-      await apiClient.sendCommunication(message);
-      setShowCommunication(false);
-      handleAddTimelineEvent({
+      if (typeof apiClient.sendCommunication === "function") {
+        await apiClient.sendCommunication(message);
+      }
+    } catch (error) {
+      console.error('Failed to send message (backend):', error);
+      backendOk = false;
+    }
+    try {
+      let updated = appendTimelineOnce({
         type: 'note',
         label: 'Message Sent',
         icon: 'ti-message',
         color: '#7c4fff',
-        date: new Date().toISOString(),
-        note: `${message.message_type} message sent to patient`
+        date: now,
+        note: tlNote,
       });
-    } catch (error) {
-      console.error('Failed to send message:', error);
+      updated = { ...updated, lastContacted: now, updatedAt: now };
+      savePatientUpdate(updated, "message sent", backendOk ? "Message logged" : undefined);
+      if (!backendOk) toast({ title: "Saved locally. Backend sync unavailable.", variant: "warning" });
+      setShowCommunication(false);
+      setQuickAction(null);
+    } catch (err) {
+      console.error('Failed to send message:', err);
+      toast({ title: "Failed to send message", variant: "error" });
+    } finally {
+      setActiveWorkflowLoading(null);
     }
   };
 
   const handleScheduleFollowUp = async (followUp: any) => {
+    if (activeWorkflowLoading) return;
+    if (!followUp.follow_up_date) {
+      toast({ title: "A follow-up date is required", variant: "error" });
+      return;
+    }
+    setActiveWorkflowLoading("followup");
+    const now = new Date().toISOString();
+    const tlNote = [followUp.follow_up_date, followUp.reason].filter(Boolean).join(" · ");
+    let backendOk = true;
     try {
       const { apiClient } = await import('./api');
-      await apiClient.scheduleFollowUp(followUp);
-      setShowFollowUp(false);
-      handleUpdateFollowUp({
-        followUpDate: followUp.follow_up_date,
-        followUpReason: followUp.reason
-      });
-      handleAddTimelineEvent({
+      if (typeof apiClient.scheduleFollowUp === "function") {
+        await apiClient.scheduleFollowUp(followUp);
+      }
+    } catch (error) {
+      console.error('Failed to schedule follow-up (backend):', error);
+      backendOk = false;
+    }
+    try {
+      let updated = appendTimelineOnce({
         type: 'followup',
-        label: 'Follow-Up Scheduled',
+        label: 'Follow-up Scheduled',
         icon: 'ti-clock',
         color: '#f0a500',
-        date: new Date().toISOString(),
-        note: `Follow-up scheduled for ${followUp.follow_up_date}`
+        date: now,
+        note: tlNote || `Follow-up scheduled for ${followUp.follow_up_date}`,
       });
-    } catch (error) {
-      console.error('Failed to schedule follow-up:', error);
+      updated = {
+        ...updated,
+        followUpDate: followUp.follow_up_date,
+        followUpReason: followUp.reason,
+        followUpStatus: "Pending" as const,
+        priority: followUp.priority ?? patient.priority ?? "Medium",
+        updatedAt: now,
+      };
+      savePatientUpdate(updated, "follow-up scheduled", backendOk ? "Follow-up scheduled" : undefined);
+      if (!backendOk) toast({ title: "Saved locally. Backend sync unavailable.", variant: "warning" });
+      setShowFollowUp(false);
+      setQuickAction(null);
+    } catch (err) {
+      console.error('Failed to schedule follow-up:', err);
+      toast({ title: "Failed to schedule follow-up", variant: "error" });
+    } finally {
+      setActiveWorkflowLoading(null);
     }
   };
 
   const handleSignConsent = async (consent: any) => {
+    if (activeWorkflowLoading) return;
+    if (!consent.consent_type) {
+      toast({ title: "Consent type is required", variant: "error" });
+      return;
+    }
+    setActiveWorkflowLoading("consent");
+    const now = new Date().toISOString();
+    const tlNote = `${consent.consent_type} consent signed`;
+    let backendOk = true;
     try {
       const { apiClient } = await import('./api');
-      await apiClient.createConsent(consent);
-      setShowConsent(false);
-      handleAddTimelineEvent({
+      if (typeof apiClient.createConsent === "function") {
+        await apiClient.createConsent(consent);
+      }
+    } catch (error) {
+      console.error('Failed to sign consent (backend):', error);
+      backendOk = false;
+    }
+    try {
+      const updatedConsents = { ...(patient.consents || {}), [consent.consent_type]: true };
+      const allSigned = CONSENT_TYPES.every((c) => updatedConsents[c.key]);
+      let updated = appendTimelineOnce({
         type: 'note',
-        label: 'Consent Signed',
+        label: 'Consent Updated',
         icon: 'ti-writing',
         color: '#10b981',
-        date: new Date().toISOString(),
-        note: `${consent.consent_type} consent signed`
+        date: now,
+        note: tlNote,
       });
-      // Update patient consent status
-      handleToggleConsent(consent.consent_type);
-    } catch (error) {
-      console.error('Failed to sign consent:', error);
+      updated = { ...updated, consents: updatedConsents, consentSigned: allSigned, updatedAt: now };
+      savePatientUpdate(updated, "consent updated", backendOk ? "Consent updated" : undefined);
+      if (!backendOk) toast({ title: "Saved locally. Backend sync unavailable.", variant: "warning" });
+      setShowConsent(false);
+      setQuickAction(null);
+    } catch (err) {
+      console.error('Failed to sign consent:', err);
+      toast({ title: "Failed to update consent", variant: "error" });
+    } finally {
+      setActiveWorkflowLoading(null);
     }
   };
 
+  const consentsSigned = CONSENT_TYPES.filter((c) => (patient.consents || {})[c.key]).length;
+
   const tabCounts: Partial<Record<TabId, number>> = {
-    timeline:  (patient.timeline  || []).length,
-    documents: (patient.documents || []).length,
-    notes:     (patient.notes     || []).length,
-    audit:     auditEntries.length,
-    followup:  patient.followUpDate ? 1 : 0,
+    timeline:      (patient.timeline     || []).length,
+    prescriptions: (patient.prescriptions|| []).length,
+    labresults:    (patient.labResults   || []).length,
+    documents:     (patient.documents    || []).length,
+    notes:         (patient.notes        || []).length,
+    consents:      consentsSigned > 0 ? consentsSigned : undefined,
+    audit:         auditEntries.length,
+    followup:      patient.followUpDate ? 1 : 0,
   };
 
   return (
@@ -326,6 +645,7 @@ export default function PatientProfile({
         .pp-tabs { padding: 0 16px; display: flex; gap: 2px; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
         .pp-tabs::-webkit-scrollbar { display: none; }
         .pp-tab-content { padding: 16px; }
+        .pp-quick-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
         @media (max-width: 640px) {
           .pp-identity { flex-wrap: wrap; padding: 10px 12px 8px !important; }
           .pp-identity .pp-actions { width: 100%; justify-content: flex-start; margin-top: 4px; }
@@ -336,6 +656,7 @@ export default function PatientProfile({
           .pp-tabs button i { font-size: 16px !important; }
           /* On small screens keep only Age+Blood in the meta row; DOB/ID/Doctor are secondary */
           .pp-meta-id, .pp-meta-doctor { display: none !important; }
+          .pp-quick-grid { grid-template-columns: repeat(2, 1fr) !important; }
         }
       `}</style>
       {/* ── Header ── */}
@@ -368,9 +689,19 @@ export default function PatientProfile({
                   }}>{a}</span>
                 ))}
             </div>
-            <span style={{ marginLeft: "auto", fontSize: "var(--font-xs)", color: "#991b1b" }}>
-              Review before proceeding
-            </span>
+            {!(patient as any).alertsReviewed ? (
+              <button
+                className="btn btn-ghost"
+                onClick={handleAcknowledgeAlerts}
+                style={{ marginLeft: "auto", fontSize: "var(--font-xs)", color: "#991b1b", border: "1px solid #991b1b", padding: "3px 10px" }}
+              >
+                <i className="ti ti-shield-check" style={{ fontSize: 11 }} /> Acknowledge
+              </button>
+            ) : (
+              <span style={{ marginLeft: "auto", fontSize: "var(--font-xs)", color: "#16a34a", fontWeight: 600 }}>
+                <i className="ti ti-shield-check" style={{ fontSize: 11 }} /> Reviewed
+              </span>
+            )}
           </div>
         )}
 
@@ -418,7 +749,28 @@ export default function PatientProfile({
                   <strong style={{ color: "var(--text)" }}>{value}</strong>
                 </span>
               ))}
+              <button
+                onClick={handleCopyPatientId}
+                title="Copy patient ID"
+                style={{ display: "inline-flex", alignItems: "center", gap: 3, background: "none", border: "none", cursor: "pointer", padding: "0 4px", color: "var(--muted)", fontSize: "var(--font-xs)" }}
+              >
+                <i className="ti ti-copy" style={{ fontSize: 11 }} />
+              </button>
             </div>
+            {((patient as any).updatedAt || (patient as any).createdAt) && (
+              <div style={{ display: "flex", gap: 12, marginTop: 3 }}>
+                {(patient as any).createdAt && (
+                  <span style={{ fontSize: "var(--font-2xs)", color: "var(--muted)" }}>
+                    Created {fmtDate((patient as any).createdAt)}
+                  </span>
+                )}
+                {(patient as any).updatedAt && (
+                  <span style={{ fontSize: "var(--font-2xs)", color: "var(--muted)" }}>
+                    Updated {fmtDate((patient as any).updatedAt)}
+                  </span>
+                )}
+              </div>
+            )}
 
             {/* Alert chips */}
             {(patient.alerts || []).length > 0 && (
@@ -430,6 +782,20 @@ export default function PatientProfile({
 
           {/* Right actions */}
           <div className="pp-actions" style={{ display: "flex", gap: 6, flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end" }}>
+            {patient.phone && (
+              <button className="btn btn-ghost" onClick={() => { window.open(`tel:${patient.phone}`, "_self"); }} title={`Call ${patient.phone}`} style={{ fontSize: "var(--font-sm)" }}>
+                <i className="ti ti-phone" style={{ fontSize: 14, color: "var(--green)" }} />
+                <span className="desktop-only">Call</span>
+              </button>
+            )}
+            <button className="btn btn-ghost" onClick={() => setShowCommunication(true)} style={{ fontSize: "var(--font-sm)" }}>
+              <i className="ti ti-message" style={{ fontSize: 14 }} />
+              <span className="desktop-only">Message</span>
+            </button>
+            <button className="btn btn-ghost" onClick={() => setShowAppointment(true)} style={{ fontSize: "var(--font-sm)" }}>
+              <i className="ti ti-calendar-plus" style={{ fontSize: 14, color: "var(--accent)" }} />
+              <span className="desktop-only">Book</span>
+            </button>
             <button className="btn btn-ghost" onClick={() => setShowEmergency(true)} style={{ fontSize: "var(--font-sm)" }}>
               <i className="ti ti-emergency-bed" style={{ fontSize: 14, color: "var(--red)" }} />
               <span className="desktop-only">Emergency</span>
@@ -441,7 +807,7 @@ export default function PatientProfile({
               </button>
             )}
             {can(role, "deletePatient") && (
-              <button className="btn btn-danger" onClick={() => setShowDelete(true)} style={{ fontSize: "var(--font-sm)" }}>
+              <button className="btn btn-danger" onClick={() => { closeAllWorkflowModals(); setShowDelete(true); }} style={{ fontSize: "var(--font-sm)" }}>
                 <i className="ti ti-trash" style={{ fontSize: 14 }} />
               </button>
             )}
@@ -521,6 +887,10 @@ export default function PatientProfile({
               onInvoice={() => setShowInvoice(true)}
               onCommunication={() => setShowCommunication(true)}
               onFollowUp={() => setShowFollowUp(true)}
+              onConsent={() => setShowConsent(true)}
+              onAcknowledgeAlerts={handleAcknowledgeAlerts}
+              consentsSigned={consentsSigned}
+              consentsTotal={CONSENT_TYPES.length}
             />
           )}
           {tab === "timeline"  && <TimelineTab patient={patient} role={role} onAddEvent={handleAddTimelineEvent} onDeleteEvent={handleDeleteTimelineEvent} />}
@@ -539,12 +909,24 @@ export default function PatientProfile({
       {showDelete && (
         <ConfirmDeleteModal
           patient={patient}
-          onConfirm={() => { onDeletePatient(patient.id); setShowDelete(false); }}
+          onConfirm={() => { setShowDelete(false); closeAllWorkflowModals(); onDeletePatient(patient.id); }}
           onClose={() => setShowDelete(false)}
         />
       )}
       {quickAction && (
-        <QuickActionModal action={quickAction} patient={patient} onClose={() => setQuickAction(null)} />
+        <QuickActionModal
+          action={quickAction}
+          patient={patient}
+          onClose={() => setQuickAction(null)}
+          onBookAppointment={() => { setQuickAction(null); setShowAppointment(true); }}
+          onStartConsultation={() => { setQuickAction(null); setShowConsultation(true); }}
+          onPrescription={() => { setQuickAction(null); setShowPrescription(true); }}
+          onFileUpload={() => { setQuickAction(null); setShowFileUpload(true); }}
+          onInvoice={() => { setQuickAction(null); setShowInvoice(true); }}
+          onCommunication={() => { setQuickAction(null); setShowCommunication(true); }}
+          onFollowUp={() => { setQuickAction(null); setShowFollowUp(true); }}
+          onConsent={() => { setQuickAction(null); setShowConsent(true); }}
+        />
       )}
       
       {/* Medical Workflow Modals */}
@@ -623,7 +1005,8 @@ export default function PatientProfile({
 function OverviewTab({
   patient, role, onVerificationToggle, snapshot, readiness, onQuickAction,
   onBookAppointment, onStartConsultation, onPrescription, onFileUpload,
-  onInvoice, onCommunication, onFollowUp
+  onInvoice, onCommunication, onFollowUp, onConsent,
+  onAcknowledgeAlerts, consentsSigned, consentsTotal,
 }: {
   patient: Patient;
   role: UserRole;
@@ -638,11 +1021,100 @@ function OverviewTab({
   onInvoice?: () => void;
   onCommunication?: () => void;
   onFollowUp?: () => void;
+  onConsent?: () => void;
+  onAcknowledgeAlerts?: () => void;
+  consentsSigned?: number;
+  consentsTotal?: number;
 }) {
+  // Profile completeness score
+  const completenessChecks = [
+    !!patient.phone,
+    !!patient.dob,
+    !!patient.emergencyName,
+    !!(patient.insuranceStatus && patient.insuranceStatus !== "None") || !!patient.insurer,
+    !!patient.consentSigned,
+    !!patient.documentsComplete,
+    !!patient.doctor,
+    !!patient.bloodGroup,
+  ];
+  const completenessScore = completenessChecks.filter(Boolean).length;
+  const completenessTotal = completenessChecks.length;
+
   return (
     <div style={{ display: "grid", gridTemplateColumns: "1fr 340px", gap: 24, alignItems: "start" }}>
       {/* Main col */}
       <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+
+        {/* ── At-a-glance safety strip ── */}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+          {/* Risk */}
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 10px", borderRadius: "var(--radius-full)", background: "var(--surface2)", border: "1px solid var(--border)", fontSize: "var(--font-xs)" }}>
+            <i className="ti ti-activity" style={{ fontSize: 11, color: "var(--muted)" }} />
+            <span style={{ color: "var(--muted)" }}>Risk:</span>
+            <RiskBadge patient={patient} />
+          </div>
+          {/* Insurance */}
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 10px", borderRadius: "var(--radius-full)", background: "var(--surface2)", border: "1px solid var(--border)", fontSize: "var(--font-xs)" }}>
+            <i className="ti ti-shield" style={{ fontSize: 11, color: "var(--muted)" }} />
+            <span style={{ color: "var(--muted)" }}>Insurance:</span>
+            <InsuranceBadge status={patient.insuranceStatus} />
+          </div>
+          {/* Consent */}
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 10px", borderRadius: "var(--radius-full)", background: "var(--surface2)", border: "1px solid var(--border)", fontSize: "var(--font-xs)" }}>
+            <i className="ti ti-writing" style={{ fontSize: 11, color: "var(--muted)" }} />
+            <span style={{ color: "var(--muted)" }}>Consents:</span>
+            <span style={{ fontWeight: 700, color: consentsSigned === consentsTotal ? "var(--green)" : "var(--amber)" }}>
+              {consentsSigned ?? 0}/{consentsTotal ?? 0}
+            </span>
+          </div>
+          {/* Documents */}
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 10px", borderRadius: "var(--radius-full)", background: "var(--surface2)", border: "1px solid var(--border)", fontSize: "var(--font-xs)" }}>
+            <i className="ti ti-files" style={{ fontSize: 11, color: "var(--muted)" }} />
+            <span style={{ color: "var(--muted)" }}>Docs:</span>
+            <span style={{ fontWeight: 700, color: patient.documentsComplete ? "var(--green)" : "var(--amber)" }}>
+              {patient.documentsComplete ? "Complete" : (patient.documents || []).length > 0 ? "Partial" : "Missing"}
+            </span>
+          </div>
+          {/* Next appt */}
+          <div style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 10px", borderRadius: "var(--radius-full)", background: "var(--surface2)", border: "1px solid var(--border)", fontSize: "var(--font-xs)" }}>
+            <i className="ti ti-calendar" style={{ fontSize: 11, color: "var(--muted)" }} />
+            <span style={{ color: "var(--muted)" }}>Next appt:</span>
+            <span style={{ fontWeight: 700, color: patient.nextAppointment ? "var(--text)" : "var(--amber)" }}>
+              {patient.nextAppointment ? fmtDate(patient.nextAppointment) : "None"}
+            </span>
+          </div>
+          {/* Follow-up */}
+          {patient.followUpDate && (
+            <div style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "5px 10px", borderRadius: "var(--radius-full)", background: "var(--amber-bg)", border: "1px solid var(--amber-border)", fontSize: "var(--font-xs)" }}>
+              <i className="ti ti-clock" style={{ fontSize: 11, color: "var(--amber)" }} />
+              <span style={{ color: "var(--amber)", fontWeight: 600 }}>Follow-up: {fmtDate(patient.followUpDate)}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Profile completeness */}
+        <div className="card card-padded" style={{ padding: "10px 14px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontSize: "var(--font-xs)", color: "var(--muted)", fontWeight: 600, whiteSpace: "nowrap" }}>
+              Profile completeness
+            </span>
+            <div style={{ flex: 1, height: 6, borderRadius: 4, background: "var(--surface3)", overflow: "hidden" }}>
+              <div style={{
+                height: "100%", borderRadius: 4,
+                width: `${(completenessScore / completenessTotal) * 100}%`,
+                background: completenessScore === completenessTotal ? "var(--green)" : "var(--accent)",
+                transition: "width 0.3s",
+              }} />
+            </div>
+            <span style={{
+              fontSize: "var(--font-xs)", fontWeight: 700,
+              color: completenessScore === completenessTotal ? "var(--green)" : "var(--muted)",
+              whiteSpace: "nowrap",
+            }}>
+              {completenessScore}/{completenessTotal}
+            </span>
+          </div>
+        </div>
 
         {/* Snapshot */}
         <div className="card card-padded" style={{
@@ -671,10 +1143,23 @@ function OverviewTab({
             ["Gender",          patient.gender],
             ["Blood Group",     patient.bloodGroup],
             ["Nationality",     patient.nationality],
-            ["Phone",           patient.phone],
-            ["Email",           patient.email],
             ["Address",         patient.address],
           ]} />
+          {/* Clickable contact row */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px 16px", marginTop: 8 }}>
+            <div>
+              <div style={{ fontSize: "var(--font-2xs)", color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 700, marginBottom: 2 }}>Phone</div>
+              {patient.phone
+                ? <a href={`tel:${patient.phone}`} style={{ fontSize: "var(--font-sm)", color: "var(--accent)", fontWeight: 500, textDecoration: "none" }}>{patient.phone}</a>
+                : <span style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>—</span>}
+            </div>
+            <div>
+              <div style={{ fontSize: "var(--font-2xs)", color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 700, marginBottom: 2 }}>Email</div>
+              {patient.email
+                ? <a href={`mailto:${patient.email}`} style={{ fontSize: "var(--font-sm)", color: "var(--accent)", fontWeight: 500, textDecoration: "none" }}>{patient.email}</a>
+                : <span style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>—</span>}
+            </div>
+          </div>
         </InfoCard>
 
         {/* Emergency Contact */}
@@ -725,7 +1210,7 @@ function OverviewTab({
 
         {/* Quick Actions */}
         <InfoCard title="Quick Actions" icon="ti-bolt" iconBg="var(--purple-bg)" iconColor="var(--purple)">
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
+          <div className="pp-quick-grid">
             {onBookAppointment && (
               <button onClick={onBookAppointment} style={{
                 display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
@@ -863,6 +1348,26 @@ function OverviewTab({
                 </div>
                 <span style={{ fontSize: "var(--font-2xs)", fontWeight: 500, color: "var(--muted)", textAlign: "center", lineHeight: 1.4 }}>
                   Schedule Follow-up
+                </span>
+              </button>
+            )}
+            {onConsent && (
+              <button onClick={onConsent} style={{
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
+                padding: "16px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)",
+                background: "var(--surface2)", cursor: "pointer", transition: "all 0.15s",
+              }}
+              onMouseOver={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface3)"; }}
+              onMouseOut={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "var(--surface2)"; }}
+              >
+                <div style={{
+                  width: 36, height: 36, borderRadius: "var(--radius)",
+                  background: "#10b98115", display: "flex", alignItems: "center", justifyContent: "center",
+                }}>
+                  <i className="ti ti-writing" style={{ fontSize: 18, color: "#10b981" }} />
+                </div>
+                <span style={{ fontSize: "var(--font-2xs)", fontWeight: 500, color: "var(--muted)", textAlign: "center", lineHeight: 1.4 }}>
+                  Sign Consent
                 </span>
               </button>
             )}
@@ -1238,6 +1743,11 @@ function DocumentsTab({
           <i className="ti ti-files empty-state-icon" />
           <div className="empty-state-text">No documents</div>
           <div className="empty-state-sub">Upload patient documents for this record</div>
+          {can(role, "editPatient") && (
+            <button className="btn btn-primary" style={{ marginTop: 16 }} onClick={onUploadFiles}>
+              <i className="ti ti-upload" style={{ fontSize: 13 }} /> Upload Files
+            </button>
+          )}
         </div>
       ) : (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: 10 }}>
@@ -1348,6 +1858,11 @@ function NotesTab({
           <i className="ti ti-notes empty-state-icon" />
           <div className="empty-state-text">No notes yet</div>
           <div className="empty-state-sub">Add notes to track important information</div>
+          {can(role, "editPatient") && (
+            <button className="btn btn-primary" style={{ marginTop: 16 }} onClick={() => setShowForm(true)}>
+              <i className="ti ti-plus" style={{ fontSize: 13 }} /> Add Note
+            </button>
+          )}
         </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
@@ -2029,7 +2544,50 @@ function ConfirmDeleteModal({ patient, onConfirm, onClose }: { patient: Patient;
 }
 
 // ─── Quick Action Modal ───────────────────────────────────────────────────────
-function QuickActionModal({ action, patient, onClose }: { action: string; patient: Patient; onClose: () => void }) {
+function QuickActionModal({
+  action, patient, onClose,
+  onBookAppointment, onStartConsultation, onPrescription,
+  onFileUpload, onInvoice, onCommunication, onFollowUp, onConsent,
+}: {
+  action: string;
+  patient: Patient;
+  onClose: () => void;
+  onBookAppointment?: () => void;
+  onStartConsultation?: () => void;
+  onPrescription?: () => void;
+  onFileUpload?: () => void;
+  onInvoice?: () => void;
+  onCommunication?: () => void;
+  onFollowUp?: () => void;
+  onConsent?: () => void;
+}) {
+  const lower = action.toLowerCase();
+
+  // Route known actions immediately to real modals
+  React.useEffect(() => {
+    if (lower.includes("appointment") || lower.includes("book")) { onBookAppointment?.(); return; }
+    if (lower.includes("consultation") || lower.includes("visit")) { onStartConsultation?.(); return; }
+    if (lower.includes("prescription") || lower.includes("medication")) { onPrescription?.(); return; }
+    if (lower.includes("upload") || lower.includes("document") || lower.includes("file")) { onFileUpload?.(); return; }
+    if (lower.includes("invoice") || lower.includes("billing")) { onInvoice?.(); return; }
+    if (lower.includes("call") || lower.includes("message") || lower.includes("communication")) { onCommunication?.(); return; }
+    if (lower.includes("follow")) { onFollowUp?.(); return; }
+    if (lower.includes("consent")) { onConsent?.(); return; }
+    // Unknown action — keep modal open and show fallback
+  }, []);
+
+  // If it's a known routable action, don't render modal (it will open the real one)
+  const isRoutable =
+    lower.includes("appointment") || lower.includes("book") ||
+    lower.includes("consultation") || lower.includes("visit") ||
+    lower.includes("prescription") || lower.includes("medication") ||
+    lower.includes("upload") || lower.includes("document") || lower.includes("file") ||
+    lower.includes("invoice") || lower.includes("billing") ||
+    lower.includes("call") || lower.includes("message") || lower.includes("communication") ||
+    lower.includes("follow") || lower.includes("consent");
+
+  if (isRoutable) return null;
+
   return (
     <div className="modal-backdrop">
       <div className="modal" style={{ width: "100%", maxWidth: 420, padding: 24 }}>
@@ -2038,14 +2596,11 @@ function QuickActionModal({ action, patient, onClose }: { action: string; patien
           <button className="btn-icon" onClick={onClose}><i className="ti ti-x" style={{ fontSize: 14 }} /></button>
         </div>
         <p style={{ fontSize: "var(--font-sm)", color: "var(--muted)", lineHeight: 1.6 }}>
-          This action would be processed for <strong>{patient.name}</strong>.
-          In a production system this would open the relevant workflow module.
+          This action is not yet implemented for <strong>{patient.name}</strong>.
+          Please contact your administrator or use the relevant workflow button from the Overview tab.
         </p>
-        <div style={{ marginTop: 16, display: "flex", gap: 8 }}>
-          <button className="btn btn-ghost" style={{ flex: 1 }} onClick={onClose}>Cancel</button>
-          <button className="btn btn-primary" style={{ flex: 1 }} onClick={onClose}>
-            <i className="ti ti-check" style={{ fontSize: 13 }} /> Confirm
-          </button>
+        <div style={{ marginTop: 16 }}>
+          <button className="btn btn-ghost" style={{ width: "100%" }} onClick={onClose}>Close</button>
         </div>
       </div>
     </div>

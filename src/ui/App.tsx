@@ -36,6 +36,7 @@ import { Notifications } from "./components/Notifications";
 const NAV_TABS = [
   { id: "dashboard",     label: "Dashboard",     icon: "ti-layout-dashboard" },
   { id: "queue",         label: "Queue",         icon: "ti-users-group" },
+  { id: "appointments",  label: "Appointments",  icon: "ti-calendar" },
   { id: "consultations", label: "Consultations", icon: "ti-stethoscope" },
   { id: "prescriptions", label: "Prescriptions", icon: "ti-pill" },
   { id: "lab",           label: "Lab",           icon: "ti-test-tube" },
@@ -52,6 +53,23 @@ type NavTab = typeof NAV_TABS[number]["id"];
 
 const CURRENT_USER = { name: "Dr. Admin", role: "admin" as UserRole };
 
+// ─── App connection/status types ──────────────────────────────────────────────
+// Backend wiring is still in progress, so getMode/getAuthStatus/healthCheck are
+// typed here as optional on top of apiClient — this lets App.tsx feature-detect
+// them at runtime without requiring any changes to api.ts. If they're missing
+// or throw, the app simply reports "local" and keeps working off localStorage.
+type ApiMode = "local" | "backend" | string;
+interface AuthStatusResult {
+  hasFirebaseToken?: boolean;
+  firebaseToken?: string | null;
+  token?: string | null;
+}
+type ApiClientWithStatus = typeof apiClient & {
+  getMode?: () => ApiMode | Promise<ApiMode>;
+  getAuthStatus?: () => AuthStatusResult | Promise<AuthStatusResult> | null | Promise<AuthStatusResult | null>;
+  healthCheck?: () => unknown | Promise<unknown>;
+};
+
 // ─── Load initial data ────────────────────────────────────────────────────────
 async function getPatients(): Promise<Patient[]> {
   const saved = await loadPatients();
@@ -63,7 +81,7 @@ async function getPatients(): Promise<Patient[]> {
 const NAV_SECTIONS = [
   {
     label: "Clinic",
-    tabs: ["dashboard", "queue", "consultations", "prescriptions", "lab"] as NavTab[],
+    tabs: ["dashboard", "queue", "appointments", "consultations", "prescriptions", "lab"] as NavTab[],
   },
   {
     label: "Admin",
@@ -364,9 +382,55 @@ function Sidebar({
   );
 }
 
+// ─── Connection / Mode Status Pill ────────────────────────────────────────────
+// Small, non-intrusive indicator of whether the app is running purely off
+// localStorage ("Local Mode") or talking to a real backend, plus whether a
+// Firebase auth token is present. Always degrades to "Local Mode" if the
+// underlying apiClient methods are missing or fail — see ApiClientWithStatus.
+function ConnectionStatusPill({
+  dark, apiMode, backendConnected, hasFirebaseToken, statusLoading,
+}: {
+  dark: boolean;
+  apiMode: ApiMode;
+  backendConnected: boolean;
+  hasFirebaseToken: boolean;
+  statusLoading: boolean;
+}) {
+  let label = "Local Mode";
+  let color = "var(--muted)";
+
+  if (statusLoading) {
+    label = "Checking…";
+  } else if (apiMode === "backend" || apiMode === "remote") {
+    label = backendConnected ? "Backend Connected" : "Backend Offline";
+    color = backendConnected ? "var(--green)" : "var(--red)";
+  } else if (hasFirebaseToken) {
+    label = "Firebase Token";
+    color = "var(--accent)";
+  }
+
+  return (
+    <span
+      title={`API mode: ${apiMode}${hasFirebaseToken ? " • Firebase token present" : ""}`}
+      style={{
+        display: "inline-flex", alignItems: "center", gap: 5,
+        fontSize: 10.5, fontWeight: 600, lineHeight: 1,
+        padding: "4px 9px", borderRadius: "var(--radius-full)",
+        color, background: dark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.045)",
+        border: "1px solid var(--border)", whiteSpace: "nowrap", flexShrink: 0,
+      }}
+    >
+      <span style={{ width: 6, height: 6, borderRadius: "50%", background: color, flexShrink: 0 }} />
+      {label}
+    </span>
+  );
+}
+
 // ─── Content Top Bar ─────────────────────────────────────────────────────────
 function ContentTopBar({
   dark, setDark, activeTab, setActiveTab, userRole, setUserRole, patients, onLogout,
+  apiMode, backendConnected, hasFirebaseToken, statusLoading, onRefresh, refreshing,
+  lastSavedAt, onSearchEnter, searchInputRef,
 }: {
   dark: boolean;
   setDark: (d: boolean) => void;
@@ -376,18 +440,23 @@ function ContentTopBar({
   setUserRole: (r: UserRole) => void;
   patients: Patient[];
   onLogout: () => void;
+  apiMode: ApiMode;
+  backendConnected: boolean;
+  hasFirebaseToken: boolean;
+  statusLoading: boolean;
+  onRefresh: () => void;
+  refreshing: boolean;
+  lastSavedAt: Date | null;
+  onSearchEnter: (q: string) => void;
+  searchInputRef?: React.RefObject<HTMLInputElement | null>;
 }) {
   const currentTab = NAV_TABS.find((t) => t.id === activeTab);
   const [searchVal, setSearchVal] = useState("");
 
   function handleSearch(e: React.KeyboardEvent<HTMLInputElement>) {
     if (e.key === "Enter" && searchVal.trim()) {
-      setActiveTab("patients");
-      // let PatientList pick up a global search trigger via Ctrl+K flow
-      setTimeout(() => {
-        const real = document.querySelector<HTMLInputElement>('input[type="search"]:not([data-topbar])');
-        if (real) { real.value = searchVal; real.focus(); real.dispatchEvent(new Event("input", { bubbles: true })); }
-      }, 60);
+      onSearchEnter(searchVal.trim());
+      setSearchVal("");
     }
   }
 
@@ -412,6 +481,8 @@ function ContentTopBar({
         }
         .qptb-root .qptb-icon-btn:hover { background: ${dark ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.05)"}; }
         .qptb-root .qptb-icon-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+        .qptb-root .qptb-icon-btn.qptb-spinning i { animation: qptb-spin 0.8s linear infinite; }
+        @keyframes qptb-spin { to { transform: rotate(360deg); } }
         .qptb-root .qptb-role-select:hover { background: ${dark ? "rgba(255,255,255,0.1)" : "rgba(0,0,0,0.07)"} !important; }
         .qptb-root .qptb-user-name { transition: opacity 0.15s; }
         /* Tablet compression: keep every control, just tighten and drop secondary text */
@@ -447,6 +518,7 @@ function ContentTopBar({
           fontSize: 12, color: "var(--muted)", pointerEvents: "none",
         }} />
         <input
+          ref={searchInputRef}
           data-topbar="1"
           type="search"
           value={searchVal}
@@ -474,6 +546,36 @@ function ContentTopBar({
       </div>
 
       <div style={{ flex: 1 }} />
+
+      {/* Last saved indicator — tiny, non-intrusive */}
+      {lastSavedAt && (
+        <span style={{
+          fontSize: 10, color: "var(--muted)", whiteSpace: "nowrap", flexShrink: 0,
+          opacity: 0.75,
+        }}>
+          Saved {lastSavedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+        </span>
+      )}
+
+      {/* Connection/mode status — small and non-intrusive, never blocks local-mode use */}
+      <ConnectionStatusPill
+        dark={dark}
+        apiMode={apiMode}
+        backendConnected={backendConnected}
+        hasFirebaseToken={hasFirebaseToken}
+        statusLoading={statusLoading}
+      />
+
+      {/* Refresh patients */}
+      <button
+        className={`btn-icon qptb-icon-btn${refreshing ? " qptb-spinning" : ""}`}
+        onClick={onRefresh}
+        disabled={refreshing}
+        title="Refresh data"
+        style={{ border: "none", background: "transparent" }}
+      >
+        <i className="ti ti-refresh" style={{ fontSize: 15, color: "var(--muted)" }} />
+      </button>
 
       {/* Notifications */}
       <Notifications patients={patients} />
@@ -1034,22 +1136,116 @@ function AppInner() {
   const [loading,         setLoading]         = useState(true);
   const searchRef = useRef<HTMLInputElement | null>(null);
 
-  // Load initial data from localStorage
-  useEffect(() => {
-    async function loadData() {
+  // App connection/status — local vs backend vs Firebase. Purely informational;
+  // the app keeps working in localStorage mode regardless of what this reports.
+  const [apiMode,            setApiMode]            = useState<ApiMode>("local");
+  const [backendConnected,   setBackendConnected]   = useState(false);
+  const [hasFirebaseToken,   setHasFirebaseToken]   = useState(false);
+  const [statusLoading,      setStatusLoading]      = useState(true);
+  const [refreshingPatients, setRefreshingPatients] = useState(false);
+  const [lastSavedAt,        setLastSavedAt]        = useState<Date | null>(null);
+  const topbarSearchRef = useRef<HTMLInputElement | null>(null);
+
+  // ── refreshPatients ──────────────────────────────────────────────────────────
+  // Central patient-loading helper. Pass silent=true during mount to suppress
+  // toast noise. Pass silent=false (default) when called manually (refresh btn).
+  const refreshPatients = useCallback(async (silent = false) => {
+    if (!silent) setRefreshingPatients(true);
+    try {
+      let fresh: Patient[] | null = null;
+
+      // 1. Try localStorage helper first
       try {
-        const loadedPatients = await getPatients();
-        setPatients(loadedPatients);
+        const saved = await loadPatients();
+        if (saved && saved.length > 0) fresh = saved;
+      } catch { /* fall through */ }
+
+      // 2. Try apiClient if localStorage had nothing
+      if (!fresh) {
+        try {
+          const ac = apiClient as ApiClientWithStatus & { getPatients?: (limit: number, offset: number) => Promise<unknown> };
+          if (typeof ac.getPatients === "function") {
+            const res = await ac.getPatients(100000, 0);
+            if (Array.isArray(res) && res.length > 0) fresh = res as Patient[];
+          }
+        } catch { /* fall through */ }
+      }
+
+      // 3. Ultimate fallback: seed data
+      if (!fresh) fresh = getInitialPatients();
+
+      setPatients(fresh);
+      setLastSavedAt(new Date());
+
+      // Keep selectedPatient from going stale after a manual refresh
+      setSelectedPatient((prev) => {
+        if (!prev) return prev;
+        const match = fresh!.find((p) => p.id === prev.id);
+        return match ?? null;
+      });
+
+      if (!silent) toast("Data refreshed", "success");
+    } catch (error) {
+      console.error("Failed to refresh patients:", error);
+      if (!silent) toast("Failed to refresh data", "error");
+    } finally {
+      if (!silent) setRefreshingPatients(false);
+      setLoading(false);
+    }
+  }, [toast]);
+
+  // Load initial data — silent so no toast on mount
+  useEffect(() => {
+    refreshPatients(true);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // App connection/status — checks local vs backend vs Firebase on mount.
+  // Each call is feature-detected and individually try/caught: if api.ts
+  // doesn't implement one of these yet (or it throws), this just falls back
+  // to reporting local mode rather than breaking anything.
+  useEffect(() => {
+    let cancelled = false;
+    const ac = apiClient as ApiClientWithStatus;
+
+    async function loadStatus() {
+      setStatusLoading(true);
+
+      try {
+        const mode = typeof ac.getMode === "function" ? await ac.getMode() : "local";
+        if (!cancelled) setApiMode(mode || "local");
       } catch (error) {
-        console.error("Failed to load patients:", error);
-        // Use mock data as fallback
-        const mockPatients = getInitialPatients();
-        setPatients(mockPatients);
+        console.error("Failed to read API mode, defaulting to local:", error);
+        if (!cancelled) setApiMode("local");
+      }
+
+      try {
+        const authStatus = typeof ac.getAuthStatus === "function" ? await ac.getAuthStatus() : null;
+        if (!cancelled) {
+          setHasFirebaseToken(Boolean(authStatus?.hasFirebaseToken ?? authStatus?.firebaseToken ?? authStatus?.token));
+        }
+      } catch (error) {
+        console.error("Failed to read auth status:", error);
+        if (!cancelled) setHasFirebaseToken(false);
+      }
+
+      try {
+        if (typeof ac.healthCheck === "function") {
+          await ac.healthCheck();
+          if (!cancelled) setBackendConnected(true);
+        } else if (!cancelled) {
+          setBackendConnected(false);
+        }
+      } catch (error) {
+        console.error("Backend health check failed, treating backend as offline:", error);
+        if (!cancelled) setBackendConnected(false);
       } finally {
-        setLoading(false);
+        if (!cancelled) setStatusLoading(false);
       }
     }
-    loadData();
+
+    loadStatus();
+    return () => { cancelled = true; };
   }, []);
 
   // Persist whenever patients or audit changes (now via localStorage)
@@ -1060,12 +1256,18 @@ function AppInner() {
     saveAuditMap(auditMap);
   }, [auditMap]);
 
-  // Keep selectedPatient in sync with patients array
+  // Keep selectedPatient in sync with patients array.
+  // If the patient was deleted, clear selection and go back to the patients list.
   useEffect(() => {
-    if (selectedPatient) {
-      const fresh = patients.find((p) => p.id === selectedPatient.id);
-      if (fresh && fresh !== selectedPatient) setSelectedPatient(fresh);
+    if (!selectedPatient) return;
+    const fresh = patients.find((p) => p.id === selectedPatient.id);
+    if (!fresh) {
+      setSelectedPatient(null);
+      setActiveTab("patients");
+    } else if (fresh !== selectedPatient) {
+      setSelectedPatient(fresh);
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [patients]);
 
   // On mobile, if the active tab isn't reachable via the bottom nav or the More sheet
@@ -1100,6 +1302,48 @@ function AppInner() {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, []);
+
+  // Extra keyboard shortcuts — only when not typing inside an input/textarea/select
+  useEffect(() => {
+    function isTyping() {
+      const el = document.activeElement as HTMLElement | null;
+      if (!el) return false;
+      const tag = el.tagName.toLowerCase();
+      return tag === "input" || tag === "textarea" || tag === "select" || el.isContentEditable;
+    }
+
+    function handler(e: KeyboardEvent) {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+      // `/` → focus topbar search
+      if (e.key === "/" && !isTyping()) {
+        e.preventDefault();
+        const input =
+          topbarSearchRef.current ??
+          document.querySelector<HTMLInputElement>('input[data-topbar]') ??
+          document.querySelector<HTMLInputElement>('input[type="search"]');
+        input?.focus();
+        return;
+      }
+
+      // `n` → open new patient modal
+      if (e.key === "n" && !isTyping()) {
+        e.preventDefault();
+        setActiveTab("patients");
+        setSelectedPatient(null);
+        setFormMode("create");
+        return;
+      }
+
+      // `Escape` → close profile / return to patients list
+      if (e.key === "Escape") {
+        if (formMode) { setFormMode(null); return; }
+        if (selectedPatient) { setSelectedPatient(null); setActiveTab("patients"); return; }
+      }
+    }
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [formMode, selectedPatient]);
 
   const stats = getPatientStats(patients);
 
@@ -1147,8 +1391,7 @@ function AppInner() {
         setFormMode("create");
         return;
       case "book-appointment":
-        // No dedicated Appointments tab wired into NAV_TABS yet — Queue is the closest equivalent for now
-        setActiveTab("queue");
+        setActiveTab("appointments");
         return;
       case "check-in":
         setActiveTab("queue");
@@ -1184,12 +1427,13 @@ function AppInner() {
   }, [patients, handleSelect, toast]);
 
   const handleUpdatePatient = useCallback(async (updated: Patient, action = "edited") => {
+    // Optimistic local update first
+    setPatients((prev) => prev.map((p) => p.id === updated.id ? updated : p));
+    setSelectedPatient((prev) => (prev && prev.id === updated.id ? updated : prev));
+
     try {
       await apiClient.updatePatient(updated.id, updated);
-      setPatients((prev) => prev.map((p) => p.id === updated.id ? updated : p));
-      // Only follow the update into the open profile if it's the patient currently being viewed —
-      // a status change triggered from elsewhere (e.g. Dashboard or Queue) must never swap which chart is on screen
-      setSelectedPatient((prev) => (prev && prev.id === updated.id ? updated : prev));
+      setLastSavedAt(new Date());
       const entry = createAuditEntry({
         patientId: updated.id,
         message:   `${CURRENT_USER.name} ${action}: ${updated.name}`,
@@ -1197,10 +1441,13 @@ function AppInner() {
         user:      CURRENT_USER.name,
       });
       setAuditMap((prev) => addAuditEntry(prev, updated.id, entry));
-      toast(`${updated.name} updated`, "success");
+      // Only toast for explicit manual edits, not silent background updates
+      if (action !== "status-change" && action !== "queue-update") {
+        toast(`${updated.name} updated`, "success");
+      }
     } catch (error) {
-      console.error("Failed to update patient:", error);
-      toast(`Failed to update patient: ${error}`, "error");
+      console.error("Failed to persist patient update:", error);
+      toast(`Failed to save changes for ${updated.name}`, "error");
     }
   }, [toast]);
 
@@ -1212,11 +1459,13 @@ function AppInner() {
     try {
       await apiClient.deletePatient(id);
       setPatients((prev) => prev.filter((x) => x.id !== id));
-      setSelectedPatient(null);
+      setSelectedPatient((prev) => (prev?.id === id ? null : prev));
+      setActiveTab("patients");
+      setLastSavedAt(new Date());
       if (p) {
         const entry = createAuditEntry({ patientId: id, message: `${CURRENT_USER.name} deleted ${p.name}`, type: "deleted", user: CURRENT_USER.name });
         setAuditMap((prev) => addAuditEntry(prev, id, entry));
-        toast(`${p.name} deleted`, "error");
+        toast(`Patient deleted`, "error");
       }
     } catch (error) {
       console.error("Failed to delete patient:", error);
@@ -1242,6 +1491,7 @@ function AppInner() {
         setAuditMap((prev) => addAuditEntry(prev, updated.id, entry));
         toast(`${updated.name} saved`, "success");
       }
+      setLastSavedAt(new Date());
       setFormMode(null);
     } catch (error) {
       console.error("Failed to save patient:", error);
@@ -1251,24 +1501,83 @@ function AppInner() {
 
   const handleImport = useCallback(async (rows: Partial<Patient>[]) => {
     try {
-      const result = await apiClient.importPatients(rows) as { imported: number; errors: string[] };
-      const importedCount = result.imported;
+      const now = new Date().toISOString();
+      let imported = 0;
+      let skipped  = 0;
+
       setPatients((prev) => {
-        // Reload patients from API after import
-        apiClient.getPatients(1000, 0).then((patients) => {
-          return patients as Patient[];
-        }).catch(() => prev);
-        return prev;
+        const next = [...prev];
+
+        for (const row of rows) {
+          // Assign id / createdAt if missing
+          const candidate: Patient = {
+            ...row,
+            id:        row.id        || `imp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            createdAt: row.createdAt || now,
+          } as Patient;
+
+          // De-dupe: by id first, then phone+name
+          const duplicate = next.find((p) =>
+            (candidate.id && p.id === candidate.id) ||
+            (candidate.phone && candidate.name &&
+              p.phone === candidate.phone && p.name === candidate.name)
+          );
+
+          if (duplicate) {
+            skipped++;
+          } else {
+            next.unshift(candidate);
+            imported++;
+          }
+        }
+
+        // Persist the merged list
+        savePatients(next);
+        return next;
       });
-      const entry = createAuditEntry({ patientId: "system", message: `${CURRENT_USER.name} imported ${importedCount} patients`, type: "import", user: CURRENT_USER.name });
+
+      setLastSavedAt(new Date());
+      const entry = createAuditEntry({ patientId: "system", message: `${CURRENT_USER.name} imported ${imported} patients (${skipped} duplicates skipped)`, type: "import", user: CURRENT_USER.name });
       setAuditMap((prev) => addAuditEntry(prev, "system", entry));
       setImportOpen(false);
-      toast(`${importedCount} patients imported`, "success");
+      toast(
+        skipped > 0
+          ? `${imported} imported, ${skipped} duplicate${skipped !== 1 ? "s" : ""} skipped`
+          : `${imported} patient${imported !== 1 ? "s" : ""} imported`,
+        "success"
+      );
     } catch (error) {
       console.error("Failed to import patients:", error);
       toast(`Failed to import patients: ${error}`, "error");
     }
   }, [toast]);
+
+  const handleRefreshPatients = useCallback(() => refreshPatients(false), [refreshPatients]);
+
+  // Topbar global search — smart navigation on Enter
+  const handleSearchEnter = useCallback((q: string) => {
+    const lower = q.toLowerCase();
+    const matches = patients.filter((p) =>
+      p.name?.toLowerCase().includes(lower) ||
+      p.id?.toLowerCase().includes(lower) ||
+      p.phone?.toLowerCase().includes(lower)
+    );
+    if (matches.length === 0) {
+      toast("No patient found", "error");
+    } else if (matches.length === 1) {
+      setSelectedPatient(matches[0]);
+      setActiveTab("patients");
+    } else {
+      // Multiple matches — go to patients list so PatientList search can filter
+      setActiveTab("patients");
+      setSelectedPatient(null);
+      setListSearch(q);
+      setTimeout(() => {
+        const real = document.querySelector<HTMLInputElement>('input[type="search"]:not([data-topbar])');
+        if (real) { real.value = q; real.focus(); real.dispatchEvent(new Event("input", { bubbles: true })); }
+      }, 60);
+    }
+  }, [patients, toast]);
 
   // Handle logout (frontend-only mode - just clears data)
   const handleLogout = async () => {
@@ -1324,6 +1633,15 @@ function AppInner() {
         userRole={userRole} setUserRole={setUserRole}
         patients={patients}
         onLogout={handleLogout}
+        apiMode={apiMode}
+        backendConnected={backendConnected}
+        hasFirebaseToken={hasFirebaseToken}
+        statusLoading={statusLoading}
+        onRefresh={handleRefreshPatients}
+        refreshing={refreshingPatients}
+        lastSavedAt={lastSavedAt}
+        onSearchEnter={handleSearchEnter}
+        searchInputRef={topbarSearchRef}
       />
 
       <MobileTopBar
@@ -1369,6 +1687,15 @@ function AppInner() {
         {activeTab === "queue" && (
           <div style={{ flex: 1, overflow: "auto" }}>
             <QueuePage patients={patients} onUpdatePatient={handleUpdatePatient} onAction={handleDashboardAction} />
+          </div>
+        )}
+        {activeTab === "appointments" && (
+          <div style={{ flex: 1, overflow: "auto" }}>
+            <AppointmentsPage
+              patients={patients}
+              onUpdatePatient={handleUpdatePatient}
+              onViewPatient={(p: Patient) => { setSelectedPatient(p); setActiveTab("patients"); }}
+            />
           </div>
         )}
         {activeTab === "consultations" && (

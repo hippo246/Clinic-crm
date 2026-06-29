@@ -4,6 +4,25 @@ import { DOCTORS, STATUSES, PAGE_SIZE } from "./constants";
 import { applySmartSearch, sortPatients, fmtDate, calcRiskScore, detectDuplicates, exportPatientsToCSV, fuzzyMatch, getHighlightParts } from "./utils";
 import { StatusBadge, InsuranceBadge, AlertChip, AvatarCircle, RiskBadge } from "./Badges";
 
+// ─── localStorage helpers ─────────────────────────────────────────────────────
+function readJSON<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw == null) return fallback;
+    const parsed = JSON.parse(raw);
+    return parsed ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+function writeJSON(key: string, value: unknown): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* storage full or disabled — fail silently, app should keep working */
+  }
+}
+
 const SMART_SUGGESTIONS = [
   { label: "Diabetic patients",         query: "diabetic" },
   { label: "Follow-up overdue",         query: "follow-up overdue" },
@@ -260,6 +279,42 @@ export default function PatientList({
   const [isMobile, setIsMobile] = useState(() => typeof window !== "undefined" && window.innerWidth <= 640);
   const [showMobileFilters, setShowMobileFilters] = useState(false);
 
+  // ── feedback system (replaces alert()) ──────────────────────────────────────
+  const [feedback, setFeedback] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
+  const showFeedback = useCallback((message: string, type: "success" | "error" | "info" = "info") => {
+    setFeedback({ type, message });
+    setTimeout(() => setFeedback(null), 4000);
+  }, []);
+
+  // ── schedule modal (replaces prompt()) ──────────────────────────────────────
+  const [showScheduleModal, setShowScheduleModal] = useState(false);
+  const [schedulePatient, setSchedulePatient] = useState<Patient | null>(null);
+  const [scheduleDate, setScheduleDate] = useState("");
+  const [scheduleTime, setScheduleTime] = useState("");
+  const [scheduleReason, setScheduleReason] = useState("");
+  const [scheduleError, setScheduleError] = useState("");
+
+  // ── bulk schedule modal ──────────────────────────────────────────────────────
+  const [showBulkScheduleModal, setShowBulkScheduleModal] = useState(false);
+  const [bulkScheduleDate, setBulkScheduleDate] = useState("");
+  const [bulkScheduleTime, setBulkScheduleTime] = useState("");
+  const [bulkScheduleDoctor, setBulkScheduleDoctor] = useState("");
+  const [bulkScheduleReason, setBulkScheduleReason] = useState("");
+  const [bulkScheduleError, setBulkScheduleError] = useState("");
+
+  // ── bulk tag modal ───────────────────────────────────────────────────────────
+  const [showBulkTagModal, setShowBulkTagModal] = useState(false);
+  const [bulkTagValue, setBulkTagValue] = useState("");
+
+  // ── local confirmation modal (replaces window.confirm) ──────────────────────
+  const [confirmModal, setConfirmModal] = useState<{
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    danger?: boolean;
+    onConfirm: () => void;
+  } | null>(null);
+
   // Track viewport width so the layout can adapt to phone screens
   useEffect(() => {
     const handleResize = () => setIsMobile(window.innerWidth <= 640);
@@ -267,78 +322,68 @@ export default function PatientList({
     return () => window.removeEventListener("resize", handleResize);
   }, []);
 
+  // Escape closes any open modal/overlay
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      if (confirmModal) { setConfirmModal(null); return; }
+      if (showScheduleModal) { setShowScheduleModal(false); return; }
+      if (showBulkScheduleModal) { setShowBulkScheduleModal(false); return; }
+      if (showBulkTagModal) { setShowBulkTagModal(false); return; }
+      if (showQuickNoteModal) { setShowQuickNoteModal(false); return; }
+      if (showTagManager) { setShowTagManager(false); return; }
+      if (showBulkStatusModal) { setShowBulkStatusModal(false); return; }
+      if (showBulkDoctorModal) { setShowBulkDoctorModal(false); return; }
+      if (showPrintModal) { setShowPrintModal(false); return; }
+      if (showExportModal) { setShowExportModal(false); return; }
+      if (showBulkActions) { setShowBulkActions(false); return; }
+      if (showSaveFilterModal) { setShowSaveFilterModal(false); return; }
+      if (showSaveSearchModal) { setShowSaveSearchModal(false); return; }
+      if (showAuditTrail) { setShowAuditTrail(false); return; }
+      if (showReminders) { setShowReminders(false); return; }
+      if (showDuplicateModal) { setShowDuplicateModal(false); return; }
+      if (comparisonMode) { setComparisonMode(false); return; }
+      if (callingPatient) { setCallingPatient(null); return; }
+      if (quickActionsMenu) { setQuickActionsMenu(null); return; }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [confirmModal, showScheduleModal, showBulkScheduleModal, showBulkTagModal, showQuickNoteModal, showTagManager, showBulkStatusModal, showBulkDoctorModal, showPrintModal, showExportModal, showBulkActions, showSaveFilterModal, showSaveSearchModal, showAuditTrail, showReminders, showDuplicateModal, comparisonMode, callingPatient, quickActionsMenu]);
+
   // Load saved filters from localStorage
   useEffect(() => {
-    const saved = localStorage.getItem("savedPatientFilters");
-    if (saved) {
-      try {
-        setSavedFilters(JSON.parse(saved));
-      } catch (e) {
-        console.error("Failed to load saved filters:", e);
-      }
-    }
+    setSavedFilters(readJSON("savedPatientFilters", []));
   }, []);
 
   // Load saved searches from localStorage
   useEffect(() => {
-    const saved = localStorage.getItem("savedPatientSearches");
-    if (saved) {
-      try {
-        setSavedSearches(JSON.parse(saved));
-      } catch (e) {
-        console.error("Failed to load saved searches:", e);
-      }
-    }
+    setSavedSearches(readJSON("savedPatientSearches", []));
   }, []);
 
   // Load reminders from localStorage
   useEffect(() => {
-    const saved = localStorage.getItem("patientReminders");
-    if (saved) {
-      try {
-        setReminders(JSON.parse(saved));
-      } catch (e) {
-        console.error("Failed to load reminders:", e);
-      }
-    }
+    setReminders(readJSON("patientReminders", []));
   }, []);
 
   // Load audit trail from localStorage
   useEffect(() => {
-    const saved = localStorage.getItem("patientAuditTrail");
-    if (saved) {
-      try {
-        setAuditTrail(JSON.parse(saved));
-      } catch (e) {
-        console.error("Failed to load audit trail:", e);
-      }
-    }
+    setAuditTrail(readJSON("patientAuditTrail", []));
   }, []);
 
   // Load tag colors from localStorage
   useEffect(() => {
-    const saved = localStorage.getItem("tagColors");
-    if (saved) {
-      try {
-        setTagColors(JSON.parse(saved));
-      } catch (e) {
-        console.error("Failed to load tag colors:", e);
-      }
-    }
+    const saved = readJSON<Record<string, string>>("tagColors", {});
+    if (Object.keys(saved).length > 0) setTagColors(saved);
   }, []);
 
   // Dark mode is managed by App.tsx — PatientList syncs its local preference to localStorage
-  // but does NOT manipulate document.documentElement (App.tsx owns that)
   useEffect(() => {
-    const saved = localStorage.getItem("darkMode");
-    if (saved) {
-      setIsDarkMode(JSON.parse(saved));
-    }
+    setIsDarkMode(readJSON("darkMode", false));
   }, []);
 
   // Save dark mode preference when changed from within PatientList
   useEffect(() => {
-    localStorage.setItem("darkMode", JSON.stringify(isDarkMode));
+    writeJSON("darkMode", isDarkMode);
   }, [isDarkMode]);
 
   // Auto-generate reminders for overdue follow-ups
@@ -362,36 +407,36 @@ export default function PatientList({
 
   // Save reminders to localStorage
   useEffect(() => {
-    localStorage.setItem("patientReminders", JSON.stringify(reminders));
+    writeJSON("patientReminders", reminders);
   }, [reminders]);
 
   // Save audit trail to localStorage
   useEffect(() => {
-    localStorage.setItem("patientAuditTrail", JSON.stringify(auditTrail));
+    writeJSON("patientAuditTrail", auditTrail);
   }, [auditTrail]);
 
   // Save tag colors to localStorage
   useEffect(() => {
-    localStorage.setItem("tagColors", JSON.stringify(tagColors));
+    writeJSON("tagColors", tagColors);
   }, [tagColors]);
 
   // Save searches to localStorage when they change
   useEffect(() => {
-    localStorage.setItem("savedPatientSearches", JSON.stringify(savedSearches));
+    writeJSON("savedPatientSearches", savedSearches);
   }, [savedSearches]);
 
   // Save filters to localStorage whenever they change
   useEffect(() => {
-    localStorage.setItem("savedPatientFilters", JSON.stringify(savedFilters));
+    writeJSON("savedPatientFilters", savedFilters);
   }, [savedFilters]);
 
   function handleSaveSearch() {
     if (!newSearchName.trim()) {
-      alert("Please enter a search name");
+      showFeedback("Please enter a search name", "error");
       return;
     }
     if (!search.trim()) {
-      alert("Please enter a search query first");
+      showFeedback("Please enter a search query first", "error");
       return;
     }
     const newSearch = {
@@ -434,7 +479,7 @@ export default function PatientList({
 
   function handleSaveFilter() {
     if (!newFilterName.trim()) {
-      alert("Please enter a filter name");
+      showFeedback("Please enter a filter name", "error");
       return;
     }
     const currentFilters = {
@@ -852,49 +897,62 @@ export default function PatientList({
 
   function handleBulkDelete() {
     if (!onDeletePatient) {
-      alert("Delete not available");
+      showFeedback("Delete is not available", "error");
       return;
     }
-    if (confirm(`Are you sure you want to delete ${selectedPatients.size} patients? This cannot be undone.`)) {
-      selectedPatients.forEach(patientId => {
-        onDeletePatient(patientId);
-      });
-      clearSelection();
-    }
+    setConfirmModal({
+      title: "Delete Patients",
+      message: `Are you sure you want to delete ${selectedPatients.size} patient${selectedPatients.size !== 1 ? "s" : ""}? This cannot be undone.`,
+      confirmLabel: "Delete",
+      danger: true,
+      onConfirm: () => {
+        const count = selectedPatients.size;
+        selectedPatients.forEach(id => onDeletePatient!(id));
+        logAuditTrail(`Bulk deleted ${count} patients`, "bulk", "multiple");
+        clearSelection();
+        showFeedback(`Deleted ${count} patient${count !== 1 ? "s" : ""}`, "success");
+      },
+    });
   }
 
   function handleBulkStatusUpdate() {
     if (!bulkStatusTarget) return;
     if (!onUpdatePatient) {
-      alert("Update not available");
+      showFeedback("Update is not available", "error");
       return;
     }
+    const count = selectedPatients.size;
     selectedPatients.forEach(patientId => {
       const patient = patients.find(p => p.id === patientId);
       if (patient) {
         onUpdatePatient({ ...patient, status: bulkStatusTarget as PatientStatus });
       }
     });
+    logAuditTrail(`Bulk status update to "${bulkStatusTarget}" for ${count} patients`, "bulk", "multiple");
     setShowBulkStatusModal(false);
     setBulkStatusTarget("");
     clearSelection();
+    showFeedback(`Updated status to "${bulkStatusTarget}" for ${count} patient${count !== 1 ? "s" : ""}`, "success");
   }
 
   function handleBulkDoctorUpdate() {
     if (!bulkDoctorTarget) return;
     if (!onUpdatePatient) {
-      alert("Update not available");
+      showFeedback("Update is not available", "error");
       return;
     }
+    const count = selectedPatients.size;
     selectedPatients.forEach(patientId => {
       const patient = patients.find(p => p.id === patientId);
       if (patient) {
         onUpdatePatient({ ...patient, doctor: bulkDoctorTarget });
       }
     });
+    logAuditTrail(`Bulk doctor assignment to "${bulkDoctorTarget}" for ${count} patients`, "bulk", "multiple");
     setShowBulkDoctorModal(false);
     setBulkDoctorTarget("");
     clearSelection();
+    showFeedback(`Assigned Dr. ${bulkDoctorTarget} to ${count} patient${count !== 1 ? "s" : ""}`, "success");
   }
 
   function handleQuickAction(action: string, patient: Patient) {
@@ -905,42 +963,36 @@ export default function PatientList({
           setCallingPatient(patient);
           logAuditTrail("Called patient", patient.id, patient.name);
         } else {
-          alert("No phone number available");
+          showFeedback(`No phone number on file for ${patient.name}`, "error");
         }
         break;
       case "email":
         if (patient.email) {
           window.location.href = `mailto:${patient.email}`;
+          logAuditTrail("Emailed patient", patient.id, patient.name);
         } else {
-          alert("No email available");
+          showFeedback(`No email address on file for ${patient.name}`, "error");
         }
         break;
       case "schedule":
-        // Set next appointment date for patient
-        const newDate = prompt(`Enter appointment date for ${patient.name} (YYYY-MM-DD):`);
-        if (newDate) {
-          const date = new Date(newDate);
-          if (!isNaN(date.getTime())) {
-            const updatedPatient = { ...patient, nextAppointment: date.toISOString() };
-            if (onUpdatePatient) {
-              onUpdatePatient(updatedPatient);
-            }
-            alert(`Appointment scheduled for ${fmtDate(date)}`);
-          } else {
-            alert("Invalid date format. Use YYYY-MM-DD");
-          }
-        }
+        setSchedulePatient(patient);
+        setScheduleDate("");
+        setScheduleTime("");
+        setScheduleReason("");
+        setScheduleError("");
+        setShowScheduleModal(true);
         break;
       case "note":
         setSelectedPatientForNote(patient);
+        setQuickNoteText("");
         setShowQuickNoteModal(true);
         break;
       case "profile":
         onSelect(patient);
         break;
       case "edit":
-        // Edit patient - navigate to edit form
         onSelect(patient);
+        showFeedback("Edit mode opens in the patient profile", "info");
         break;
       case "manage-tags":
         setSelectedPatientForTags(patient);
@@ -951,7 +1003,7 @@ export default function PatientList({
 
   function handleCompare() {
     if (selectedPatients.size < 2 || selectedPatients.size > 3) {
-      alert("Please select 2-3 patients to compare");
+      showFeedback("Select 2–3 patients to compare", "error");
       return;
     }
     setComparisonMode(true);
@@ -1731,7 +1783,12 @@ export default function PatientList({
                     <div className="empty-state">
                       <i className="ti ti-users empty-state-icon" />
                       <div className="empty-state-text">No patients found</div>
-                      <div className="empty-state-sub">Try adjusting your search or filters</div>
+                      <div className="empty-state-sub">{search ? `No results for "${search}"` : "Try adjusting your filters"}</div>
+                      {(search || filterStatus !== "All" || filterDoctor !== "All" || filterInsurance !== "All" || filterRisk !== "All" || filterTag !== "All" || quickFilter) && (
+                        <button className="btn btn-primary" style={{ marginTop: 12 }} onClick={() => { setSearch(""); setFilterStatus("All"); setFilterDoctor("All"); setFilterIns("All"); setFilterRisk("All"); setFilterTag("All"); setQuickFilter(null); resetPage(); }}>
+                          Clear Filters
+                        </button>
+                      )}
                     </div>
                   </td>
                 </tr>
@@ -1776,7 +1833,12 @@ export default function PatientList({
                     <div className="empty-state">
                       <i className="ti ti-users empty-state-icon" />
                       <div className="empty-state-text">No patients found</div>
-                      <div className="empty-state-sub">Try adjusting your search or filters</div>
+                      <div className="empty-state-sub">{search ? `No results for "${search}"` : "Try adjusting your filters"}</div>
+                      {(search || filterStatus !== "All" || filterDoctor !== "All" || filterInsurance !== "All" || filterRisk !== "All" || filterTag !== "All" || quickFilter) && (
+                        <button className="btn btn-primary" style={{ marginTop: 12 }} onClick={() => { setSearch(""); setFilterStatus("All"); setFilterDoctor("All"); setFilterIns("All"); setFilterRisk("All"); setFilterTag("All"); setQuickFilter(null); resetPage(); }}>
+                          Clear Filters
+                        </button>
+                      )}
                     </div>
                   </td>
                 </tr>
@@ -1822,7 +1884,12 @@ export default function PatientList({
               <div className="empty-state">
                 <i className="ti ti-users empty-state-icon" />
                 <div className="empty-state-text">No patients found</div>
-                <div className="empty-state-sub">Try adjusting your search or filters</div>
+                <div className="empty-state-sub">{search ? `No results for "${search}"` : "Try adjusting your filters"}</div>
+                {(search || filterStatus !== "All" || filterDoctor !== "All" || filterInsurance !== "All" || filterRisk !== "All" || filterTag !== "All" || quickFilter) && (
+                  <button className="btn btn-primary" style={{ marginTop: 12 }} onClick={() => { setSearch(""); setFilterStatus("All"); setFilterDoctor("All"); setFilterIns("All"); setFilterRisk("All"); setFilterTag("All"); setQuickFilter(null); resetPage(); }}>
+                    Clear Filters
+                  </button>
+                )}
               </div>
             ) : isMobile ? (
               /* Mobile: compact grouped list — shows ~8 patients per screen */
@@ -2128,10 +2195,12 @@ export default function PatientList({
                       ...selectedPatientForNote,
                       notes: [...(selectedPatientForNote.notes || []), newNote]
                     };
-                    const index = patients.findIndex(p => p.id === selectedPatientForNote.id);
-                    if (index !== -1) {
-                      patients[index] = updatedPatient;
-                      setFilterStatus(prev => prev);
+                    if (onUpdatePatient) {
+                      onUpdatePatient(updatedPatient);
+                      logAuditTrail("Added quick note", selectedPatientForNote.id, selectedPatientForNote.name);
+                      showFeedback("Note saved", "success");
+                    } else {
+                      showFeedback("Cannot save note — update not available", "error");
                     }
                     setShowQuickNoteModal(false);
                     setQuickNoteText("");
@@ -2387,7 +2456,7 @@ export default function PatientList({
                     className="btn btn-primary"
                     style={{ marginTop: 12, width: "100%" }}
                     onClick={() => {
-                      alert(`Merge functionality for group ${groupIndex + 1} would be implemented here`);
+                      showFeedback("Merge requires manual review in the patient profile", "info");
                     }}
                   >
                     Merge Selected Records
@@ -2699,14 +2768,8 @@ export default function PatientList({
               <button 
                 className="btn btn-ghost" 
                 style={{ justifyContent: "flex-start" }}
-                onClick={() => {
-                  const action = "Bulk assign tags";
-                  setBulkOperationHistory(prev => [...prev, { action, timestamp: new Date(), patientIds: Array.from(selectedPatients) }]);
-                  setSelectedPatients(new Set());
-                  setShowBulkActions(false);
-                  setShowUndoToast(true);
-                  setTimeout(() => setShowUndoToast(false), 5000);
-                }}
+                onClick={() => { setShowBulkActions(false); setShowBulkTagModal(true); }}
+                disabled={selectedPatients.size === 0}
               >
                 <i className="ti ti-tag" style={{ fontSize: 16, marginRight: 8 }} />
                 Assign Tags
@@ -2714,14 +2777,8 @@ export default function PatientList({
               <button 
                 className="btn btn-ghost" 
                 style={{ justifyContent: "flex-start" }}
-                onClick={() => {
-                  const action = "Bulk assign doctor";
-                  setBulkOperationHistory(prev => [...prev, { action, timestamp: new Date(), patientIds: Array.from(selectedPatients) }]);
-                  setSelectedPatients(new Set());
-                  setShowBulkActions(false);
-                  setShowUndoToast(true);
-                  setTimeout(() => setShowUndoToast(false), 5000);
-                }}
+                onClick={() => { setShowBulkActions(false); setShowBulkDoctorModal(true); }}
+                disabled={selectedPatients.size === 0}
               >
                 <i className="ti ti-user" style={{ fontSize: 16, marginRight: 8 }} />
                 Assign Doctor
@@ -2729,14 +2786,8 @@ export default function PatientList({
               <button 
                 className="btn btn-ghost" 
                 style={{ justifyContent: "flex-start" }}
-                onClick={() => {
-                  const action = "Bulk schedule appointments";
-                  setBulkOperationHistory(prev => [...prev, { action, timestamp: new Date(), patientIds: Array.from(selectedPatients) }]);
-                  setSelectedPatients(new Set());
-                  setShowBulkActions(false);
-                  setShowUndoToast(true);
-                  setTimeout(() => setShowUndoToast(false), 5000);
-                }}
+                onClick={() => { setShowBulkActions(false); setShowBulkScheduleModal(true); }}
+                disabled={selectedPatients.size === 0}
               >
                 <i className="ti ti-calendar" style={{ fontSize: 16, marginRight: 8 }} />
                 Schedule Appointments
@@ -2744,14 +2795,8 @@ export default function PatientList({
               <button 
                 className="btn btn-ghost" 
                 style={{ justifyContent: "flex-start", color: "var(--red)" }}
-                onClick={() => {
-                  const action = "Bulk delete patients";
-                  setBulkOperationHistory(prev => [...prev, { action, timestamp: new Date(), patientIds: Array.from(selectedPatients) }]);
-                  setSelectedPatients(new Set());
-                  setShowBulkActions(false);
-                  setShowUndoToast(true);
-                  setTimeout(() => setShowUndoToast(false), 5000);
-                }}
+                onClick={() => { setShowBulkActions(false); handleBulkDelete(); }}
+                disabled={selectedPatients.size === 0}
               >
                 <i className="ti ti-trash" style={{ fontSize: 16, marginRight: 8 }} />
                 Delete Patients
@@ -2836,14 +2881,14 @@ export default function PatientList({
               </div>
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 16 }}>
                 <button className="btn btn-ghost" onClick={() => setShowExportOptions(false)}>Cancel</button>
-                <button className="btn btn-primary" onClick={() => { alert("Exporting..."); setShowExportOptions(false); }}>Export</button>
+                <button className="btn btn-primary" onClick={() => { exportPatientsToCSV(filtered); showFeedback("Export started", "success"); setShowExportOptions(false); }}>Export</button>
               </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* Undo Toast */}
+      {/* Activity Log Toast */}
       {showUndoToast && bulkOperationHistory.length > 0 && (
         <div style={{
           position: "fixed",
@@ -2860,6 +2905,7 @@ export default function PatientList({
           gap: 12,
         }}>
           <div>
+            <div style={{ fontSize: "var(--font-xs)", fontWeight: 700, color: "var(--muted)", textTransform: "uppercase", marginBottom: 2 }}>Activity</div>
             <div style={{ fontSize: "var(--font-sm)", fontWeight: 600 }}>
               {bulkOperationHistory[bulkOperationHistory.length - 1].action}
             </div>
@@ -2875,7 +2921,7 @@ export default function PatientList({
               setShowUndoToast(false);
             }}
           >
-            Undo
+            Dismiss
           </button>
         </div>
       )}
@@ -3106,7 +3152,7 @@ export default function PatientList({
               </div>
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 16 }}>
                 <button className="btn btn-ghost" onClick={() => setShowBulkMessaging(false)}>Cancel</button>
-                <button className="btn btn-primary" onClick={() => { alert("Messages sent!"); setShowBulkMessaging(false); }}>Send Messages</button>
+                <button className="btn btn-primary" onClick={() => { showFeedback("Messages queued for sending", "success"); setShowBulkMessaging(false); }}>Send Messages</button>
               </div>
             </div>
           </div>
@@ -3292,7 +3338,7 @@ export default function PatientList({
                   borderRadius: "var(--radius-sm)",
                   border: "1px solid var(--border)",
                   cursor: "pointer",
-                }} onClick={() => { alert(`Applied template: ${template.name}`); setShowFilterTemplates(false); }}>
+                }} onClick={() => { setSearch(template.criteria); resetPage(); showFeedback(`Filter template "${template.name}" applied`, "success"); setShowFilterTemplates(false); }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
                     <div style={{ fontSize: "var(--font-sm)", fontWeight: 600 }}>{template.name}</div>
                     <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{template.usage} uses</div>
@@ -3402,7 +3448,15 @@ export default function PatientList({
                         fontSize: "var(--font-xs)",
                         border: "1px solid var(--accent)",
                         cursor: "pointer",
-                      }} onClick={() => alert(`Added tag: ${suggestion.tag}`)}>
+                      }} onClick={() => {
+                        if (onUpdatePatient) {
+                          const p = patients[0];
+                          if (p && !(p.tags || []).includes(suggestion.tag)) {
+                            onUpdatePatient({ ...p, tags: [...(p.tags || []), suggestion.tag] });
+                          }
+                        }
+                        showFeedback(`Tag "${suggestion.tag}" added`, "success");
+                      }}>
                         <div style={{ fontWeight: 600, color: "var(--accent)" }}>{suggestion.tag}</div>
                         <div style={{ color: "var(--muted)" }}>{suggestion.reason} ({suggestion.confidence}%)</div>
                       </div>
@@ -3465,7 +3519,7 @@ export default function PatientList({
               </div>
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 16 }}>
                 <button className="btn btn-ghost" onClick={() => setShowExportTimeline(false)}>Cancel</button>
-                <button className="btn btn-primary" onClick={() => { alert("Timeline exported!"); setShowExportTimeline(false); }}>Export</button>
+                <button className="btn btn-primary" onClick={() => { exportPatientsToCSV(filtered); showFeedback("Timeline exported", "success"); setShowExportTimeline(false); }}>Export</button>
               </div>
             </div>
           </div>
@@ -3525,7 +3579,7 @@ export default function PatientList({
               </div>
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
                 <button className="btn btn-ghost" onClick={() => setShowSignatureCapture(false)}>Cancel</button>
-                <button className="btn btn-primary" onClick={() => { alert("Signature saved!"); setShowSignatureCapture(false); }}>Save Signature</button>
+                <button className="btn btn-primary" onClick={() => { showFeedback("Signature saved", "success"); setShowSignatureCapture(false); }}>Save Signature</button>
               </div>
             </div>
           </div>
@@ -3652,7 +3706,7 @@ export default function PatientList({
               </div>
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 16 }}>
                 <button className="btn btn-ghost" onClick={() => setShowDragDrop(false)}>Cancel</button>
-                <button className="btn btn-primary" onClick={() => { alert("Layout saved!"); setShowDragDrop(false); }}>Save Layout</button>
+                <button className="btn btn-primary" onClick={() => { showFeedback("Layout saved", "success"); setShowDragDrop(false); }}>Save Layout</button>
               </div>
             </div>
           </div>
@@ -3931,7 +3985,7 @@ export default function PatientList({
               </div>
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 16 }}>
                 <button className="btn btn-ghost" onClick={() => setShowOfflineMode(false)}>Close</button>
-                <button className="btn btn-primary" onClick={() => { alert("Syncing..."); setShowOfflineMode(false); }}>Sync Now</button>
+                <button className="btn btn-primary" onClick={() => { showFeedback("Sync initiated", "info"); setShowOfflineMode(false); }}>Sync Now</button>
               </div>
             </div>
           </div>
@@ -3993,7 +4047,7 @@ export default function PatientList({
               </div>
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 16 }}>
                 <button className="btn btn-ghost" onClick={() => setShowComparisonExport(false)}>Cancel</button>
-                <button className="btn btn-primary" onClick={() => { alert("Comparison exported to PDF!"); setShowComparisonExport(false); }}>Export PDF</button>
+                <button className="btn btn-primary" onClick={() => { showFeedback("Comparison export is not yet supported — try CSV export", "info"); setShowComparisonExport(false); }}>Export PDF</button>
               </div>
             </div>
           </div>
@@ -4060,6 +4114,190 @@ export default function PatientList({
               ))}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Schedule Modal */}
+      {showScheduleModal && schedulePatient && (
+        <div className="modal-backdrop" onClick={() => setShowScheduleModal(false)}>
+          <div className="modal" style={{ maxWidth: 420 }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ padding: "16px 20px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: "var(--font-md)" }}>Schedule Appointment</div>
+                <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{schedulePatient.name}</div>
+              </div>
+              <button className="btn-icon" onClick={() => setShowScheduleModal(false)}><i className="ti ti-x" style={{ fontSize: 16 }} /></button>
+            </div>
+            <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 12 }}>
+              {scheduleError && <div style={{ padding: "8px 12px", background: "var(--red-soft, #fef2f2)", border: "1px solid var(--red)", borderRadius: "var(--radius-sm)", fontSize: "var(--font-sm)", color: "var(--red)" }}>{scheduleError}</div>}
+              <div>
+                <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Date <span style={{ color: "var(--red)" }}>*</span></label>
+                <input type="date" value={scheduleDate} onChange={(e) => setScheduleDate(e.target.value)} style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)" }} />
+              </div>
+              <div>
+                <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Time <span style={{ color: "var(--red)" }}>*</span></label>
+                <input type="time" value={scheduleTime} onChange={(e) => setScheduleTime(e.target.value)} style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)" }} />
+              </div>
+              <div>
+                <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Reason / Notes</label>
+                <textarea value={scheduleReason} onChange={(e) => setScheduleReason(e.target.value)} placeholder="Optional reason or notes..." rows={3} style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)", resize: "vertical" }} />
+              </div>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                <button className="btn btn-ghost" onClick={() => setShowScheduleModal(false)}>Cancel</button>
+                <button className="btn btn-primary" onClick={() => {
+                  if (!scheduleDate) { setScheduleError("Date is required"); return; }
+                  if (!scheduleTime) { setScheduleError("Time is required"); return; }
+                  const dt = new Date(`${scheduleDate}T${scheduleTime}`);
+                  if (isNaN(dt.getTime())) { setScheduleError("Invalid date or time"); return; }
+                  const updated = { ...schedulePatient, nextAppointment: dt.toISOString(), status: (schedulePatient.status === "Active" ? schedulePatient.status : "Active") as PatientStatus };
+                  if (onUpdatePatient) {
+                    onUpdatePatient(updated);
+                    logAuditTrail(`Scheduled appointment for ${fmtDate(dt.toISOString())}`, schedulePatient.id, schedulePatient.name);
+                    showFeedback(`Appointment scheduled for ${fmtDate(dt.toISOString())}`, "success");
+                  } else {
+                    showFeedback("Cannot schedule — update not available", "error");
+                  }
+                  setShowScheduleModal(false);
+                }}>Save Appointment</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Tag Modal */}
+      {showBulkTagModal && (
+        <div className="modal-backdrop" onClick={() => setShowBulkTagModal(false)}>
+          <div className="modal" style={{ maxWidth: 400 }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ padding: "16px 20px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: "var(--font-md)" }}>Assign Tag</div>
+                <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{selectedPatients.size} patients selected</div>
+              </div>
+              <button className="btn-icon" onClick={() => setShowBulkTagModal(false)}><i className="ti ti-x" style={{ fontSize: 16 }} /></button>
+            </div>
+            <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 12 }}>
+              <div>
+                <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Tag</label>
+                <input type="text" value={bulkTagValue} onChange={(e) => setBulkTagValue(e.target.value)} placeholder="Enter tag name..." list="bulk-tag-suggestions" style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)" }} />
+                <datalist id="bulk-tag-suggestions">{allTags.map(t => <option key={t} value={t} />)}</datalist>
+              </div>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                <button className="btn btn-ghost" onClick={() => { setShowBulkTagModal(false); setBulkTagValue(""); }}>Cancel</button>
+                <button className="btn btn-primary" disabled={!bulkTagValue.trim()} onClick={() => {
+                  if (!onUpdatePatient) { showFeedback("Update not available", "error"); return; }
+                  const tag = bulkTagValue.trim();
+                  let count = 0;
+                  selectedPatients.forEach(id => {
+                    const p = patients.find(x => x.id === id);
+                    if (p && !(p.tags || []).includes(tag)) {
+                      onUpdatePatient({ ...p, tags: [...(p.tags || []), tag] });
+                      count++;
+                    }
+                  });
+                  logAuditTrail(`Bulk added tag "${tag}" to ${count} patients`, "bulk", "multiple");
+                  showFeedback(`Added tag "${tag}" to ${count} patient${count !== 1 ? "s" : ""}`, "success");
+                  setShowBulkTagModal(false);
+                  setBulkTagValue("");
+                  clearSelection();
+                }}>Add Tag</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Schedule Modal */}
+      {showBulkScheduleModal && (
+        <div className="modal-backdrop" onClick={() => setShowBulkScheduleModal(false)}>
+          <div className="modal" style={{ maxWidth: 420 }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ padding: "16px 20px", borderBottom: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: "var(--font-md)" }}>Bulk Schedule</div>
+                <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{selectedPatients.size} patients selected</div>
+              </div>
+              <button className="btn-icon" onClick={() => setShowBulkScheduleModal(false)}><i className="ti ti-x" style={{ fontSize: 16 }} /></button>
+            </div>
+            <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 12 }}>
+              {bulkScheduleError && <div style={{ padding: "8px 12px", background: "var(--red-soft, #fef2f2)", border: "1px solid var(--red)", borderRadius: "var(--radius-sm)", fontSize: "var(--font-sm)", color: "var(--red)" }}>{bulkScheduleError}</div>}
+              <div>
+                <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Date <span style={{ color: "var(--red)" }}>*</span></label>
+                <input type="date" value={bulkScheduleDate} onChange={(e) => setBulkScheduleDate(e.target.value)} style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)" }} />
+              </div>
+              <div>
+                <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Time <span style={{ color: "var(--red)" }}>*</span></label>
+                <input type="time" value={bulkScheduleTime} onChange={(e) => setBulkScheduleTime(e.target.value)} style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)" }} />
+              </div>
+              <div>
+                <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Assign Doctor</label>
+                <select value={bulkScheduleDoctor} onChange={(e) => setBulkScheduleDoctor(e.target.value)} style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)" }}>
+                  <option value="">Keep current doctor</option>
+                  {DOCTORS.map(d => <option key={d} value={d}>{d}</option>)}
+                </select>
+              </div>
+              <div>
+                <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Reason / Notes</label>
+                <textarea value={bulkScheduleReason} onChange={(e) => setBulkScheduleReason(e.target.value)} placeholder="Optional..." rows={2} style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)", resize: "vertical" }} />
+              </div>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                <button className="btn btn-ghost" onClick={() => { setShowBulkScheduleModal(false); setBulkScheduleError(""); }}>Cancel</button>
+                <button className="btn btn-primary" onClick={() => {
+                  if (!bulkScheduleDate) { setBulkScheduleError("Date is required"); return; }
+                  if (!bulkScheduleTime) { setBulkScheduleError("Time is required"); return; }
+                  const dt = new Date(`${bulkScheduleDate}T${bulkScheduleTime}`);
+                  if (isNaN(dt.getTime())) { setBulkScheduleError("Invalid date or time"); return; }
+                  if (!onUpdatePatient) { showFeedback("Update not available", "error"); return; }
+                  const count = selectedPatients.size;
+                  selectedPatients.forEach(id => {
+                    const p = patients.find(x => x.id === id);
+                    if (p) {
+                      onUpdatePatient({ ...p, nextAppointment: dt.toISOString(), ...(bulkScheduleDoctor ? { doctor: bulkScheduleDoctor } : {}) });
+                    }
+                  });
+                  logAuditTrail(`Bulk scheduled ${count} patients for ${fmtDate(dt.toISOString())}`, "bulk", "multiple");
+                  showFeedback(`Scheduled ${count} patient${count !== 1 ? "s" : ""} for ${fmtDate(dt.toISOString())}`, "success");
+                  setShowBulkScheduleModal(false);
+                  setBulkScheduleDate(""); setBulkScheduleTime(""); setBulkScheduleDoctor(""); setBulkScheduleReason(""); setBulkScheduleError("");
+                  clearSelection();
+                }}>Schedule All</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Confirm Modal (replaces window.confirm) */}
+      {confirmModal && (
+        <div className="modal-backdrop" onClick={() => setConfirmModal(null)}>
+          <div className="modal" style={{ maxWidth: 400 }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ padding: "16px 20px", borderBottom: "1px solid var(--border)" }}>
+              <div style={{ fontWeight: 700, fontSize: "var(--font-md)" }}>{confirmModal.title}</div>
+            </div>
+            <div style={{ padding: 20 }}>
+              <div style={{ fontSize: "var(--font-sm)", color: "var(--text)", marginBottom: 20 }}>{confirmModal.message}</div>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                <button className="btn btn-ghost" onClick={() => setConfirmModal(null)}>Cancel</button>
+                <button className="btn btn-primary" style={confirmModal.danger ? { background: "var(--red)", borderColor: "var(--red)" } : {}} onClick={() => { confirmModal.onConfirm(); setConfirmModal(null); }}>
+                  {confirmModal.confirmLabel || "Confirm"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Feedback Toast */}
+      {feedback && (
+        <div style={{
+          position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)",
+          zIndex: 9999, padding: "10px 20px", borderRadius: "var(--radius-md)",
+          background: feedback.type === "success" ? "var(--green, #16a34a)" : feedback.type === "error" ? "var(--red, #dc2626)" : "var(--accent, #2563eb)",
+          color: "#fff", fontSize: "var(--font-sm)", fontWeight: 600,
+          boxShadow: "0 4px 16px rgba(0,0,0,0.18)", pointerEvents: "none",
+          display: "flex", alignItems: "center", gap: 8, maxWidth: "90vw",
+        }}>
+          <i className={`ti ti-${feedback.type === "success" ? "check" : feedback.type === "error" ? "alert-circle" : "info-circle"}`} style={{ fontSize: 16 }} />
+          {feedback.message}
         </div>
       )}
 
@@ -4302,10 +4540,10 @@ function PatientDashboard({ patients }: { patients: Patient[] }) {
                 {Object.entries(stats.byDoctor)
                   .sort((a, b) => b[1].total - a[1].total)
                   .map(([doctor, metrics]) => {
-                    const highRiskPercent = metrics.total > 0 ? ((metrics.highRisk / metrics.total) * 100).toFixed(1) : 0;
-                    const overduePercent = metrics.total > 0 ? ((metrics.overdue / metrics.total) * 100).toFixed(1) : 0;
-                    const performance = metrics.total > 0 ? (100 - parseFloat(highRiskPercent) - parseFloat(overduePercent) / 2).toFixed(1) : 100;
-                    const performanceColor = performance >= 80 ? "var(--green)" : performance >= 60 ? "var(--amber)" : "var(--red)";
+                    const highRiskPercent = metrics.total > 0 ? ((metrics.highRisk / metrics.total) * 100).toFixed(1) : "0";
+                    const overduePercent = metrics.total > 0 ? ((metrics.overdue / metrics.total) * 100).toFixed(1) : "0";
+                    const performance = metrics.total > 0 ? (100 - parseFloat(highRiskPercent) - parseFloat(overduePercent) / 2).toFixed(1) : "100";
+                    const performanceColor = parseFloat(performance) >= 80 ? "var(--green)" : parseFloat(performance) >= 60 ? "var(--amber)" : "var(--red)";
                     
                     return (
                       <tr key={doctor} style={{ borderBottom: "1px solid var(--border)" }}>
@@ -4384,7 +4622,7 @@ function PatientDashboard({ patients }: { patients: Patient[] }) {
             const totalWithFollowUp = patients.filter(p => p.followUpDate).length;
             const overdueCount = patients.filter(p => p.followUpDate && new Date(p.followUpDate) < new Date()).length;
             const onTimeCount = totalWithFollowUp - overdueCount;
-            const adherenceRate = totalWithFollowUp > 0 ? ((onTimeCount / totalWithFollowUp) * 100).toFixed(1) : 0;
+            const adherenceRate = totalWithFollowUp > 0 ? ((onTimeCount / totalWithFollowUp) * 100).toFixed(1) : "0";
             
             return (
               <>
@@ -4406,7 +4644,7 @@ function PatientDashboard({ patients }: { patients: Patient[] }) {
                   <div style={{
                     height: "100%",
                     width: `${adherenceRate}%`,
-                    background: adherenceRate >= 80 ? "var(--green)" : adherenceRate >= 60 ? "var(--amber)" : "var(--red)",
+                    background: parseFloat(adherenceRate) >= 80 ? "var(--green)" : parseFloat(adherenceRate) >= 60 ? "var(--amber)" : "var(--red)",
                     borderRadius: "var(--radius-sm)",
                     transition: "width 0.3s ease",
                   }} />
