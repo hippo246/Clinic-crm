@@ -78,24 +78,97 @@ const emptyConsult = (patientId: string, doctor: string): ConsultRecord => ({
 });
 
 // ─── localStorage helpers ──────────────────────────────────────────────────────
-const LS_KEY = "clinic_consultations";
+const CONSULTS_KEY = "clinic_consultations";
+const DRAFTS_KEY = "clinic_consultation_drafts";
+const ACTIVITY_KEY = "clinic_consultation_activity";
+const TEMPLATES_KEY = "clinic_consultation_templates";
+
+function readJSON<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJSON(key: string, value: unknown): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* storage full or disabled */
+  }
+}
 
 function loadConsults(): ConsultRecord[] {
-  try { return JSON.parse(localStorage.getItem(LS_KEY) || "[]"); } catch { return []; }
+  return readJSON<ConsultRecord[]>(CONSULTS_KEY, []);
 }
 
 function saveConsults(records: ConsultRecord[]) {
-  localStorage.setItem(LS_KEY, JSON.stringify(records));
+  writeJSON(CONSULTS_KEY, records);
+}
+
+interface DraftRecord {
+  id: string;
+  patientId: string;
+  patientName: string;
+  consult: ConsultRecord;
+  savedAt: string;
+}
+
+function loadDrafts(): DraftRecord[] {
+  return readJSON<DraftRecord[]>(DRAFTS_KEY, []);
+}
+
+function saveDrafts(drafts: DraftRecord[]) {
+  writeJSON(DRAFTS_KEY, drafts);
+}
+
+interface ActivityEntry {
+  timestamp: string;
+  action: string;
+  patientId?: string;
+  patientName?: string;
+  details?: string;
+}
+
+function loadActivity(): ActivityEntry[] {
+  return readJSON<ActivityEntry[]>(ACTIVITY_KEY, []);
+}
+
+function saveActivity(activity: ActivityEntry[]) {
+  writeJSON(ACTIVITY_KEY, activity);
+}
+
+interface Template {
+  id: string;
+  name: string;
+  category: string;
+  complaint?: string;
+  symptoms?: string;
+  diagnosis?: string;
+  treatment?: string;
+  followup?: string;
+}
+
+function loadTemplates(): Template[] {
+  return readJSON<Template[]>(TEMPLATES_KEY, []);
+}
+
+function saveTemplates(templates: Template[]) {
+  writeJSON(TEMPLATES_KEY, templates);
 }
 
 // ─── Props ────────────────────────────────────────────────────────────────────
 interface ConsultationsPageProps {
   patients: Patient[];
   onUpdatePatient: (p: Patient, action?: string) => void;
+  userRole?: "receptionist" | "doctor" | "admin";
 }
 
 // ─── Main Component ───────────────────────────────────────────────────────────
-export default function ConsultationsPage({ patients, onUpdatePatient }: ConsultationsPageProps) {
+export default function ConsultationsPage({ patients, onUpdatePatient, userRole = "admin" }: ConsultationsPageProps) {
   const [allConsults, setAllConsults] = useState<ConsultRecord[]>(loadConsults);
   const [selectedPatient, setSelectedPatient] = useState<Patient | null>(null);
   const [activeConsult, setActiveConsult] = useState<ConsultRecord | null>(null);
@@ -109,6 +182,110 @@ export default function ConsultationsPage({ patients, onUpdatePatient }: Consult
   // so "Discard" can restore it instead of leaving a half-edited record persisted.
   const originalRef = useRef<ConsultRecord | null>(null);
 
+  // Feedback state
+  const [feedback, setFeedback] = useState<{ type: "success" | "error" | "info" | "warning"; message: string } | null>(null);
+
+  // Drafts state
+  const [drafts, setDrafts] = useState<DraftRecord[]>(loadDrafts);
+  const [showDrafts, setShowDrafts] = useState(false);
+
+  // Activity state
+  const [activity, setActivity] = useState<ActivityEntry[]>(loadActivity);
+  const [showActivity, setShowActivity] = useState(false);
+
+  // Templates state
+  const [templates, setTemplates] = useState<Template[]>(() => {
+    const loaded = loadTemplates();
+    // Initialize default templates if none exist
+    if (loaded.length === 0) {
+      const defaults: Template[] = [
+        {
+          id: "tpl-default-general",
+          name: "General Consultation",
+          category: "General",
+          complaint: "Patient presents for routine consultation",
+          symptoms: "No acute symptoms reported",
+          diagnosis: "To be determined",
+          treatment: "Physical examination performed. Vital signs within normal limits.",
+          followup: "Follow up as needed",
+        },
+        {
+          id: "tpl-default-followup",
+          name: "Follow-up Visit",
+          category: "Follow-up",
+          complaint: "Follow-up for previous condition",
+          symptoms: "Patient reports improvement in symptoms",
+          diagnosis: "Condition stable",
+          treatment: "Continue current treatment plan. Monitor for any changes.",
+          followup: "Follow up in 2 weeks",
+        },
+        {
+          id: "tpl-default-fever",
+          name: "Fever/Cold Visit",
+          category: "Fever/Cold",
+          complaint: "Patient presents with fever and cold symptoms",
+          symptoms: "Fever, runny nose, sore throat, cough, body aches",
+          diagnosis: "Upper respiratory infection / Viral fever",
+          treatment: "Rest, fluids, antipyretics for fever. Monitor temperature.",
+          followup: "Follow up in 3-5 days if symptoms worsen",
+        },
+        {
+          id: "tpl-default-diabetes",
+          name: "Diabetes Review",
+          category: "Diabetes",
+          complaint: "Routine diabetes follow-up",
+          symptoms: "No symptoms of hypo/hyperglycemia reported",
+          diagnosis: "Type 2 Diabetes Mellitus - stable",
+          treatment: "Continue current medications. Monitor blood glucose levels regularly.",
+          followup: "Follow up in 1 month with HbA1c",
+        },
+        {
+          id: "tpl-default-hypertension",
+          name: "Hypertension Review",
+          category: "Hypertension",
+          complaint: "Routine blood pressure follow-up",
+          symptoms: "No symptoms of hypertension reported",
+          diagnosis: "Essential Hypertension - controlled",
+          treatment: "Continue current antihypertensive medications. Monitor BP at home.",
+          followup: "Follow up in 1 month",
+        },
+      ];
+      saveTemplates(defaults);
+      return defaults;
+    }
+    return loaded;
+  });
+  const [showTemplates, setShowTemplates] = useState(false);
+  const [templateModal, setTemplateModal] = useState<{ mode: "create" | "edit"; template?: Template } | null>(null);
+
+  // Confirmation modal state
+  const [confirmModal, setConfirmModal] = useState<{ message: string; onConfirm: () => void } | null>(null);
+
+  // History filters
+  const [filterStatus, setFilterStatus] = useState<ConsultStatus | "">("");
+  const [filterDoctor, setFilterDoctor] = useState("");
+  const [filterDateFrom, setFilterDateFrom] = useState("");
+  const [filterDateTo, setFilterDateTo] = useState("");
+  const [historySearch, setHistorySearch] = useState("");
+
+  const showFeedback = (message: string, type: "success" | "error" | "info" | "warning" = "info") => {
+    setFeedback({ type, message });
+    setTimeout(() => setFeedback(null), 4000);
+  };
+
+  const logActivity = (action: string, patientId?: string, patientName?: string, details?: string) => {
+    const entry: ActivityEntry = {
+      timestamp: new Date().toISOString(),
+      action,
+      patientId,
+      patientName,
+      details,
+    };
+    const updated = [entry, ...activity].slice(0, 50);
+    setActivity(updated);
+    saveActivity(updated);
+  };
+
   useEffect(() => {
     const handler = (e: MouseEvent) => {
       if (dropRef.current && !dropRef.current.contains(e.target as Node)) setDropdownOpen(false);
@@ -116,6 +293,44 @@ export default function ConsultationsPage({ patients, onUpdatePatient }: Consult
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
   }, []);
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Don't hijack typing inside inputs/textareas/selects
+      const tag = (document.activeElement?.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select") {
+        // Still allow Escape to close modals
+        if (e.key === "Escape") {
+          if (confirmModal) setConfirmModal(null);
+          if (templateModal) setTemplateModal(null);
+          if (showDrafts) setShowDrafts(false);
+          if (showActivity) setShowActivity(false);
+          if (showTemplates) setShowTemplates(false);
+          if (viewingHistory) setViewingHistory(null);
+        }
+        return;
+      }
+      // Escape closes modals
+      if (e.key === "Escape") {
+        if (confirmModal) setConfirmModal(null);
+        if (templateModal) setTemplateModal(null);
+        if (showDrafts) setShowDrafts(false);
+        if (showActivity) setShowActivity(false);
+        if (showTemplates) setShowTemplates(false);
+        if (viewingHistory) setViewingHistory(null);
+      }
+      // Ctrl/Cmd + S saves draft
+      if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+        e.preventDefault();
+        if (activeConsult && selectedPatient) {
+          handleSaveDraft();
+        }
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [confirmModal, templateModal, showDrafts, showActivity, showTemplates, viewingHistory, activeConsult, selectedPatient]);
 
   const persist = (updated: ConsultRecord[]) => {
     setAllConsults(updated);
@@ -152,11 +367,48 @@ export default function ConsultationsPage({ patients, onUpdatePatient }: Consult
   };
 
   const handleSave = () => {
-    if (!activeConsult || !selectedPatient) return;
+    if (!activeConsult || !selectedPatient) {
+      showFeedback("Please select a patient first.", "error");
+      return;
+    }
+
+    // Validation for completing consultation
+    if (!activeConsult.complaint && !activeConsult.diagnosis) {
+      showFeedback("Chief complaint or diagnosis is required to complete consultation.", "error");
+      return;
+    }
+    if (!activeConsult.treatment && !activeConsult.followup) {
+      showFeedback("Treatment plan or follow-up notes are required to complete consultation.", "error");
+      return;
+    }
+
+    // Vitals validation (light)
+    if (activeConsult.hr && isNaN(Number(activeConsult.hr))) {
+      showFeedback("Heart rate must be a number.", "warning");
+      return;
+    }
+    if (activeConsult.temp && isNaN(Number(activeConsult.temp))) {
+      showFeedback("Temperature must be a number.", "warning");
+      return;
+    }
+    if (activeConsult.weight && isNaN(Number(activeConsult.weight))) {
+      showFeedback("Weight must be a number.", "warning");
+      return;
+    }
+    if (activeConsult.bp && !/^\d{2,3}\/\d{2,3}$/.test(activeConsult.bp)) {
+      showFeedback("Blood pressure format should be like 120/80.", "warning");
+      return;
+    }
+
     const saved: ConsultRecord = { ...activeConsult, status: "completed" };
     const others = allConsults.filter(c => c.id !== saved.id);
     persist([...others, saved]);
     setActiveConsult(saved);
+
+    // Remove draft if exists
+    const updatedDrafts = drafts.filter(d => d.patientId !== selectedPatient.id);
+    setDrafts(updatedDrafts);
+    saveDrafts(updatedDrafts);
 
     // ── Write back to Patient record ──────────────────────────────────────────
     const now = new Date().toISOString();
@@ -205,17 +457,437 @@ export default function ConsultationsPage({ patients, onUpdatePatient }: Consult
       rx => !existingRx.find(e => e.id === rx.id)
     );
 
-    onUpdatePatient({
+    // Update patient status
+    const updatedPatient: Patient = {
       ...selectedPatient,
       lastVisit: now,
+      status: "Active",
       timeline,
       notes,
       prescriptions: [...existingRx, ...newRxItems],
-    }, "consultation saved");
+      updatedAt: now,
+    };
+
+    // Set follow-up if provided
+    if (saved.followup) {
+      const followUpDate = new Date();
+      followUpDate.setDate(followUpDate.getDate() + 7); // Default 7 days
+      updatedPatient.followUpDate = followUpDate.toISOString().split("T")[0];
+      updatedPatient.status = "Follow-Up Due";
+    }
+
+    onUpdatePatient(updatedPatient, "consultation saved");
+
+    logActivity("consultation completed", selectedPatient.id, selectedPatient.name, `Diagnosis: ${saved.diagnosis || saved.complaint}`);
 
     originalRef.current = null;
     setSaveFlash(true);
+    showFeedback("Consultation completed and saved to patient record.", "success");
     setTimeout(() => setSaveFlash(false), 2000);
+  };
+
+  const handleSaveDraft = () => {
+    if (!activeConsult || !selectedPatient) {
+      showFeedback("Please select a patient first.", "error");
+      return;
+    }
+
+    // Validation for draft - at least one clinical field
+    const hasContent = Object.entries(activeConsult)
+      .filter(([k]) => ["bp","hr","temp","weight","complaint","symptoms","diagnosis","treatment","followup"].includes(k))
+      .some(([,v]) => typeof v === "string" && v.trim())
+      || activeConsult.prescriptions.length > 0;
+
+    if (!hasContent) {
+      showFeedback("Add at least one clinical field before saving draft.", "warning");
+      return;
+    }
+
+    const draft: DraftRecord = {
+      id: `draft-${activeConsult.id}`,
+      patientId: selectedPatient.id,
+      patientName: selectedPatient.name,
+      consult: activeConsult,
+      savedAt: new Date().toISOString(),
+    };
+
+    // Remove existing draft for this patient
+    const updatedDrafts = drafts.filter(d => d.patientId !== selectedPatient.id);
+    setDrafts([draft, ...updatedDrafts]);
+    saveDrafts([draft, ...updatedDrafts]);
+
+    logActivity("draft saved", selectedPatient.id, selectedPatient.name);
+    showFeedback("Draft saved successfully.", "success");
+  };
+
+  const handleLoadDraft = (draft: DraftRecord) => {
+    if (draft.patientId !== selectedPatient?.id) {
+      showFeedback("This draft belongs to a different patient.", "error");
+      return;
+    }
+    setActiveConsult(draft.consult);
+    setViewingHistory(null);
+    logActivity("draft loaded", selectedPatient.id, selectedPatient.name);
+    showFeedback("Draft loaded.", "info");
+  };
+
+  const handleDeleteDraft = (draftId: string) => {
+    setConfirmModal({
+      message: "Are you sure you want to delete this draft?",
+      onConfirm: () => {
+        const updatedDrafts = drafts.filter(d => d.id !== draftId);
+        setDrafts(updatedDrafts);
+        saveDrafts(updatedDrafts);
+        logActivity("draft deleted");
+        showFeedback("Draft deleted.", "info");
+        setConfirmModal(null);
+      },
+    });
+  };
+
+  const handleApplyTemplate = (template: Template) => {
+    if (!activeConsult) {
+      showFeedback("Start a consultation first to apply a template.", "warning");
+      return;
+    }
+    const updated = {
+      ...activeConsult,
+      complaint: template.complaint || activeConsult.complaint,
+      symptoms: template.symptoms || activeConsult.symptoms,
+      diagnosis: template.diagnosis || activeConsult.diagnosis,
+      treatment: template.treatment || activeConsult.treatment,
+      followup: template.followup || activeConsult.followup,
+      status: "in-progress" as ConsultStatus,
+    };
+    setActiveConsult(updated);
+    const others = allConsults.filter(c => c.id !== updated.id);
+    persist([...others, updated]);
+    logActivity("template applied", selectedPatient?.id, selectedPatient?.name, `Template: ${template.name}`);
+    showFeedback(`Template "${template.name}" applied.`, "success");
+  };
+
+  const handleSaveTemplate = (template: Omit<Template, "id">) => {
+    const newTemplate: Template = {
+      ...template,
+      id: `tpl-${Date.now()}`,
+    };
+    const updated = [...templates, newTemplate];
+    setTemplates(updated);
+    saveTemplates(updated);
+    logActivity("template saved", undefined, undefined, `Template: ${template.name}`);
+    showFeedback(`Template "${template.name}" saved.`, "success");
+    setTemplateModal(null);
+  };
+
+  const handleEditTemplate = (template: Template) => {
+    const updated = templates.map(t => t.id === template.id ? template : t);
+    setTemplates(updated);
+    saveTemplates(updated);
+    logActivity("template updated", undefined, undefined, `Template: ${template.name}`);
+    showFeedback(`Template "${template.name}" updated.`, "success");
+    setTemplateModal(null);
+  };
+
+  const handleDeleteTemplate = (templateId: string) => {
+    setConfirmModal({
+      message: "Are you sure you want to delete this template?",
+      onConfirm: () => {
+        const updated = templates.filter(t => t.id !== templateId);
+        setTemplates(updated);
+        saveTemplates(updated);
+        logActivity("template deleted", undefined, undefined, `Template ID: ${templateId}`);
+        showFeedback("Template deleted.", "info");
+        setConfirmModal(null);
+      },
+    });
+  };
+
+  const handleExportConsultationTXT = () => {
+    if (!viewingHistory && !activeConsult) {
+      showFeedback("No consultation to export.", "warning");
+      return;
+    }
+    const consult = viewingHistory || activeConsult;
+    if (!consult) return;
+
+    const patient = patients.find(p => p.id === consult.patientId);
+    if (!patient) {
+      showFeedback("Patient not found.", "error");
+      return;
+    }
+
+    const txt = `
+CONSULTATION RECORD
+===================
+Date: ${new Date(consult.date).toLocaleString()}
+Patient: ${patient.name} (${patient.id})
+Doctor: ${consult.doctor}
+
+VITALS
+------
+Blood Pressure: ${consult.bp || "Not recorded"}
+Heart Rate: ${consult.hr || "Not recorded"}
+Temperature: ${consult.temp || "Not recorded"}
+Weight: ${consult.weight || "Not recorded"}
+
+CLINICAL NOTES
+--------------
+Chief Complaint: ${consult.complaint || "Not recorded"}
+Symptoms: ${consult.symptoms || "Not recorded"}
+Diagnosis: ${consult.diagnosis || "Not recorded"}
+Treatment Plan: ${consult.treatment || "Not recorded"}
+Follow-up: ${consult.followup || "Not recorded"}
+
+PRESCRIPTIONS
+${consult.prescriptions.length === 0 ? "None" : consult.prescriptions.map(rx => 
+  `- ${rx.medicationName} ${rx.dosage}, ${rx.frequency}, ${rx.duration}${rx.route ? ` (${rx.route})` : ""}${rx.instructions ? ` - ${rx.instructions}` : ""}`
+).join("\n")}
+
+Generated by Clinic CRM
+    `.trim();
+
+    const blob = new Blob([txt], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `consultation-${patient.id}-${new Date(consult.date).toISOString().split("T")[0]}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    logActivity("consultation exported as TXT", consult.patientId, patient.name);
+    showFeedback("Consultation exported as TXT.", "success");
+  };
+
+  const handleExportHistoryCSV = () => {
+    const filteredHistory = allConsults.filter(c => {
+      if (filterStatus && c.status !== filterStatus) return false;
+      if (filterDoctor && c.doctor !== filterDoctor) return false;
+      if (filterDateFrom && new Date(c.date) < new Date(filterDateFrom)) return false;
+      if (filterDateTo && new Date(c.date) > new Date(filterDateTo + "T23:59:59")) return false;
+      if (historySearch) {
+        const patient = patients.find(p => p.id === c.patientId);
+        const searchLower = historySearch.toLowerCase();
+        if (!patient) return false;
+        if (!patient.name.toLowerCase().includes(searchLower) &&
+            !c.diagnosis?.toLowerCase().includes(searchLower) &&
+            !c.complaint?.toLowerCase().includes(searchLower) &&
+            !c.treatment?.toLowerCase().includes(searchLower)) {
+          return false;
+        }
+      }
+      return true;
+    });
+
+    if (filteredHistory.length === 0) {
+      showFeedback("No consultations to export with current filters.", "info");
+      return;
+    }
+
+    const header = "Consultation ID,Patient ID,Patient Name,Doctor,Date,BP,HR,Temp,Weight,Chief Complaint,Symptoms,Diagnosis,Treatment,Follow-up,Status\n";
+    const rows = filteredHistory.map(c => {
+      const patient = patients.find(p => p.id === c.patientId);
+      return [
+        `"${c.id}"`,
+        `"${c.patientId}"`,
+        `"${patient?.name || "Unknown"}"`,
+        `"${c.doctor}"`,
+        `"${new Date(c.date).toLocaleString()}"`,
+        `"${c.bp}"`,
+        `"${c.hr}"`,
+        `"${c.temp}"`,
+        `"${c.weight}"`,
+        `"${(c.complaint || "").replace(/"/g, '""')}"`,
+        `"${(c.symptoms || "").replace(/"/g, '""')}"`,
+        `"${(c.diagnosis || "").replace(/"/g, '""')}"`,
+        `"${(c.treatment || "").replace(/"/g, '""')}"`,
+        `"${(c.followup || "").replace(/"/g, '""')}"`,
+        `"${c.status}"`,
+      ].join(",");
+    }).join("\n");
+
+    const blob = new Blob(["\ufeff" + header + rows], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `consultations-history-${new Date().toISOString().split("T")[0]}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    logActivity("consultation history exported as CSV", undefined, undefined, `${filteredHistory.length} records`);
+    showFeedback(`Exported ${filteredHistory.length} consultation(s) as CSV.`, "success");
+  };
+
+  const handlePrintConsultation = () => {
+    if (!viewingHistory && !activeConsult) {
+      showFeedback("No consultation to print.", "warning");
+      return;
+    }
+    const consult = viewingHistory || activeConsult;
+    if (!consult) return;
+
+    const patient = patients.find(p => p.id === consult.patientId);
+    if (!patient) {
+      showFeedback("Patient not found.", "error");
+      return;
+    }
+
+    const printContent = `
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Consultation - ${patient.name}</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 20px; max-width: 800px; margin: 0 auto; }
+    h1 { border-bottom: 2px solid #333; padding-bottom: 10px; }
+    .header { display: flex; justify-content: space-between; margin-bottom: 20px; }
+    .section { margin: 20px 0; }
+    .section h2 { background: #f4f4f4; padding: 8px; margin: 0 0 10px 0; }
+    .vitals-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+    .vital-item { padding: 8px; background: #f9f9f9; }
+    .field { margin: 10px 0; }
+    .label { font-weight: bold; }
+    .value { margin-left: 10px; }
+    .prescriptions { margin-top: 10px; }
+    .rx-item { padding: 10px; border: 1px solid #ddd; margin-bottom: 5px; }
+  </style>
+</head>
+<body>
+  <h1>Consultation Record</h1>
+  <div class="header">
+    <div>
+      <strong>Patient:</strong> ${patient.name}<br>
+      <strong>ID:</strong> ${patient.id}<br>
+      ${patient.age ? `<strong>Age:</strong> ${patient.age}<br>` : ""}
+      ${patient.gender ? `<strong>Gender:</strong> ${patient.gender}<br>` : ""}
+    </div>
+    <div style="text-align: right;">
+      <strong>Date:</strong> ${new Date(consult.date).toLocaleString()}<br>
+      <strong>Doctor:</strong> ${consult.doctor}<br>
+      <strong>Status:</strong> ${consult.status}
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Vitals</h2>
+    <div class="vitals-grid">
+      <div class="vital-item"><span class="label">BP:</span> <span class="value">${consult.bp || "Not recorded"}</span></div>
+      <div class="vital-item"><span class="label">HR:</span> <span class="value">${consult.hr || "Not recorded"}</span></div>
+      <div class="vital-item"><span class="label">Temp:</span> <span class="value">${consult.temp || "Not recorded"}</span></div>
+      <div class="vital-item"><span class="label">Weight:</span> <span class="value">${consult.weight || "Not recorded"}</span></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Clinical Notes</h2>
+    <div class="field"><span class="label">Chief Complaint:</span> <span class="value">${consult.complaint || "Not recorded"}</span></div>
+    <div class="field"><span class="label">Symptoms:</span> <span class="value">${consult.symptoms || "Not recorded"}</span></div>
+    <div class="field"><span class="label">Diagnosis:</span> <span class="value">${consult.diagnosis || "Not recorded"}</span></div>
+    <div class="field"><span class="label">Treatment Plan:</span> <span class="value">${consult.treatment || "Not recorded"}</span></div>
+    <div class="field"><span class="label">Follow-up:</span> <span class="value">${consult.followup || "Not recorded"}</span></div>
+  </div>
+
+  ${consult.prescriptions.length > 0 ? `
+  <div class="section">
+    <h2>Prescriptions</h2>
+    <div class="prescriptions">
+      ${consult.prescriptions.map(rx => `
+        <div class="rx-item">
+          <strong>${rx.medicationName}</strong> - ${rx.dosage}, ${rx.frequency}, ${rx.duration}
+          ${rx.route ? ` (${rx.route})` : ""}<br>
+          ${rx.instructions ? `<em>${rx.instructions}</em>` : ""}
+        </div>
+      `).join("")}
+    </div>
+  </div>
+  ` : ""}
+
+  <div style="margin-top: 40px; font-size: 12px; color: #666; text-align: center;">
+    Generated by Clinic CRM
+  </div>
+</body>
+</html>
+    `;
+
+    const printWindow = window.open("", "_blank");
+    if (printWindow) {
+      printWindow.document.write(printContent);
+      printWindow.document.close();
+      printWindow.print();
+      logActivity("consultation printed", consult.patientId, patient.name);
+      showFeedback("Print dialog opened.", "success");
+    } else {
+      showFeedback("Popup blocked. Please allow popups for this site.", "error");
+    }
+  };
+
+  const handleDeleteConsultation = (consultId: string) => {
+    setConfirmModal({
+      message: "Are you sure you want to delete this consultation? This cannot be undone.",
+      onConfirm: () => {
+        const consult = allConsults.find(c => c.id === consultId);
+        const updated = allConsults.filter(c => c.id !== consultId);
+        persist(updated);
+        if (viewingHistory?.id === consultId) setViewingHistory(null);
+        if (activeConsult?.id === consultId) setActiveConsult(null);
+        if (consult) {
+          logActivity("consultation deleted", consult.patientId, undefined, `Consultation ID: ${consultId}`);
+        }
+        showFeedback("Consultation deleted.", "success");
+        setConfirmModal(null);
+      },
+    });
+  };
+
+  const handleMarkCompleted = (consultId: string) => {
+    const consult = allConsults.find(c => c.id === consultId);
+    if (!consult) return;
+
+    const updated = { ...consult, status: "completed" as ConsultStatus };
+    const others = allConsults.filter(c => c.id !== updated.id);
+    persist([...others, updated]);
+
+    if (viewingHistory?.id === consultId) setViewingHistory({ ...viewingHistory, status: "completed" });
+
+    logActivity("consultation marked completed", consult.patientId, undefined, `Consultation ID: ${consultId}`);
+    showFeedback("Consultation marked as completed.", "success");
+  };
+
+  const handleClearActivity = () => {
+    setConfirmModal({
+      message: "Are you sure you want to clear all activity logs?",
+      onConfirm: () => {
+        setActivity([]);
+        saveActivity([]);
+        showFeedback("Activity log cleared.", "success");
+        setConfirmModal(null);
+      },
+    });
+  };
+
+  const handleExportActivityCSV = () => {
+    if (activity.length === 0) {
+      showFeedback("No activity to export.", "info");
+      return;
+    }
+
+    const header = "Timestamp,Action,Patient ID,Patient Name,Details\n";
+    const rows = activity.map(a => [
+      `"${new Date(a.timestamp).toLocaleString()}"`,
+      `"${a.action}"`,
+      `"${a.patientId || ""}"`,
+      `"${(a.patientName || "").replace(/"/g, '""')}"`,
+      `"${(a.details || "").replace(/"/g, '""')}"`,
+    ].join(",")).join("\n");
+
+    const blob = new Blob(["\ufeff" + header + rows], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `consultation-activity-${new Date().toISOString().split("T")[0]}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    showFeedback("Activity log exported.", "success");
   };
 
   const handleAddRx = (rx: Prescription) => {
@@ -288,13 +960,46 @@ export default function ConsultationsPage({ patients, onUpdatePatient }: Consult
     <div style={{ padding: 24, maxWidth: 900 }}>
       <style>{css}</style>
 
+      {/* Feedback display */}
+      {feedback && (
+        <div style={{
+          padding: "10px 14px",
+          marginBottom: 16,
+          background: feedback.type === "success" ? "var(--green-bg)" : feedback.type === "error" ? "var(--red-bg)" : feedback.type === "warning" ? "var(--amber-bg)" : "var(--blue-bg)",
+          color: feedback.type === "success" ? "var(--green)" : feedback.type === "error" ? "var(--red)" : feedback.type === "warning" ? "var(--amber)" : "var(--blue)",
+          border: `1px solid ${feedback.type === "success" ? "var(--green-border)" : feedback.type === "error" ? "var(--red-border)" : feedback.type === "warning" ? "var(--amber-border)" : "var(--blue-border)"}`,
+          borderRadius: "var(--radius)",
+          fontSize: "var(--font-sm)",
+          fontWeight: 600,
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+        }}>
+          <i className={`ti ${feedback.type === "success" ? "ti-circle-check" : feedback.type === "error" ? "ti-alert-circle" : feedback.type === "warning" ? "ti-alert-triangle" : "ti-info-circle"}`} style={{ fontSize: 14 }} />
+          {feedback.message}
+        </div>
+      )}
+
       {/* Header */}
-      <div style={{ marginBottom: 20 }}>
-        <h1 style={{ fontSize: "var(--font-xl)", fontWeight: 800, margin: 0, marginBottom: 4 }}>
-          Consultations & Encounters
-        </h1>
-        <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>
-          Record and manage patient visit notes — saves to patient timeline, notes, and prescriptions
+      <div style={{ marginBottom: 20, display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 12 }}>
+        <div>
+          <h1 style={{ fontSize: "var(--font-xl)", fontWeight: 800, margin: 0, marginBottom: 4 }}>
+            Consultations & Encounters
+          </h1>
+          <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>
+            Record and manage patient visit notes — saves to patient timeline, notes, and prescriptions
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "6px 12px" }} onClick={() => setShowDrafts(!showDrafts)}>
+            <i className="ti ti-file-description" style={{ marginRight: 4, fontSize: 12 }} />Drafts ({drafts.length})
+          </button>
+          <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "6px 12px" }} onClick={() => setShowTemplates(!showTemplates)}>
+            <i className="ti ti-template" style={{ marginRight: 4, fontSize: 12 }} />Templates
+          </button>
+          <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "6px 12px" }} onClick={() => setShowActivity(!showActivity)}>
+            <i className="ti ti-history" style={{ marginRight: 4, fontSize: 12 }} />Activity
+          </button>
         </div>
       </div>
 
@@ -305,6 +1010,153 @@ export default function ConsultationsPage({ patients, onUpdatePatient }: Consult
         <StatCard label="Completed"       value={totalCompleted}  color="var(--green)" icon="ti-check"       bg="var(--green-bg)" />
         <StatCard label="All Patients"    value={patients.length} color="var(--muted)" icon="ti-users"       bg="var(--surface3)" />
       </div>
+
+      {/* Drafts Panel */}
+      {showDrafts && (
+        <div className="card card-padded" style={{ marginBottom: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+            <div className="cs-section-title" style={{ margin: 0 }}>Drafts ({drafts.length})</div>
+            <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={() => setShowDrafts(false)}>
+              <i className="ti ti-x" style={{ fontSize: 11 }} />
+            </button>
+          </div>
+          {drafts.length === 0 ? (
+            <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)", padding: "20px 0", textAlign: "center" }}>
+              No saved drafts
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {drafts.map(d => (
+                <div key={d.id} style={{ padding: "10px 14px", background: "var(--surface2)", borderRadius: "var(--radius)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div>
+                    <div style={{ fontSize: "var(--font-sm)", fontWeight: 600 }}>{d.patientName}</div>
+                    <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>Saved {new Date(d.savedAt).toLocaleString()}</div>
+                  </div>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px" }} onClick={() => handleLoadDraft(d)}>
+                      <i className="ti ti-upload" style={{ fontSize: 11 }} />
+                    </button>
+                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", color: "var(--red)" }} onClick={() => handleDeleteDraft(d.id)}>
+                      <i className="ti ti-trash" style={{ fontSize: 11 }} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Templates Panel */}
+      {showTemplates && (
+        <div className="card card-padded" style={{ marginBottom: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+            <div className="cs-section-title" style={{ margin: 0 }}>Clinical Note Templates</div>
+            <div style={{ display: "flex", gap: 4 }}>
+              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={() => setTemplateModal({ mode: "create" })}>
+                <i className="ti ti-plus" style={{ fontSize: 11, marginRight: 4 }} />New
+              </button>
+              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={() => setShowTemplates(false)}>
+                <i className="ti ti-x" style={{ fontSize: 11 }} />
+              </button>
+            </div>
+          </div>
+          {templates.length === 0 ? (
+            <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)", padding: "20px 0", textAlign: "center" }}>
+              No templates saved. Create one to quickly fill clinical notes.
+            </div>
+          ) : (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 8 }}>
+              {templates.map(t => (
+                <div key={t.id} style={{ padding: "10px 14px", background: "var(--surface2)", borderRadius: "var(--radius)", border: "1px solid var(--border)" }}>
+                  <div style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4 }}>{t.name}</div>
+                  <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginBottom: 8 }}>{t.category}</div>
+                  <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                    <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", flex: 1 }} onClick={() => handleApplyTemplate(t)}>
+                      Apply
+                    </button>
+                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px" }} onClick={() => setTemplateModal({ mode: "edit", template: t })}>
+                      <i className="ti ti-pencil" style={{ fontSize: 11 }} />
+                    </button>
+                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", color: "var(--red)" }} onClick={() => handleDeleteTemplate(t.id)}>
+                      <i className="ti ti-trash" style={{ fontSize: 11 }} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Activity Panel */}
+      {showActivity && (
+        <div className="card card-padded" style={{ marginBottom: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+            <div className="cs-section-title" style={{ margin: 0 }}>Activity Log ({activity.length})</div>
+            <div style={{ display: "flex", gap: 4 }}>
+              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 90px" }} onClick={handleExportActivityCSV}>
+                <i className="ti ti-download" style={{ fontSize: 11, marginRight: 4 }} />Export CSV
+              </button>
+              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px", color: "var(--red)" }} onClick={handleClearActivity}>
+                <i className="ti ti-trash" style={{ fontSize: 11, marginRight: 4 }} />Clear
+              </button>
+              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={() => setShowActivity(false)}>
+                <i className="ti ti-x" style={{ fontSize: 11 }} />
+              </button>
+            </div>
+          </div>
+          {activity.length === 0 ? (
+            <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)", padding: "20px 0", textAlign: "center" }}>
+              No activity recorded yet
+            </div>
+          ) : (
+            <div style={{ maxHeight: 300, overflowY: "auto", display: "flex", flexDirection: "column", gap: 6 }}>
+              {activity.map((a, i) => (
+                <div key={i} style={{ padding: "8px 12px", background: i === 0 ? "var(--accent-soft)" : "var(--surface2)", borderRadius: "var(--radius)", fontSize: "var(--font-xs)" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+                    <span style={{ fontWeight: 600 }}>{a.action}</span>
+                    <span style={{ color: "var(--muted)" }}>{new Date(a.timestamp).toLocaleString()}</span>
+                  </div>
+                  {a.patientName && <div style={{ color: "var(--muted)" }}>Patient: {a.patientName}</div>}
+                  {a.details && <div style={{ color: "var(--muted)", fontStyle: "italic" }}>{a.details}</div>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Confirmation Modal */}
+      {confirmModal && (
+        <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
+          <div className="card card-padded" style={{ maxWidth: 400, width: "90%" }}>
+            <div style={{ fontSize: "var(--font-md)", fontWeight: 700, marginBottom: 12 }}>Confirm Action</div>
+            <div style={{ fontSize: "var(--font-sm)", marginBottom: 16, color: "var(--muted)" }}>{confirmModal.message}</div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button className="btn btn-ghost" onClick={() => setConfirmModal(null)}>Cancel</button>
+              <button className="btn btn-danger" style={{ background: "var(--red)", color: "#fff" }} onClick={confirmModal.onConfirm}>Confirm</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Template Modal */}
+      {templateModal && (
+        <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
+          <div className="card card-padded" style={{ maxWidth: 500, width: "90%", maxHeight: "90vh", overflowY: "auto" }}>
+            <div style={{ fontSize: "var(--font-md)", fontWeight: 700, marginBottom: 12 }}>
+              {templateModal.mode === "create" ? "Create Template" : "Edit Template"}
+            </div>
+            <TemplateForm
+              template={templateModal.template}
+              onSave={handleSaveTemplate}
+              onEdit={handleEditTemplate}
+              onCancel={() => setTemplateModal(null)}
+            />
+          </div>
+        </div>
+      )}
 
       {/* Patient Picker */}
       <div className="card card-padded" style={{ marginBottom: 14 }}>
@@ -414,15 +1266,23 @@ export default function ConsultationsPage({ patients, onUpdatePatient }: Consult
           {/* Consult form / history viewer */}
           <div className="card card-padded">
             {viewingHistory ? (
-              <HistoryView record={viewingHistory} onClose={() => setViewingHistory(null)} onEdit={() => {
-                // Snapshot the completed record before unlocking so Discard can restore it
-                originalRef.current = viewingHistory;
-                const unlocked = { ...viewingHistory, status: "in-progress" as ConsultStatus };
-                const others = allConsults.filter(c => c.id !== unlocked.id);
-                persist([...others, unlocked]);
-                setActiveConsult(unlocked);
-                setViewingHistory(null);
-              }} />
+              <HistoryView
+                record={viewingHistory}
+                onClose={() => setViewingHistory(null)}
+                onEdit={() => {
+                  // Snapshot the completed record before unlocking so Discard can restore it
+                  originalRef.current = viewingHistory;
+                  const unlocked = { ...viewingHistory, status: "in-progress" as ConsultStatus };
+                  const others = allConsults.filter(c => c.id !== unlocked.id);
+                  persist([...others, unlocked]);
+                  setActiveConsult(unlocked);
+                  setViewingHistory(null);
+                }}
+                onExport={handleExportConsultationTXT}
+                onPrint={handlePrintConsultation}
+                onDelete={() => handleDeleteConsultation(viewingHistory.id)}
+                onMarkCompleted={() => handleMarkCompleted(viewingHistory.id)}
+              />
             ) : activeConsult ? (
               <>
                 <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16, paddingBottom:14, borderBottom:"1px solid var(--border)" }}>
@@ -499,19 +1359,30 @@ export default function ConsultationsPage({ patients, onUpdatePatient }: Consult
                 <hr className="cs-divider" />
 
                 {/* Actions */}
-                <div className="cs-actions" style={{ display:"flex", gap:8, justifyContent:"flex-end" }}>
+                <div className="cs-actions" style={{ display:"flex", gap:8, justifyContent:"flex-end", flexWrap:"wrap" }}>
                   {isCompleted ? (
-                    <button className="btn btn-ghost" onClick={() => {
-                      originalRef.current = activeConsult;
-                      const unlocked = { ...activeConsult, status: "in-progress" as ConsultStatus };
-                      setActiveConsult(unlocked);
-                      const others = allConsults.filter(c => c.id !== unlocked.id);
-                      persist([...others, unlocked]);
-                    }}>
-                      <i className="ti ti-pencil" style={{ marginRight:5, fontSize:12 }} />Edit
-                    </button>
+                    <>
+                      <button className="btn btn-ghost" onClick={handleExportConsultationTXT}>
+                        <i className="ti ti-download" style={{ marginRight:5, fontSize:12 }} />Export TXT
+                      </button>
+                      <button className="btn btn-ghost" onClick={handlePrintConsultation}>
+                        <i className="ti ti-printer" style={{ marginRight:5, fontSize:12 }} />Print
+                      </button>
+                      <button className="btn btn-ghost" onClick={() => {
+                        originalRef.current = activeConsult;
+                        const unlocked = { ...activeConsult, status: "in-progress" as ConsultStatus };
+                        setActiveConsult(unlocked);
+                        const others = allConsults.filter(c => c.id !== unlocked.id);
+                        persist([...others, unlocked]);
+                      }}>
+                        <i className="ti ti-pencil" style={{ marginRight:5, fontSize:12 }} />Edit
+                      </button>
+                    </>
                   ) : (
                     <>
+                      <button className="btn btn-ghost" onClick={handleSaveDraft}>
+                        <i className="ti ti-device-floppy" style={{ marginRight:5, fontSize:12 }} />Save Draft
+                      </button>
                       <button className="btn btn-ghost" onClick={handleDiscard}>Discard</button>
                       <button className="btn btn-primary" onClick={handleSave} disabled={!hasContent}>
                         {saveFlash
@@ -556,7 +1427,7 @@ export default function ConsultationsPage({ patients, onUpdatePatient }: Consult
 }
 
 // ─── History Viewer ───────────────────────────────────────────────────────────
-function HistoryView({ record, onClose, onEdit }: { record: ConsultRecord; onClose: () => void; onEdit: () => void }) {
+function HistoryView({ record, onClose, onEdit, onExport, onPrint, onDelete, onMarkCompleted }: { record: ConsultRecord; onClose: () => void; onEdit: () => void; onExport: () => void; onPrint: () => void; onDelete: () => void; onMarkCompleted: () => void }) {
   const fields = [
     { label: "Chief Complaint", value: record.complaint },
     { label: "Symptoms",        value: record.symptoms  },
@@ -582,8 +1453,22 @@ function HistoryView({ record, onClose, onEdit }: { record: ConsultRecord; onClo
         </div>
         <div style={{ display:"flex", gap:8, alignItems:"center" }}>
           <StatusPill status={record.status} />
+          {record.status !== "completed" && (
+            <button className="btn btn-ghost" style={{ fontSize:"var(--font-xs)", padding:"4px 10px", color: "var(--green)" }} onClick={onMarkCompleted}>
+              <i className="ti ti-check" style={{ fontSize:11, marginRight:4 }} />Complete
+            </button>
+          )}
+          <button className="btn btn-ghost" style={{ fontSize:"var(--font-xs)", padding:"4px 10px" }} onClick={onExport}>
+            <i className="ti ti-download" style={{ fontSize:11, marginRight:4 }} />Export
+          </button>
+          <button className="btn btn-ghost" style={{ fontSize:"var(--font-xs)", padding:"4px 10px" }} onClick={onPrint}>
+            <i className="ti ti-printer" style={{ fontSize:11, marginRight:4 }} />Print
+          </button>
           <button className="btn btn-ghost" style={{ fontSize:"var(--font-xs)", padding:"4px 10px" }} onClick={onEdit}>
             <i className="ti ti-pencil" style={{ fontSize:11, marginRight:4 }} />Edit
+          </button>
+          <button className="btn btn-ghost" style={{ fontSize:"var(--font-xs)", padding:"4px 10px", color: "var(--red)" }} onClick={onDelete}>
+            <i className="ti ti-trash" style={{ fontSize:11, marginRight:4 }} />Delete
           </button>
           <button className="btn-icon" onClick={onClose}><i className="ti ti-x" style={{ fontSize:14 }} /></button>
         </div>
@@ -720,6 +1605,80 @@ function StatCard({ label, value, color, icon, bg }: { label:string; value:numbe
         <span style={{ fontSize:"var(--font-xs)", color:"var(--muted)" }}>{label}</span>
       </div>
       <div style={{ fontSize:"var(--font-xl)", fontWeight:800, color }}>{value}</div>
+    </div>
+  );
+}
+
+// ─── Template Form ─────────────────────────────────────────────────────────────
+function TemplateForm({ template, onSave, onEdit, onCancel }: { template?: Template; onSave: (t: Omit<Template, "id">) => void; onEdit: (t: Template) => void; onCancel: () => void }) {
+  const [form, setForm] = useState({
+    name: template?.name || "",
+    category: template?.category || "General",
+    complaint: template?.complaint || "",
+    symptoms: template?.symptoms || "",
+    diagnosis: template?.diagnosis || "",
+    treatment: template?.treatment || "",
+    followup: template?.followup || "",
+  });
+
+  const handleChange = (k: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) =>
+    setForm(p => ({ ...p, [k]: e.target.value }));
+
+  const submit = () => {
+    if (!form.name || !form.category) return;
+    if (template) {
+      onEdit({ ...template, ...form });
+    } else {
+      onSave(form);
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+        <div>
+          <label className="cs-label">Template Name *</label>
+          <input className="cs-input" placeholder="e.g. General Consultation" value={form.name} onChange={handleChange("name")} />
+        </div>
+        <div>
+          <label className="cs-label">Category *</label>
+          <select className="cs-select" value={form.category} onChange={handleChange("category")}>
+            <option value="General">General</option>
+            <option value="Follow-up">Follow-up</option>
+            <option value="Fever/Cold">Fever/Cold</option>
+            <option value="Diabetes">Diabetes</option>
+            <option value="Hypertension">Hypertension</option>
+            <option value="Cardiovascular">Cardiovascular</option>
+            <option value="Respiratory">Respiratory</option>
+            <option value="Gastrointestinal">Gastrointestinal</option>
+            <option value="Custom">Custom</option>
+          </select>
+        </div>
+      </div>
+      <div>
+        <label className="cs-label">Chief Complaint</label>
+        <textarea className="cs-textarea" placeholder="Typical chief complaint for this template..." rows={2} value={form.complaint} onChange={handleChange("complaint")} />
+      </div>
+      <div>
+        <label className="cs-label">Symptoms</label>
+        <textarea className="cs-textarea" placeholder="Common symptoms..." rows={2} value={form.symptoms} onChange={handleChange("symptoms")} />
+      </div>
+      <div>
+        <label className="cs-label">Diagnosis</label>
+        <textarea className="cs-textarea" placeholder="Common diagnosis..." rows={2} value={form.diagnosis} onChange={handleChange("diagnosis")} />
+      </div>
+      <div>
+        <label className="cs-label">Treatment Plan</label>
+        <textarea className="cs-textarea" placeholder="Standard treatment approach..." rows={2} value={form.treatment} onChange={handleChange("treatment")} />
+      </div>
+      <div>
+        <label className="cs-label">Follow-up</label>
+        <textarea className="cs-textarea" placeholder="Follow-up instructions..." rows={2} value={form.followup} onChange={handleChange("followup")} />
+      </div>
+      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+        <button className="btn btn-ghost" onClick={onCancel}>Cancel</button>
+        <button className="btn btn-primary" onClick={submit} disabled={!form.name || !form.category}>{template ? "Update Template" : "Save Template"}</button>
+      </div>
     </div>
   );
 }

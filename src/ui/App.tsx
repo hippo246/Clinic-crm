@@ -1686,7 +1686,7 @@ function AppInner() {
         )}
         {activeTab === "queue" && (
           <div style={{ flex: 1, overflow: "auto" }}>
-            <QueuePage patients={patients} onUpdatePatient={handleUpdatePatient} onAction={handleDashboardAction} />
+            <QueuePage patients={patients} onUpdatePatient={handleUpdatePatient} onAction={handleDashboardAction} userRole={userRole} />
           </div>
         )}
         {activeTab === "appointments" && (
@@ -1695,42 +1695,43 @@ function AppInner() {
               patients={patients}
               onUpdatePatient={handleUpdatePatient}
               onViewPatient={(p: Patient) => { setSelectedPatient(p); setActiveTab("patients"); }}
+              userRole={userRole}
             />
           </div>
         )}
         {activeTab === "consultations" && (
           <div style={{ flex: 1, overflow: "auto" }}>
-            <ConsultationsPage patients={patients} onUpdatePatient={handleUpdatePatient} />
+            <ConsultationsPage patients={patients} onUpdatePatient={handleUpdatePatient} userRole={userRole} />
           </div>
         )}
         {activeTab === "prescriptions" && (
           <div style={{ flex: 1, overflow: "auto" }}>
-            <PrescriptionsPage patients={patients} />
+            <PrescriptionsPage patients={patients} onUpdatePatient={handleUpdatePatient} userRole={userRole} />
           </div>
         )}
         {activeTab === "lab" && (
           <div style={{ flex: 1, overflow: "auto" }}>
-            <LabPage patients={patients} />
+            <LabPage patients={patients} onUpdatePatient={handleUpdatePatient} userRole={userRole} />
           </div>
         )}
         {activeTab === "billing" && (
           <div style={{ flex: 1, overflow: "auto" }}>
-            <BillingPage patients={patients} />
+            <BillingPage patients={patients} onUpdatePatient={handleUpdatePatient} userRole={userRole} />
           </div>
         )}
         {activeTab === "documents" && (
           <div style={{ flex: 1, overflow: "auto" }}>
-            <DocumentsPage patients={patients} />
+            <DocumentsPage patients={patients} onUpdatePatient={handleUpdatePatient} userRole={userRole} />
           </div>
         )}
         {activeTab === "communications" && (
           <div style={{ flex: 1, overflow: "auto" }}>
-            <CommunicationsPage patients={patients} />
+            <CommunicationsPage patients={patients} onUpdatePatient={handleUpdatePatient} userRole={userRole} />
           </div>
         )}
         {activeTab === "reports" && (
           <div style={{ flex: 1, overflow: "auto" }}>
-            <ReportsPage patients={patients} />
+            <ReportsPage patients={patients} onUpdatePatient={handleUpdatePatient} userRole={userRole} />
           </div>
         )}
         {activeTab === "staff" && (
@@ -1767,6 +1768,8 @@ function AppInner() {
               onNewPatient={() => setFormMode("create")}
               onImport={() => setImportOpen(true)}
               role={userRole}
+              onUpdatePatient={handleUpdatePatient}
+              onDeletePatient={handleDeletePatient}
             />
           )
         )}

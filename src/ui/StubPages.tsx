@@ -22,7 +22,7 @@ function writeJSON(key: string, value: unknown): void {
 }
 
 // ─── Appointments ─────────────────────────────────────────────────────────────
-export function AppointmentsPage({ patients, onUpdatePatient, onViewPatient }: { patients: Patient[]; onUpdatePatient?: (patient: Patient) => void; onViewPatient?: (patient: Patient) => void }) {
+export function AppointmentsPage({ patients, onUpdatePatient, onViewPatient, userRole = "admin" }: { patients: Patient[]; onUpdatePatient?: (patient: Patient) => void; onViewPatient?: (patient: Patient) => void; userRole?: "receptionist" | "doctor" | "admin" }) {
   const [currentDate, setCurrentDate] = useState(new Date());
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
   const [showNewAppointmentModal, setShowNewAppointmentModal] = useState(false);

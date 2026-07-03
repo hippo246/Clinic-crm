@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from "react";
 import type { Patient } from "./types";
 import { fmtDate } from "./utils";
 
-export default function DocumentsPage({ patients }: { patients: Patient[] }) {
+export default function DocumentsPage({ patients, onUpdatePatient, userRole = "admin" }: { patients: Patient[]; onUpdatePatient?: (updated: Patient, action?: string) => void; userRole?: "receptionist" | "doctor" | "admin" }) {
   const [showUploadModal, setShowUploadModal] = useState(false);
   const [selectedPatient, setSelectedPatient] = useState<Patient | null>(null);
   const [activeTab, setActiveTab] = useState<"all" | "consents" | "id" | "insurance">("all");

@@ -40,7 +40,7 @@ function readLocalStorageJSON<T>(key: string, fallback: T): T {
   }
 }
 
-export default function ReportsPage({ patients }: { patients: Patient[] }) {
+export default function ReportsPage({ patients, onUpdatePatient, userRole = "admin" }: { patients: Patient[]; onUpdatePatient?: (updated: Patient, action?: string) => void; userRole?: "receptionist" | "doctor" | "admin" }) {
   const [activeTab, setActiveTab] = useState<"patients" | "appointments" | "revenue" | "performance" | "followups">("patients");
   const [dateRange, setDateRange] = useState<"today" | "week" | "month" | "custom">("month");
   const [customFrom, setCustomFrom] = useState<string>("");

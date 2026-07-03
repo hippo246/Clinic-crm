@@ -53,6 +53,10 @@ function QualityBar({ patients, onSearch }: { patients: Patient[]; onSearch: (q:
       { label: "Follow-Up Overdue",    count: patients.filter((p) => p.status === "Follow-Up Due").length,        color: "#d97706", query: "follow-up overdue" },
       { label: "Critical Alerts",      count: patients.filter((p) => (p.alerts||[]).some((a) => ["Allergy","Heart Condition","Pregnancy","High Risk"].includes(a))).length, color: "#dc2626", query: "critical" },
       { label: "No Emergency Contact", count: patients.filter((p) => !p.emergencyName || !p.emergencyPhone).length, color: "#7c3aed", query: "missing emergency" },
+      { label: "Missing Phone",        count: patients.filter((p) => !p.phone).length,                            color: "#0891b2", query: "missing phone" },
+      { label: "Missing DOB",          count: patients.filter((p) => !p.dob).length,                              color: "#0891b2", query: "missing dob" },
+      { label: "Missing Doctor",       count: patients.filter((p) => !p.doctor).length,                          color: "#0891b2", query: "missing doctor" },
+      { label: "Missing Insurance Info", count: patients.filter((p) => !p.insuranceStatus).length,                color: "#0891b2", query: "missing insurance" },
     ];
     return items.filter((i) => i.count > 0);
   }, [patients]);
@@ -226,7 +230,7 @@ export default function PatientList({
   const [newSearchName, setNewSearchName] = useState("");
   const [filterLogic, setFilterLogic] = useState<"AND" | "OR">("AND");
   const [showReminders, setShowReminders] = useState(false);
-  const [reminders, setReminders] = useState<Array<{ id: string; patientId: string; patientName: string; type: string; date: string; completed: boolean }>>([]);
+  const [reminders, setReminders] = useState<Array<{ id: string; patientId: string; patientName: string; type: string; date: string; completed: boolean; notes?: string }>>([]);
   const [showOnboardingChecklist, setShowOnboardingChecklist] = useState(false);
   const [onboardingTasks, setOnboardingTasks] = useState<Array<{ id: string; title: string; completed: boolean }>>([
     { id: "1", title: "Patient registration", completed: true },
@@ -312,8 +316,10 @@ export default function PatientList({
     message: string;
     confirmLabel?: string;
     danger?: boolean;
+    requireTypedWord?: string;
     onConfirm: () => void;
   } | null>(null);
+  const [confirmTypedValue, setConfirmTypedValue] = useState("");
 
   // Track viewport width so the layout can adapt to phone screens
   useEffect(() => {
@@ -325,6 +331,14 @@ export default function PatientList({
   // Escape closes any open modal/overlay
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
+      if ((e.key === "a" || e.key === "A") && (e.ctrlKey || e.metaKey)) {
+        const target = e.target as HTMLElement;
+        const tag = target?.tagName?.toLowerCase();
+        if (tag === "input" || tag === "textarea" || tag === "select") return;
+        e.preventDefault();
+        toggleSelectAll();
+        return;
+      }
       if (e.key !== "Escape") return;
       if (confirmModal) { setConfirmModal(null); return; }
       if (showScheduleModal) { setShowScheduleModal(false); return; }
@@ -447,18 +461,75 @@ export default function PatientList({
     setSavedSearches([...savedSearches, newSearch]);
     setNewSearchName("");
     setShowSaveSearchModal(false);
+    showFeedback(`Saved search "${newSearch.name}"`, "success");
   }
 
   function handleDeleteSearch(id: string) {
-    setSavedSearches(savedSearches.filter(s => s.id !== id));
+    if (!requireAdmin()) return;
+    const s = savedSearches.find(s => s.id === id);
+    setConfirmModal({
+      title: "Delete Saved Search",
+      message: `Delete the saved search "${s?.name || ""}"? This cannot be undone.`,
+      confirmLabel: "Delete",
+      danger: true,
+      onConfirm: () => {
+        setSavedSearches(savedSearches.filter(s => s.id !== id));
+        showFeedback("Saved search deleted", "success");
+      },
+    });
   }
 
   function handleApplySearch(query: string) {
     setSearch(query);
+    resetPage();
   }
 
   function handleToggleReminder(id: string) {
     setReminders(reminders.map(r => r.id === id ? { ...r, completed: !r.completed } : r));
+  }
+
+  // ── add reminder modal ──────────────────────────────────────────────────────
+  const [showAddReminderModal, setShowAddReminderModal] = useState(false);
+  const [reminderPatient, setReminderPatient] = useState<Patient | null>(null);
+  const [reminderType, setReminderType] = useState("follow-up");
+  const [reminderDate, setReminderDate] = useState("");
+  const [reminderNotes, setReminderNotes] = useState("");
+
+  function handleAddReminder() {
+    if (!reminderPatient) return;
+    if (!reminderDate) {
+      showFeedback("Please choose a reminder date", "error");
+      return;
+    }
+    const newReminder = {
+      id: `reminder-${reminderPatient.id}-${Date.now()}`,
+      patientId: reminderPatient.id,
+      patientName: reminderPatient.name,
+      type: reminderType,
+      date: reminderDate,
+      notes: reminderNotes,
+      completed: false,
+    };
+    setReminders(prev => [...prev, newReminder]);
+    logAuditTrail(`Added ${reminderType} reminder`, reminderPatient.id, reminderPatient.name);
+    showFeedback(`Reminder set for ${reminderPatient.name}`, "success");
+    setShowAddReminderModal(false);
+    setReminderPatient(null);
+  }
+
+  function handleDeleteReminder(id: string) {
+    if (!requireAdmin()) return;
+    const r = reminders.find(r => r.id === id);
+    setConfirmModal({
+      title: "Delete Reminder",
+      message: `Delete the reminder for "${r?.patientName || ""}"? This cannot be undone.`,
+      confirmLabel: "Delete",
+      danger: true,
+      onConfirm: () => {
+        setReminders(reminders.filter(r => r.id !== id));
+        showFeedback("Reminder deleted", "success");
+      },
+    });
   }
 
   function handleToggleOnboardingTask(id: string) {
@@ -477,6 +548,16 @@ export default function PatientList({
     setAuditTrail(prev => [entry, ...prev].slice(0, 100));
   }
 
+  // ── role gating ──────────────────────────────────────────────────────────────
+  const isAdmin = String(role).toLowerCase() === "admin";
+  function requireAdmin(): boolean {
+    if (!isAdmin) {
+      showFeedback("You do not have permission for this action in the current role.", "error");
+      return false;
+    }
+    return true;
+  }
+
   function handleSaveFilter() {
     if (!newFilterName.trim()) {
       showFeedback("Please enter a filter name", "error");
@@ -490,6 +571,10 @@ export default function PatientList({
       filterRisk,
       dateRangeFrom,
       dateRangeTo,
+      filterTag,
+      filterLogic,
+      groupBy,
+      viewMode,
     };
     const newFilter = {
       id: Date.now().toString(),
@@ -499,21 +584,48 @@ export default function PatientList({
     setSavedFilters([...savedFilters, newFilter]);
     setNewFilterName("");
     setShowSaveFilterModal(false);
+    showFeedback(`Saved filter "${newFilter.name}"`, "success");
+  }
+
+  function handleRenameFilter(id: string, name: string) {
+    if (!name.trim()) {
+      showFeedback("Filter name cannot be empty", "error");
+      return;
+    }
+    setSavedFilters(savedFilters.map(f => f.id === id ? { ...f, name: name.trim() } : f));
+    showFeedback("Filter renamed", "success");
   }
 
   function handleLoadFilter(filter: any) {
-    setSearch(filter.filters.search);
-    setFilterStatus(filter.filters.filterStatus);
-    setFilterDoctor(filter.filters.filterDoctor);
-    setFilterIns(filter.filters.filterInsurance);
-    setFilterRisk(filter.filters.filterRisk);
-    setDateRangeFrom(filter.filters.dateRangeFrom);
-    setDateRangeTo(filter.filters.dateRangeTo);
+    const f = filter.filters || {};
+    setSearch(f.search ?? "");
+    setFilterStatus(f.filterStatus ?? "All");
+    setFilterDoctor(f.filterDoctor ?? "All");
+    setFilterIns(f.filterInsurance ?? "All");
+    setFilterRisk(f.filterRisk ?? "All");
+    setDateRangeFrom(f.dateRangeFrom ?? "");
+    setDateRangeTo(f.dateRangeTo ?? "");
+    setFilterTag(f.filterTag ?? "All");
+    setFilterLogic(f.filterLogic ?? "AND");
+    setGroupBy(f.groupBy ?? "none");
+    setViewMode(f.viewMode ?? "table");
     resetPage();
+    showFeedback(`Applied filter "${filter.name}"`, "success");
   }
 
   function handleDeleteFilter(id: string) {
-    setSavedFilters(savedFilters.filter(f => f.id !== id));
+    if (!requireAdmin()) return;
+    const filter = savedFilters.find(f => f.id === id);
+    setConfirmModal({
+      title: "Delete Saved Filter",
+      message: `Delete the saved filter "${filter?.name || ""}"? This cannot be undone.`,
+      confirmLabel: "Delete",
+      danger: true,
+      onConfirm: () => {
+        setSavedFilters(savedFilters.filter(f => f.id !== id));
+        showFeedback("Saved filter deleted", "success");
+      },
+    });
   }
 
   function handlePrint() {
@@ -539,7 +651,10 @@ export default function PatientList({
 
     // Create a print-friendly HTML based on template
     const printWindow = window.open("", "_blank");
-    if (!printWindow) return;
+    if (!printWindow) {
+      showFeedback("Popup blocked. Please allow popups for this site to print.", "error");
+      return;
+    }
 
     const title = customPrintTitle || "Patient List";
     const headerRow = Array.from(selectedColumns).map(col => `<th>${columnLabels[col]}</th>`).join("");
@@ -596,8 +711,25 @@ export default function PatientList({
       </div>
     ` : "";
 
+    const brandingSection = includeClinicBranding ? `
+      <div class="branding" style="font-weight: 700; font-size: 16px; color: #2563eb; margin-bottom: 8px;">ClinicOS Medical Center</div>
+    ` : "";
+
+    const alertsSummary = includeMedicalAlerts ? `
+      <div class="alerts-summary" style="margin: 10px 0; padding: 10px; background: #fef2f2; border-radius: 4px; font-size: 12px;">
+        <strong>Patients with medical alerts:</strong> ${filtered.filter(p => (p.alerts || []).length > 0).length}
+      </div>
+    ` : "";
+
+    const signatureSection = includeDoctorSignature ? `
+      <div class="signature" style="margin-top: 40px; display: flex; justify-content: flex-end;">
+        <div style="border-top: 1px solid #333; width: 240px; text-align: center; padding-top: 6px; font-size: 12px;">Doctor Signature</div>
+      </div>
+    ` : "";
+
     const headerSection = includeHeader ? `
       <div class="header" style="margin-bottom: 20px; border-bottom: 2px solid #333; padding-bottom: 15px;">
+        ${brandingSection}
         <h1 style="margin: 0; font-size: 24px; color: #333;">${title}</h1>
         <div class="meta" style="color: #666; font-size: 14px; margin-top: 5px;">
           Generated on ${new Date().toLocaleString()} · ${filtered.length} patients · Template: ${printTemplate}
@@ -636,10 +768,12 @@ export default function PatientList({
       <body>
         ${headerSection}
         ${filterInfo}
+        ${alertsSummary}
         <table>
           <thead><tr>${headerRow}</tr></thead>
           <tbody>${rows}</tbody>
         </table>
+        ${signatureSection}
         ${footerSection}
       </body>
       </html>
@@ -673,11 +807,20 @@ export default function PatientList({
   }
 
   function handleAddTag(patient: Patient) {
-    if (!newTag.trim()) return;
-    const updatedTags = [...(patient.tags || []), newTag.trim()];
+    const tagValue = newTag.trim();
+    if (!tagValue) return;
+    if ((patient.tags || []).some(t => t.toLowerCase() === tagValue.toLowerCase())) {
+      showFeedback(`"${tagValue}" is already on ${patient.name}`, "error");
+      return;
+    }
+    const updatedTags = [...(patient.tags || []), tagValue];
     const updatedPatient = { ...patient, tags: updatedTags };
     if (onUpdatePatient) {
       onUpdatePatient(updatedPatient);
+      logAuditTrail(`Added tag "${tagValue}"`, patient.id, patient.name);
+      showFeedback(`Added tag "${tagValue}"`, "success");
+    } else {
+      showFeedback("Update not available", "error");
     }
     setSelectedPatientForTags(updatedPatient);
     setNewTag("");
@@ -688,6 +831,10 @@ export default function PatientList({
     const updatedPatient = { ...patient, tags: updatedTags };
     if (onUpdatePatient) {
       onUpdatePatient(updatedPatient);
+      logAuditTrail(`Removed tag "${tag}"`, patient.id, patient.name);
+      showFeedback(`Removed tag "${tag}"`, "success");
+    } else {
+      showFeedback("Update not available", "error");
     }
     setSelectedPatientForTags(updatedPatient);
   }
@@ -845,8 +992,18 @@ export default function PatientList({
     return { groups };
   }, [filtered, groupBy]);
 
-  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  const paginated  = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  const totalPages = useMemo(() => Math.max(1, Math.ceil(filtered.length / PAGE_SIZE)), [filtered.length]);
+  const paginated  = useMemo(() => filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE), [filtered, page]);
+
+  // Clamp page if filtering shrinks the result set below the current page
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages);
+  }, [totalPages, page]);
+
+  // Reset to page 1 whenever search/filters/sort/grouping change
+  useEffect(() => {
+    setPage(1);
+  }, [search, filterStatus, filterDoctor, filterInsurance, filterRisk, filterTag, filterLogic, dateRangeFrom, dateRangeTo, quickFilter, sortKey, sortDir, groupBy]);
 
   const activeFilterCount = [filterStatus !== "All", filterDoctor !== "All", filterInsurance !== "All", filterRisk !== "All", filterTag !== "All"].filter(Boolean).length;
 
@@ -884,6 +1041,11 @@ export default function PatientList({
     }
   }
 
+  function selectAllFiltered() {
+    setSelectedPatients(new Set(filtered.map(p => p.id)));
+    showFeedback(`Selected all ${filtered.length} filtered patient${filtered.length !== 1 ? "s" : ""}`, "success");
+  }
+
   function clearSelection() {
     setSelectedPatients(new Set());
     setShowBulkActions(false);
@@ -891,11 +1053,22 @@ export default function PatientList({
 
   function handleBulkExport() {
     const selected = patients.filter(p => selectedPatients.has(p.id));
+    if (selected.length === 0) {
+      showFeedback("Select at least one patient first", "error");
+      return;
+    }
     exportPatientsToCSV(selected);
+    logAuditTrail(`Exported ${selected.length} selected patient${selected.length !== 1 ? "s" : ""}`, "bulk", "multiple");
+    showFeedback(`Exported ${selected.length} patient${selected.length !== 1 ? "s" : ""}`, "success");
     clearSelection();
   }
 
   function handleBulkDelete() {
+    if (selectedPatients.size === 0) {
+      showFeedback("Select at least one patient first", "error");
+      return;
+    }
+    if (!requireAdmin()) return;
     if (!onDeletePatient) {
       showFeedback("Delete is not available", "error");
       return;
@@ -905,6 +1078,7 @@ export default function PatientList({
       message: `Are you sure you want to delete ${selectedPatients.size} patient${selectedPatients.size !== 1 ? "s" : ""}? This cannot be undone.`,
       confirmLabel: "Delete",
       danger: true,
+      requireTypedWord: "DELETE",
       onConfirm: () => {
         const count = selectedPatients.size;
         selectedPatients.forEach(id => onDeletePatient!(id));
@@ -916,7 +1090,14 @@ export default function PatientList({
   }
 
   function handleBulkStatusUpdate() {
-    if (!bulkStatusTarget) return;
+    if (selectedPatients.size === 0) {
+      showFeedback("Select at least one patient first", "error");
+      return;
+    }
+    if (!bulkStatusTarget) {
+      showFeedback("Choose a status first", "error");
+      return;
+    }
     if (!onUpdatePatient) {
       showFeedback("Update is not available", "error");
       return;
@@ -936,7 +1117,14 @@ export default function PatientList({
   }
 
   function handleBulkDoctorUpdate() {
-    if (!bulkDoctorTarget) return;
+    if (selectedPatients.size === 0) {
+      showFeedback("Select at least one patient first", "error");
+      return;
+    }
+    if (!bulkDoctorTarget) {
+      showFeedback("Choose a doctor first", "error");
+      return;
+    }
     if (!onUpdatePatient) {
       showFeedback("Update is not available", "error");
       return;
@@ -998,6 +1186,13 @@ export default function PatientList({
         setSelectedPatientForTags(patient);
         setShowTagManager(true);
         break;
+      case "reminder":
+        setReminderPatient(patient);
+        setReminderType("follow-up");
+        setReminderDate("");
+        setReminderNotes("");
+        setShowAddReminderModal(true);
+        break;
     }
   }
 
@@ -1018,6 +1213,168 @@ export default function PatientList({
   }, [patients, selectedPatients]);
 
   const dupeCount = useMemo(() => detectDuplicates(patients).length, [patients]);
+  const [reviewedDuplicates, setReviewedDuplicates] = useState<Set<string>>(new Set());
+
+  // ── import modal state/handlers ─────────────────────────────────────────────
+  const [importText, setImportText] = useState("");
+  const [importResult, setImportResult] = useState<{ matched: number; newRows: number; skipped: number } | null>(null);
+
+  function parseCSV(text: string): Array<Record<string, string>> {
+    const lines = text.split(/\r?\n/).filter(l => l.trim().length > 0);
+    if (lines.length === 0) return [];
+    const headers = lines[0].split(",").map(h => h.trim().replace(/^"|"$/g, ""));
+    return lines.slice(1).map(line => {
+      const cells = line.split(",").map(c => c.trim().replace(/^"|"$/g, ""));
+      const row: Record<string, string> = {};
+      headers.forEach((h, i) => { row[h] = cells[i] ?? ""; });
+      return row;
+    });
+  }
+
+  function handleImport() {
+    if (!importText.trim()) {
+      showFeedback("Paste CSV text or choose a file first", "error");
+      return;
+    }
+    const rows = parseCSV(importText);
+    if (rows.length === 0) {
+      showFeedback("No rows found to import", "error");
+      return;
+    }
+
+    let matched = 0;
+    let newRows = 0;
+    let skipped = 0;
+    const seen = new Set<string>();
+
+    rows.forEach((row) => {
+      const firstName = row.firstName || (row.name ? row.name.split(" ")[0] : "");
+      const lastName = row.lastName || (row.name ? row.name.split(" ").slice(1).join(" ") : "");
+      const name = row.name || `${firstName} ${lastName}`.trim();
+      const phone = row.phone || "";
+      const email = row.email || "";
+
+      // de-dupe key: id, then phone+name, then email
+      const dedupeKey = row.id || (phone && name ? `${phone}|${name}` : "") || email;
+      if (dedupeKey && seen.has(dedupeKey)) { skipped++; return; }
+      if (dedupeKey) seen.add(dedupeKey);
+
+      const existing = patients.find(p =>
+        (row.id && p.id === row.id) ||
+        (phone && name && p.phone === phone && p.name === name) ||
+        (email && p.email === email)
+      );
+
+      if (existing) {
+        if (onUpdatePatient) {
+          onUpdatePatient({
+            ...existing,
+            name: name || existing.name,
+            phone: phone || existing.phone,
+            email: email || existing.email,
+            dob: row.dob || existing.dob,
+            gender: (row.gender as any) || existing.gender,
+            doctor: row.doctor || existing.doctor,
+            status: (row.status as any) || existing.status,
+          });
+          matched++;
+        } else {
+          skipped++;
+        }
+      } else {
+        // No bulk-create callback is available on this component — id would be generated here if one existed.
+        newRows++;
+      }
+    });
+
+    if (matched > 0) {
+      logAuditTrail(`Imported updates for ${matched} patient${matched !== 1 ? "s" : ""}`, "bulk", "multiple");
+    }
+    setImportResult({ matched, newRows, skipped });
+
+    if (newRows > 0) {
+      showFeedback(
+        `Updated ${matched} existing patient${matched !== 1 ? "s" : ""}. ${newRows} new patient${newRows !== 1 ? "s" : ""} could not be added here — use the app's main import flow to create new patients.`,
+        "info"
+      );
+    } else if (matched > 0) {
+      showFeedback(`Updated ${matched} existing patient${matched !== 1 ? "s" : ""} from import`, "success");
+    } else {
+      showFeedback("No matching patients found to update", "error");
+    }
+  }
+
+  // ── export modal state/handlers ─────────────────────────────────────────────
+  const [exportScope, setExportScope] = useState<"filtered" | "selected">("filtered");
+  const [exportFormat, setExportFormat] = useState<"csv" | "json" | "contacts">("csv");
+  const [exportVisibleColumnsOnly, setExportVisibleColumnsOnly] = useState(false);
+
+  function downloadFile(content: string, filename: string, mime: string) {
+    const blob = new Blob([content], { type: mime });
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    window.URL.revokeObjectURL(url);
+  }
+
+  // Escapes a value for CSV: wraps in quotes and doubles any embedded quotes.
+  function csvCell(value: unknown): string {
+    const str = value == null ? "" : String(value);
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+
+  function buildCSV(headers: string[], rows: Array<Record<string, unknown>>): string {
+    const lines = [
+      headers.map(csvCell).join(","),
+      ...rows.map(row => headers.map(h => {
+        let v = row[h];
+        if (Array.isArray(v)) v = v.join("; ");
+        return csvCell(v);
+      }).join(",")),
+    ];
+    // UTF-8 BOM so Excel renders names with accents correctly
+    return "\uFEFF" + lines.join("\r\n");
+  }
+
+  function handleExport() {
+    const rows = exportScope === "selected"
+      ? patients.filter(p => selectedPatients.has(p.id))
+      : filtered;
+
+    if (rows.length === 0) {
+      showFeedback(exportScope === "selected" ? "No patients selected to export" : "No patients match the current filters", "error");
+      return;
+    }
+
+    const stamp = new Date().toISOString().split("T")[0];
+
+    if (exportFormat === "json") {
+      const payload = {
+        exportedAt: new Date().toISOString(),
+        count: rows.length,
+        filters: {
+          search, filterStatus, filterDoctor, filterInsurance, filterRisk, filterTag,
+          filterLogic, dateRangeFrom, dateRangeTo, scope: exportScope,
+        },
+        data: rows,
+      };
+      downloadFile(JSON.stringify(payload, null, 2), `patients_${stamp}.json`, "application/json");
+    } else if (exportFormat === "contacts") {
+      const headers = ["name", "phone", "email", "doctor", "followUpDate"];
+      downloadFile(buildCSV(headers, rows as any), `patient_contacts_${stamp}.csv`, "text/csv");
+    } else if (exportVisibleColumnsOnly && selectedColumns.size > 0) {
+      const cols = Array.from(selectedColumns);
+      downloadFile(buildCSV(cols, rows as any), `patients_${stamp}.csv`, "text/csv");
+    } else {
+      exportPatientsToCSV(rows);
+    }
+
+    logAuditTrail(`Exported ${rows.length} patient${rows.length !== 1 ? "s" : ""} (${exportFormat}, ${exportScope})`, "bulk", "multiple");
+    showFeedback(`Exported ${rows.length} patient${rows.length !== 1 ? "s" : ""}`, "success");
+    setShowExportModal(false);
+  }
 
   const SortIcon = ({ col }: { col: keyof Patient }) => {
     if (sortKey !== col) return <i className="ti ti-selector" style={{ fontSize: 11, opacity: 0.3 }} />;
@@ -1220,14 +1577,14 @@ export default function PatientList({
               background: "var(--surface)", border: "1px solid var(--border)",
               borderRadius: "var(--radius-lg)", boxShadow: "var(--shadow-lg)", overflow: "hidden",
             }}>
-              {savedSearches.length > 0 && (
+              {savedSearches.length > 0 ? (
                 <>
                   <div style={{ padding: "8px 12px 4px", fontSize: "var(--font-2xs)", fontWeight: 700, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.07em" }}>
                 Saved Searches
               </div>
                   {savedSearches.map((s) => (
                     <div key={s.id} style={{ display: "flex", alignItems: "center", padding: "8px 12px", gap: 8, borderBottom: "1px solid var(--border)" }}>
-                      <button onMouseDown={() => { handleApplySearch(s.query); resetPage(); }} style={{ flex: 1, background: "none", border: "none", cursor: "pointer", textAlign: "left", fontSize: "var(--font-sm)", color: "var(--text)" }}>
+                      <button onMouseDown={() => handleApplySearch(s.query)} style={{ flex: 1, background: "none", border: "none", cursor: "pointer", textAlign: "left", fontSize: "var(--font-sm)", color: "var(--text)" }}>
                         <div style={{ fontWeight: 600 }}>{s.name}</div>
                         <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{s.query}</div>
                       </button>
@@ -1237,6 +1594,10 @@ export default function PatientList({
                     </div>
                   ))}
                 </>
+              ) : (
+                <div style={{ padding: "8px 12px", fontSize: "var(--font-xs)", color: "var(--muted)" }}>
+                  No saved searches yet — type a search and click the bookmark icon to save one.
+                </div>
               )}
               <div style={{ padding: "8px 12px 4px", fontSize: "var(--font-2xs)", fontWeight: 700, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.07em" }}>
                 Smart Search
@@ -1566,7 +1927,12 @@ export default function PatientList({
             <i className="ti ti-printer" style={{ fontSize: 14 }} />
             <span className="desktop-only">Print</span>
           </button>
-          <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)" }} onClick={() => exportPatientsToCSV(filtered)}>
+          <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)" }} onClick={() => {
+            if (filtered.length === 0) { showFeedback("No patients match the current filters", "error"); return; }
+            exportPatientsToCSV(filtered);
+            logAuditTrail(`Exported ${filtered.length} filtered patient${filtered.length !== 1 ? "s" : ""}`, "bulk", "multiple");
+            showFeedback(`Exported ${filtered.length} patient${filtered.length !== 1 ? "s" : ""}`, "success");
+          }}>
             <i className="ti ti-download" style={{ fontSize: 14 }} />
             <span className="desktop-only">Export</span>
           </button>
@@ -1703,11 +2069,19 @@ export default function PatientList({
       {selectedPatients.size > 0 && (
         <div style={{
           background: "var(--accent-soft)", borderBottom: "1px solid var(--accent-border)",
-          padding: "8px 16px", display: "flex", alignItems: "center", gap: 12, flexShrink: 0,
+          padding: "8px 16px", display: "flex", alignItems: "center", gap: 12, flexShrink: 0, flexWrap: "wrap",
         }}>
           <span style={{ fontSize: "var(--font-sm)", color: "var(--accent)", fontWeight: 600 }}>
             {selectedPatients.size} patient{selectedPatients.size !== 1 ? "s" : ""} selected
           </span>
+          {selectedPatients.size < filtered.length && (
+            <button className="btn btn-ghost" onClick={selectAllFiltered} style={{ fontSize: "var(--font-sm)" }}>
+              Select all filtered ({filtered.length})
+            </button>
+          )}
+          <button className="btn btn-ghost" onClick={clearSelection} style={{ fontSize: "var(--font-sm)" }}>
+            Clear selection
+          </button>
           {selectedPatients.size >= 2 && selectedPatients.size <= 3 && (
             <button className="btn btn-ghost" onClick={handleCompare} style={{ fontSize: "var(--font-sm)" }}>
               <i className="ti ti-layout-columns" style={{ fontSize: 14 }} />
@@ -1730,7 +2104,13 @@ export default function PatientList({
             <i className="ti ti-download" style={{ fontSize: 14 }} />
             Export Selected
           </button>
-          <button className="btn btn-ghost" onClick={handleBulkDelete} style={{ fontSize: "var(--font-sm)", color: "var(--red)" }}>
+          <button
+            className="btn btn-ghost"
+            onClick={handleBulkDelete}
+            disabled={!isAdmin}
+            title={!isAdmin ? "You do not have permission for this action in the current role." : "Delete selected patients"}
+            style={{ fontSize: "var(--font-sm)", color: "var(--red)", opacity: !isAdmin ? 0.5 : 1, cursor: !isAdmin ? "not-allowed" : "pointer" }}
+          >
             <i className="ti ti-trash" style={{ fontSize: 14 }} />
             Delete Selected
           </button>
@@ -1933,7 +2313,7 @@ export default function PatientList({
           justifyContent: "space-between", flexShrink: 0, flexWrap: "wrap", gap: 8,
         }}>
           <span style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>
-            Page {page} of {totalPages} · {filtered.length} records
+            Showing {Math.min((page - 1) * PAGE_SIZE + 1, filtered.length)}-{Math.min(page * PAGE_SIZE, filtered.length)} of {filtered.length} · Page {page} of {totalPages}
           </span>
           <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
             <button className="btn btn-ghost" style={{ padding: "5px 10px", fontSize: "var(--font-sm)" }}
@@ -1974,6 +2354,9 @@ export default function PatientList({
       {comparisonMode && (
         <PatientComparisonModal
           patients={comparisonPatients}
+          onOpenPatient={(p) => { onSelect(p); setComparisonMode(false); }}
+          onRemovePatient={(id) => setSelectedPatients(prev => { const next = new Set(prev); next.delete(id); return next; })}
+          onClear={() => { clearSelection(); setComparisonMode(false); }}
           onClose={closeComparison}
         />
       )}
@@ -2116,6 +2499,11 @@ export default function PatientList({
                   {DOCTORS.map((d) => <option key={d} value={d}>{d}</option>)}
                 </select>
               </div>
+              {bulkDoctorTarget && (
+                <div style={{ marginBottom: 12, padding: 10, background: "var(--surface2)", borderRadius: "var(--radius-sm)", fontSize: "var(--font-xs)" }}>
+                  This will assign <strong>{bulkDoctorTarget}</strong> to <strong>{selectedPatients.size}</strong> patient{selectedPatients.size !== 1 ? "s" : ""}.
+                </div>
+              )}
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
                 <button className="btn btn-ghost" onClick={() => setShowBulkDoctorModal(false)}>Cancel</button>
                 <button className="btn btn-primary" onClick={handleBulkDoctorUpdate} disabled={!bulkDoctorTarget}>Assign Doctor</button>
@@ -2148,6 +2536,11 @@ export default function PatientList({
                   {STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
                 </select>
               </div>
+              {bulkStatusTarget && (
+                <div style={{ marginBottom: 12, padding: 10, background: "var(--surface2)", borderRadius: "var(--radius-sm)", fontSize: "var(--font-xs)" }}>
+                  This will change <strong>{selectedPatients.size}</strong> patient{selectedPatients.size !== 1 ? "s" : ""} to status <strong>{bulkStatusTarget}</strong>.
+                </div>
+              )}
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
                 <button className="btn btn-ghost" onClick={() => setShowBulkStatusModal(false)}>Cancel</button>
                 <button className="btn btn-primary" onClick={handleBulkStatusUpdate} disabled={!bulkStatusTarget}>Update Status</button>
@@ -2418,10 +2811,14 @@ export default function PatientList({
               </p>
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-              {duplicateGroups.map((group, groupIndex) => (
-                <div key={groupIndex} style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 16 }}>
-                  <div style={{ marginBottom: 12, fontWeight: 600, color: "var(--text)" }}>
-                    Group {groupIndex + 1} ({group.length} patients)
+              {duplicateGroups.map((group, groupIndex) => {
+                const groupKey = group.map(p => p.id).join("-");
+                const reviewed = reviewedDuplicates.has(groupKey);
+                return (
+                <div key={groupIndex} style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 16, opacity: reviewed ? 0.6 : 1 }}>
+                  <div style={{ marginBottom: 12, fontWeight: 600, color: "var(--text)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span>Group {groupIndex + 1} ({group.length} patients) — matched by {group[0]?.phone && group[1]?.phone === group[0]?.phone ? "phone" : group[0]?.email && group[1]?.email === group[0]?.email ? "email" : "name"}</span>
+                    {reviewed && <span className="badge" style={{ background: "var(--green-bg)", color: "var(--green)" }}>Reviewed</span>}
                   </div>
                   <div style={{ display: "grid", gap: 12 }}>
                     {group.map((patient) => (
@@ -2446,23 +2843,40 @@ export default function PatientList({
                             ID: {patient.id} · Phone: {patient.phone || "N/A"} · Email: {patient.email || "N/A"}
                           </div>
                         </label>
-                        <span className="badge" style={{ background: "var(--blue-bg)", color: "var(--blue)" }}>
-                          Keep
-                        </span>
+                        <button
+                          className="btn btn-ghost"
+                          style={{ fontSize: "var(--font-xs)" }}
+                          onClick={() => { onSelect(patient); setShowDuplicateModal(false); }}
+                        >
+                          View patient
+                        </button>
                       </div>
                     ))}
                   </div>
-                  <button
-                    className="btn btn-primary"
-                    style={{ marginTop: 12, width: "100%" }}
-                    onClick={() => {
-                      showFeedback("Merge requires manual review in the patient profile", "info");
-                    }}
-                  >
-                    Merge Selected Records
-                  </button>
+                  <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                    <button
+                      className="btn btn-ghost"
+                      style={{ flex: 1 }}
+                      onClick={() => {
+                        setReviewedDuplicates(prev => new Set(prev).add(groupKey));
+                        showFeedback("Marked as reviewed", "success");
+                      }}
+                      disabled={reviewed}
+                    >
+                      Mark as reviewed
+                    </button>
+                    <button
+                      className="btn btn-primary"
+                      style={{ flex: 1 }}
+                      onClick={() => {
+                        showFeedback("Merge requires parent-level patient update support.", "info");
+                      }}
+                    >
+                      Merge Selected Records
+                    </button>
+                  </div>
                 </div>
-              ))}
+              );})}
             </div>
             <div style={{ marginTop: 16, display: "flex", justifyContent: "flex-end", gap: 8 }}>
               <button className="btn btn-ghost" onClick={() => setShowDuplicateModal(false)}>Close</button>
@@ -2501,16 +2915,44 @@ export default function PatientList({
       {/* Import Modal */}
       {showImportModal && (
         <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}>
-          <div style={{ background: "var(--surface)", borderRadius: "var(--radius)", padding: 24, width: "100%", maxWidth: 600 }}>
+          <div style={{ background: "var(--surface)", borderRadius: "var(--radius)", padding: 24, width: "100%", maxWidth: 600, position: "relative" }}>
             <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0, marginBottom: 16 }}>Import Patients</h2>
-            <button onClick={() => setShowImportModal(false)} style={{ position: "absolute", top: 16, right: 16, background: "none", border: "none", fontSize: "1.5rem", cursor: "pointer" }}>×</button>
-            <div style={{ marginBottom: 16 }}>
+            <button onClick={() => { setShowImportModal(false); setImportText(""); setImportResult(null); }} style={{ position: "absolute", top: 16, right: 16, background: "none", border: "none", fontSize: "1.5rem", cursor: "pointer" }}>×</button>
+            <div style={{ marginBottom: 12 }}>
               <label style={{ display: "block", marginBottom: 8, fontSize: "var(--font-sm)", fontWeight: 600 }}>Upload CSV File</label>
-              <input type="file" accept=".csv" style={{ width: "100%", padding: 8, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }} />
+              <input
+                type="file"
+                accept=".csv"
+                style={{ width: "100%", padding: 8, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }}
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  const reader = new FileReader();
+                  reader.onload = () => setImportText(String(reader.result || ""));
+                  reader.readAsText(file);
+                }}
+              />
             </div>
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ display: "block", marginBottom: 8, fontSize: "var(--font-sm)", fontWeight: 600 }}>Or paste CSV text</label>
+              <textarea
+                value={importText}
+                onChange={(e) => setImportText(e.target.value)}
+                placeholder="name,phone,email,doctor,status&#10;John Doe,555-0100,john@example.com,Dr. Smith,Active"
+                style={{ width: "100%", minHeight: 120, padding: 8, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", fontFamily: "monospace", fontSize: "var(--font-xs)" }}
+              />
+              <div style={{ fontSize: "var(--font-2xs)", color: "var(--muted)", marginTop: 4 }}>
+                Supported columns: firstName, lastName, name, phone, email, dob, gender, doctor, status. Existing patients are matched by id, then phone+name, then email and updated.
+              </div>
+            </div>
+            {importResult && (
+              <div style={{ marginBottom: 16, padding: 10, background: "var(--surface2)", borderRadius: "var(--radius-sm)", fontSize: "var(--font-xs)" }}>
+                Updated {importResult.matched} · Could not create {importResult.newRows} new · Skipped {importResult.skipped} duplicate/unmatched rows
+              </div>
+            )}
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
-              <button className="btn btn-ghost" onClick={() => setShowImportModal(false)}>Cancel</button>
-              <button className="btn btn-primary" onClick={() => { setShowImportModal(false); }}>Import</button>
+              <button className="btn btn-ghost" onClick={() => { setShowImportModal(false); setImportText(""); setImportResult(null); }}>Close</button>
+              <button className="btn btn-primary" onClick={handleImport}>Import</button>
             </div>
           </div>
         </div>
@@ -2523,16 +2965,45 @@ export default function PatientList({
             <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0, marginBottom: 16 }}>Export Patients</h2>
             <button onClick={() => setShowExportModal(false)} style={{ position: "absolute", top: 16, right: 16, background: "none", border: "none", fontSize: "1.5rem", cursor: "pointer" }}>×</button>
             <div style={{ marginBottom: 16 }}>
+              <label style={{ display: "block", marginBottom: 8, fontSize: "var(--font-sm)", fontWeight: 600 }}>Scope</label>
+              <div style={{ display: "flex", gap: 12 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "var(--font-sm)" }}>
+                  <input type="radio" checked={exportScope === "filtered"} onChange={() => setExportScope("filtered")} />
+                  Filtered patients ({filtered.length})
+                </label>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "var(--font-sm)" }}>
+                  <input type="radio" checked={exportScope === "selected"} onChange={() => setExportScope("selected")} />
+                  Selected patients ({selectedPatients.size})
+                </label>
+              </div>
+            </div>
+            <div style={{ marginBottom: 16 }}>
               <label style={{ display: "block", marginBottom: 8, fontSize: "var(--font-sm)", fontWeight: 600 }}>Export Format</label>
-              <select style={{ width: "100%", padding: 8, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }}>
-                <option>CSV</option>
-                <option>JSON</option>
-                <option>Excel</option>
+              <select
+                value={exportFormat}
+                onChange={(e) => setExportFormat(e.target.value as any)}
+                style={{ width: "100%", padding: 8, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }}
+              >
+                <option value="csv">CSV</option>
+                <option value="json">Detailed JSON</option>
+                <option value="contacts">Contact List CSV (name, phone, email, doctor, follow-up)</option>
               </select>
             </div>
+            {exportFormat === "csv" && (
+              <div style={{ marginBottom: 16 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "var(--font-sm)" }}>
+                  <input
+                    type="checkbox"
+                    checked={exportVisibleColumnsOnly}
+                    onChange={(e) => setExportVisibleColumnsOnly(e.target.checked)}
+                  />
+                  Export visible columns only ({selectedColumns.size} selected)
+                </label>
+              </div>
+            )}
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
               <button className="btn btn-ghost" onClick={() => setShowExportModal(false)}>Cancel</button>
-              <button className="btn btn-primary" onClick={() => { exportPatientsToCSV(filtered); setShowExportModal(false); }}>Export</button>
+              <button className="btn btn-primary" onClick={handleExport}>Export</button>
             </div>
           </div>
         </div>
@@ -2544,7 +3015,43 @@ export default function PatientList({
           reminders={reminders}
           onClose={() => setShowReminders(false)}
           onToggleComplete={handleToggleReminder}
+          onDelete={handleDeleteReminder}
         />
+      )}
+
+      {/* Add Reminder Modal */}
+      {showAddReminderModal && reminderPatient && (
+        <div className="modal-backdrop" onClick={() => setShowAddReminderModal(false)}>
+          <div className="modal" style={{ maxWidth: 420 }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Set Reminder</h2>
+              <button className="btn-icon" onClick={() => setShowAddReminderModal(false)}><i className="ti ti-x" style={{ fontSize: 16 }} /></button>
+            </div>
+            <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)", marginBottom: 12 }}>Patient: {reminderPatient.name}</div>
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ display: "block", marginBottom: 6, fontSize: "var(--font-sm)", fontWeight: 600 }}>Type</label>
+              <select value={reminderType} onChange={(e) => setReminderType(e.target.value)} style={{ width: "100%", padding: 8, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }}>
+                <option value="follow-up">Follow-up</option>
+                <option value="medication">Medication</option>
+                <option value="appointment">Appointment</option>
+                <option value="call">Call back</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ display: "block", marginBottom: 6, fontSize: "var(--font-sm)", fontWeight: 600 }}>Date</label>
+              <input type="date" value={reminderDate} onChange={(e) => setReminderDate(e.target.value)} style={{ width: "100%", padding: 8, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }} />
+            </div>
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ display: "block", marginBottom: 6, fontSize: "var(--font-sm)", fontWeight: 600 }}>Notes</label>
+              <textarea value={reminderNotes} onChange={(e) => setReminderNotes(e.target.value)} style={{ width: "100%", minHeight: 70, padding: 8, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }} />
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button className="btn btn-ghost" onClick={() => setShowAddReminderModal(false)}>Cancel</button>
+              <button className="btn btn-primary" onClick={handleAddReminder}>Save Reminder</button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Onboarding Checklist Modal */}
@@ -2553,9 +3060,30 @@ export default function PatientList({
           <div className="modal" style={{ maxWidth: 500, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Patient Onboarding Checklist</h2>
-              <button className="btn-icon" onClick={() => setShowOnboardingChecklist(false)}>
-                <i className="ti ti-x" style={{ fontSize: 20 }} />
-              </button>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  className="btn btn-ghost"
+                  style={{ fontSize: "var(--font-xs)" }}
+                  onClick={() => {
+                    if (!requireAdmin()) return;
+                    setConfirmModal({
+                      title: "Reset Checklist",
+                      message: "Reset all onboarding tasks to incomplete? This cannot be undone.",
+                      confirmLabel: "Reset",
+                      danger: true,
+                      onConfirm: () => {
+                        setOnboardingTasks(prev => prev.map(t => ({ ...t, completed: false })));
+                        showFeedback("Checklist reset", "success");
+                      },
+                    });
+                  }}
+                >
+                  Reset
+                </button>
+                <button className="btn-icon" onClick={() => setShowOnboardingChecklist(false)}>
+                  <i className="ti ti-x" style={{ fontSize: 20 }} />
+                </button>
+              </div>
             </div>
             
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -2616,9 +3144,42 @@ export default function PatientList({
           <div className="modal" style={{ maxWidth: 600, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
               <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0 }}>Audit Trail</h2>
-              <button className="btn-icon" onClick={() => setShowAuditTrail(false)}>
-                <i className="ti ti-x" style={{ fontSize: 20 }} />
-              </button>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  className="btn btn-ghost"
+                  style={{ fontSize: "var(--font-xs)" }}
+                  onClick={() => {
+                    if (auditTrail.length === 0) { showFeedback("No audit entries to export", "error"); return; }
+                    const csv = buildCSV(["timestamp", "action", "patientId", "patientName", "user"], auditTrail as any);
+                    downloadFile(csv, `audit_trail_${new Date().toISOString().split("T")[0]}.csv`, "text/csv");
+                    showFeedback("Audit trail exported", "success");
+                  }}
+                >
+                  Export CSV
+                </button>
+                <button
+                  className="btn btn-ghost"
+                  style={{ fontSize: "var(--font-xs)" }}
+                  onClick={() => {
+                    if (!requireAdmin()) return;
+                    setConfirmModal({
+                      title: "Clear Audit Trail",
+                      message: "Delete all audit trail entries? This cannot be undone.",
+                      confirmLabel: "Clear",
+                      danger: true,
+                      onConfirm: () => {
+                        setAuditTrail([]);
+                        showFeedback("Audit trail cleared", "success");
+                      },
+                    });
+                  }}
+                >
+                  Clear
+                </button>
+                <button className="btn-icon" onClick={() => setShowAuditTrail(false)}>
+                  <i className="ti ti-x" style={{ fontSize: 20 }} />
+                </button>
+              </div>
             </div>
             
             {auditTrail.length === 0 ? (
@@ -2881,7 +3442,13 @@ export default function PatientList({
               </div>
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 16 }}>
                 <button className="btn btn-ghost" onClick={() => setShowExportOptions(false)}>Cancel</button>
-                <button className="btn btn-primary" onClick={() => { exportPatientsToCSV(filtered); showFeedback("Export started", "success"); setShowExportOptions(false); }}>Export</button>
+                <button className="btn btn-primary" onClick={() => {
+                  if (filtered.length === 0) { showFeedback("No patients match the current filters", "error"); return; }
+                  exportPatientsToCSV(filtered);
+                  logAuditTrail(`Exported ${filtered.length} filtered patient${filtered.length !== 1 ? "s" : ""}`, "bulk", "multiple");
+                  showFeedback("Export started", "success");
+                  setShowExportOptions(false);
+                }}>Export</button>
               </div>
             </div>
           </div>
@@ -3519,7 +4086,13 @@ export default function PatientList({
               </div>
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 16 }}>
                 <button className="btn btn-ghost" onClick={() => setShowExportTimeline(false)}>Cancel</button>
-                <button className="btn btn-primary" onClick={() => { exportPatientsToCSV(filtered); showFeedback("Timeline exported", "success"); setShowExportTimeline(false); }}>Export</button>
+                <button className="btn btn-primary" onClick={() => {
+                  if (filtered.length === 0) { showFeedback("No patients match the current filters", "error"); return; }
+                  exportPatientsToCSV(filtered);
+                  logAuditTrail(`Exported ${filtered.length} filtered patient${filtered.length !== 1 ? "s" : ""}`, "bulk", "multiple");
+                  showFeedback("Timeline exported", "success");
+                  setShowExportTimeline(false);
+                }}>Export</button>
               </div>
             </div>
           </div>
@@ -4182,9 +4755,15 @@ export default function PatientList({
                 <input type="text" value={bulkTagValue} onChange={(e) => setBulkTagValue(e.target.value)} placeholder="Enter tag name..." list="bulk-tag-suggestions" style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)" }} />
                 <datalist id="bulk-tag-suggestions">{allTags.map(t => <option key={t} value={t} />)}</datalist>
               </div>
+              {bulkTagValue.trim() && (
+                <div style={{ padding: 10, background: "var(--surface2)", borderRadius: "var(--radius-sm)", fontSize: "var(--font-xs)" }}>
+                  This will add tag <strong>{bulkTagValue.trim()}</strong> to up to <strong>{selectedPatients.size}</strong> patient{selectedPatients.size !== 1 ? "s" : ""}.
+                </div>
+              )}
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
                 <button className="btn btn-ghost" onClick={() => { setShowBulkTagModal(false); setBulkTagValue(""); }}>Cancel</button>
                 <button className="btn btn-primary" disabled={!bulkTagValue.trim()} onClick={() => {
+                  if (selectedPatients.size === 0) { showFeedback("Select at least one patient first", "error"); return; }
                   if (!onUpdatePatient) { showFeedback("Update not available", "error"); return; }
                   const tag = bulkTagValue.trim();
                   let count = 0;
@@ -4239,9 +4818,15 @@ export default function PatientList({
                 <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Reason / Notes</label>
                 <textarea value={bulkScheduleReason} onChange={(e) => setBulkScheduleReason(e.target.value)} placeholder="Optional..." rows={2} style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)", resize: "vertical" }} />
               </div>
+              {bulkScheduleDate && bulkScheduleTime && (
+                <div style={{ padding: 10, background: "var(--surface2)", borderRadius: "var(--radius-sm)", fontSize: "var(--font-xs)" }}>
+                  This will schedule <strong>{selectedPatients.size}</strong> patient{selectedPatients.size !== 1 ? "s" : ""} for <strong>{bulkScheduleDate} {bulkScheduleTime}</strong>{bulkScheduleDoctor ? ` with ${bulkScheduleDoctor}` : ""}.
+                </div>
+              )}
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
                 <button className="btn btn-ghost" onClick={() => { setShowBulkScheduleModal(false); setBulkScheduleError(""); }}>Cancel</button>
                 <button className="btn btn-primary" onClick={() => {
+                  if (selectedPatients.size === 0) { setBulkScheduleError("Select at least one patient first"); return; }
                   if (!bulkScheduleDate) { setBulkScheduleError("Date is required"); return; }
                   if (!bulkScheduleTime) { setBulkScheduleError("Time is required"); return; }
                   const dt = new Date(`${bulkScheduleDate}T${bulkScheduleTime}`);
@@ -4268,16 +4853,35 @@ export default function PatientList({
 
       {/* Confirm Modal (replaces window.confirm) */}
       {confirmModal && (
-        <div className="modal-backdrop" onClick={() => setConfirmModal(null)}>
+        <div className="modal-backdrop" onClick={() => { setConfirmModal(null); setConfirmTypedValue(""); }}>
           <div className="modal" style={{ maxWidth: 400 }} onClick={(e) => e.stopPropagation()}>
             <div style={{ padding: "16px 20px", borderBottom: "1px solid var(--border)" }}>
               <div style={{ fontWeight: 700, fontSize: "var(--font-md)" }}>{confirmModal.title}</div>
             </div>
             <div style={{ padding: 20 }}>
-              <div style={{ fontSize: "var(--font-sm)", color: "var(--text)", marginBottom: 20 }}>{confirmModal.message}</div>
+              <div style={{ fontSize: "var(--font-sm)", color: "var(--text)", marginBottom: confirmModal.requireTypedWord ? 12 : 20 }}>{confirmModal.message}</div>
+              {confirmModal.requireTypedWord && (
+                <div style={{ marginBottom: 20 }}>
+                  <label style={{ display: "block", fontSize: "var(--font-xs)", color: "var(--muted)", marginBottom: 6 }}>
+                    Type <strong>{confirmModal.requireTypedWord}</strong> to confirm
+                  </label>
+                  <input
+                    autoFocus
+                    type="text"
+                    value={confirmTypedValue}
+                    onChange={(e) => setConfirmTypedValue(e.target.value)}
+                    style={{ width: "100%", padding: 8, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }}
+                  />
+                </div>
+              )}
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-                <button className="btn btn-ghost" onClick={() => setConfirmModal(null)}>Cancel</button>
-                <button className="btn btn-primary" style={confirmModal.danger ? { background: "var(--red)", borderColor: "var(--red)" } : {}} onClick={() => { confirmModal.onConfirm(); setConfirmModal(null); }}>
+                <button className="btn btn-ghost" onClick={() => { setConfirmModal(null); setConfirmTypedValue(""); }}>Cancel</button>
+                <button
+                  className="btn btn-primary"
+                  style={confirmModal.danger ? { background: "var(--red)", borderColor: "var(--red)" } : {}}
+                  disabled={!!confirmModal.requireTypedWord && confirmTypedValue !== confirmModal.requireTypedWord}
+                  onClick={() => { confirmModal.onConfirm(); setConfirmModal(null); setConfirmTypedValue(""); }}
+                >
                   {confirmModal.confirmLabel || "Confirm"}
                 </button>
               </div>
@@ -5075,16 +5679,23 @@ function PatientRow({
   const idParts = getHighlightParts(p.id, searchQuery || "");
   const menuRef = React.useRef<HTMLDivElement>(null);
 
-  // Close menu when clicking outside
+  // Close menu when clicking outside or when the page scrolls
   React.useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
       if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
         closeQuickActions();
       }
     }
+    function handleScroll() {
+      closeQuickActions();
+    }
     if (quickActionsOpen) {
       document.addEventListener("mousedown", handleClickOutside);
-      return () => document.removeEventListener("mousedown", handleClickOutside);
+      window.addEventListener("scroll", handleScroll, true);
+      return () => {
+        document.removeEventListener("mousedown", handleClickOutside);
+        window.removeEventListener("scroll", handleScroll, true);
+      };
     }
   }, [quickActionsOpen, closeQuickActions]);
 
@@ -5382,6 +5993,28 @@ function PatientRow({
                 <i className="ti ti-tag" style={{ fontSize: 14, color: "var(--purple)" }} />
                 Manage Tags
               </button>
+              <button
+                onClick={() => onQuickAction("reminder")}
+                style={{
+                  width: "100%",
+                  padding: "8px 12px",
+                  background: "none",
+                  border: "none",
+                  borderRadius: "var(--radius-sm)",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  fontSize: "var(--font-sm)",
+                  color: "var(--text)",
+                  textAlign: "left",
+                }}
+                onMouseEnter={(e) => (e.currentTarget as HTMLElement).style.background = "var(--surface2)"}
+                onMouseLeave={(e) => (e.currentTarget as HTMLElement).style.background = "none"}
+              >
+                <i className="ti ti-bell" style={{ fontSize: 14, color: "var(--amber)" }} />
+                Set Reminder
+              </button>
             </div>
           )}
         </div>
@@ -5390,7 +6023,13 @@ function PatientRow({
   );
 }
 
-function PatientComparisonModal({ patients, onClose }: { patients: Patient[]; onClose: () => void }) {
+function PatientComparisonModal({ patients, onClose, onOpenPatient, onRemovePatient, onClear }: {
+  patients: Patient[];
+  onClose: () => void;
+  onOpenPatient: (p: Patient) => void;
+  onRemovePatient: (id: string) => void;
+  onClear: () => void;
+}) {
   const comparisonFields = [
     { key: "name", label: "Name" },
     { key: "age", label: "Age" },
@@ -5404,6 +6043,7 @@ function PatientComparisonModal({ patients, onClose }: { patients: Patient[]; on
     { key: "insuranceExpiry", label: "Insurance Expiry" },
     { key: "lastVisit", label: "Last Visit" },
     { key: "nextAppointment", label: "Next Appointment" },
+    { key: "followUpDate", label: "Follow-up" },
   ];
 
   return (
@@ -5414,7 +6054,10 @@ function PatientComparisonModal({ patients, onClose }: { patients: Patient[]; on
             <div style={{ fontWeight: 700, fontSize: "var(--font-md)" }}>Patient Comparison</div>
             <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>Comparing {patients.length} patients side-by-side</div>
           </div>
-          <button className="btn-icon" onClick={onClose}><i className="ti ti-x" style={{ fontSize: 16 }} /></button>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={onClear}>Clear comparison</button>
+            <button className="btn-icon" onClick={onClose}><i className="ti ti-x" style={{ fontSize: 16 }} /></button>
+          </div>
         </div>
         <div style={{ padding: 20 }}>
           <table className="tbl" style={{ width: "100%" }}>
@@ -5430,6 +6073,10 @@ function PatientComparisonModal({ patients, onClose }: { patients: Patient[]; on
                         <div style={{ fontSize: "var(--font-2xs)", color: "var(--muted)" }}>{p.id}</div>
                       </div>
                     </div>
+                    <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
+                      <button className="btn btn-ghost" style={{ fontSize: "var(--font-2xs)", padding: "2px 6px" }} onClick={() => onOpenPatient(p)}>Open</button>
+                      <button className="btn btn-ghost" style={{ fontSize: "var(--font-2xs)", padding: "2px 6px" }} onClick={() => onRemovePatient(p.id)}>Remove</button>
+                    </div>
                   </th>
                 ))}
               </tr>
@@ -5442,7 +6089,7 @@ function PatientComparisonModal({ patients, onClose }: { patients: Patient[]; on
                     <td key={p.id} style={{ fontSize: "var(--font-sm)" }}>
                       {field.key === "status" ? <StatusBadge status={p.status as any} /> :
                        field.key === "insuranceStatus" ? <InsuranceBadge status={p.insuranceStatus as any} /> :
-                       field.key === "insuranceExpiry" || field.key === "lastVisit" || field.key === "nextAppointment" ? fmtDate(p[field.key as keyof Patient] as string) :
+                       field.key === "insuranceExpiry" || field.key === "lastVisit" || field.key === "nextAppointment" || field.key === "followUpDate" ? fmtDate(p[field.key as keyof Patient] as string) :
                        (p[field.key as keyof Patient] as string) || "-"}
                     </td>
                   ))}
@@ -5475,10 +6122,11 @@ function PatientComparisonModal({ patients, onClose }: { patients: Patient[]; on
   );
 }
 
-function RemindersModal({ reminders, onClose, onToggleComplete }: { 
-  reminders: Array<{ id: string; patientId: string; patientName: string; type: string; date: string; completed: boolean }>;
+function RemindersModal({ reminders, onClose, onToggleComplete, onDelete }: { 
+  reminders: Array<{ id: string; patientId: string; patientName: string; type: string; date: string; completed: boolean; notes?: string }>;
   onClose: () => void;
   onToggleComplete: (id: string) => void;
+  onDelete: (id: string) => void;
 }) {
   const activeReminders = reminders.filter(r => !r.completed);
   const completedReminders = reminders.filter(r => r.completed);
@@ -5519,14 +6167,26 @@ function RemindersModal({ reminders, onClose, onToggleComplete }: {
                         <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>
                           {reminder.type === "follow-up" ? "Follow-up" : reminder.type} · {fmtDate(reminder.date)}
                         </div>
+                        {reminder.notes && (
+                          <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginTop: 4, fontStyle: "italic" }}>{reminder.notes}</div>
+                        )}
                       </div>
-                      <button
-                        className="btn-icon"
-                        onClick={() => onToggleComplete(reminder.id)}
-                        title="Mark as complete"
-                      >
-                        <i className="ti ti-check" style={{ fontSize: 16 }} />
-                      </button>
+                      <div style={{ display: "flex", gap: 4 }}>
+                        <button
+                          className="btn-icon"
+                          onClick={() => onToggleComplete(reminder.id)}
+                          title="Mark as complete"
+                        >
+                          <i className="ti ti-check" style={{ fontSize: 16 }} />
+                        </button>
+                        <button
+                          className="btn-icon"
+                          onClick={() => onDelete(reminder.id)}
+                          title="Delete reminder"
+                        >
+                          <i className="ti ti-trash" style={{ fontSize: 16 }} />
+                        </button>
+                      </div>
                     </div>
                   </div>
                 ))}
@@ -5553,13 +6213,22 @@ function RemindersModal({ reminders, onClose, onToggleComplete }: {
                           {reminder.type === "follow-up" ? "Follow-up" : reminder.type} · {fmtDate(reminder.date)}
                         </div>
                       </div>
-                      <button
-                        className="btn-icon"
-                        onClick={() => onToggleComplete(reminder.id)}
-                        title="Mark as incomplete"
-                      >
-                        <i className="ti ti-refresh" style={{ fontSize: 16 }} />
-                      </button>
+                      <div style={{ display: "flex", gap: 4 }}>
+                        <button
+                          className="btn-icon"
+                          onClick={() => onToggleComplete(reminder.id)}
+                          title="Mark as incomplete"
+                        >
+                          <i className="ti ti-refresh" style={{ fontSize: 16 }} />
+                        </button>
+                        <button
+                          className="btn-icon"
+                          onClick={() => onDelete(reminder.id)}
+                          title="Delete reminder"
+                        >
+                          <i className="ti ti-trash" style={{ fontSize: 16 }} />
+                        </button>
+                      </div>
                     </div>
                   </div>
                 ))}
