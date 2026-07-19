@@ -1,5 +1,8 @@
 // LocalStorage-based API Client (Frontend-only mode, hybrid-ready)
 
+// ── Audit logging (Phase 2B) ──────────────────────────────────────────────────
+import { logAction,logAccess,logModification,logExport,logDeletion,safeAudit } from "../shared/services/auditLogger";
+
 // ── Storage key constants ──────────────────────────────────────────────────
 const STORAGE_KEY        = "clinic_crm_patients_v1";
 const AUDIT_KEY          = "clinic_crm_audit_v1";
@@ -101,12 +104,30 @@ class ApiClient {
   // Patients
   async getPatients(limit = 20, offset = 0): Promise<any[]> {
     const patients = this.getPatientsInternal();
+    // Log only on first page load to avoid spam (offset === 0)
+    if (offset === 0) {
+      safeAudit(() => {
+        logAccess({
+          resourceType: "patient",
+          details: "Patient list accessed",
+        });
+      });
+    }
     return patients.slice(offset, offset + limit);
   }
 
   async getPatient(id: string): Promise<any> {
     const patients = this.getPatientsInternal();
-    return patients.find((p: any) => p.id === id) || null;
+    const patient = patients.find((p: any) => p.id === id) || null;
+    safeAudit(() => {
+      logAccess({
+        resourceType: "patient",
+        resourceId: id,
+        resourceLabel: patient?.name || id,
+        details: "Patient profile viewed",
+      });
+    });
+    return patient;
   }
 
   async createPatient(patient: any): Promise<any> {
@@ -114,6 +135,16 @@ class ApiClient {
     const newPatient = { ...patient, id: `CLN-${Date.now()}`, createdAt: new Date().toISOString() };
     patients.unshift(newPatient);
     this.setPatients(patients);
+    safeAudit(() => {
+      logAction({
+        action: "create",
+        resourceType: "patient",
+        resourceId: newPatient.id,
+        resourceLabel: newPatient.id,
+        details: "Patient created",
+        success: true,
+      });
+    });
     return newPatient;
   }
 
@@ -123,15 +154,105 @@ class ApiClient {
     if (index !== -1) {
       patients[index] = { ...patients[index], ...patient, updatedAt: new Date().toISOString() };
       this.setPatients(patients);
+      safeAudit(() => {
+        logModification({
+          resourceType: "patient",
+          resourceId: id,
+          resourceLabel: id,
+          details: "Patient updated",
+          success: true,
+        });
+      });
       return patients[index];
     }
+    safeAudit(() => {
+      logAction({
+        action: "update",
+        resourceType: "patient",
+        resourceId: id,
+        details: "Patient update failed - not found",
+        success: false,
+        errorMessage: "Patient not found",
+      });
+    });
     throw new Error("Patient not found");
   }
 
-  async deletePatient(id: string) {
+  async deletePatient(id: string, actor?: string, reason?: string) {
     let patients = this.getPatientsInternal();
-    patients = patients.filter((p: any) => p.id !== id);
+    const index = patients.findIndex((p: any) => p.id === id);
+    
+    if (index === -1) {
+      throw new Error("Patient not found");
+    }
+
+    // Save status before archive for restore (Phase 7C)
+    const previousStatus = patients[index].status;
+
+    // Soft delete: mark as deleted instead of removing from storage
+    patients[index] = {
+      ...patients[index],
+      deletedAt: new Date().toISOString(),
+      deletedBy: actor || "unknown",
+      deleteReason: reason || "Deleted via patient management",
+      status: "Archived",
+      statusBeforeArchive: previousStatus,
+      updatedAt: new Date().toISOString(),
+    };
+    
     this.setPatients(patients);
+    
+    safeAudit(() => {
+      logAction({
+        action: "soft_delete",
+        resourceType: "patient",
+        resourceId: id,
+        details: `Patient soft-deleted by ${actor || "unknown"}` + (reason ? `: ${reason}` : ""),
+        success: true,
+      });
+    });
+    
+    return { success: true };
+  }
+
+  async restorePatient(id: string, actor?: string) {
+    let patients = this.getPatientsInternal();
+    const index = patients.findIndex((p: any) => p.id === id);
+    
+    if (index === -1) {
+      throw new Error("Patient not found");
+    }
+
+    const patient = patients[index];
+    const previousStatus = patient.statusBeforeArchive || "Active";
+
+    // Restore: clear deleted metadata and restore status
+    patients[index] = {
+      ...patient,
+      deletedAt: undefined,
+      deletedBy: undefined,
+      deleteReason: undefined,
+      archivedAt: undefined,
+      archivedBy: undefined,
+      archiveReason: undefined,
+      restoredAt: new Date().toISOString(),
+      restoredBy: actor || "unknown",
+      status: previousStatus,
+      updatedAt: new Date().toISOString(),
+    };
+    
+    this.setPatients(patients);
+    
+    safeAudit(() => {
+      logAction({
+        action: "restore",
+        resourceType: "patient",
+        resourceId: id,
+        details: `Patient record restored by ${actor || "unknown"}`,
+        success: true,
+      });
+    });
+    
     return { success: true };
   }
 
@@ -154,6 +275,14 @@ class ApiClient {
     }));
     const allPatients = [...imported, ...existingPatients];
     this.setPatients(allPatients);
+    safeAudit(() => {
+      logAction({
+        action: "import",
+        resourceType: "patient",
+        details: `Imported ${imported.length} patients`,
+        success: true,
+      });
+    });
     return { imported: imported.length, errors: [] };
   }
 
@@ -202,6 +331,15 @@ class ApiClient {
     const newAppointment = { ...appointment, id: `apt-${Date.now()}`, createdAt: new Date().toISOString() };
     appointments.push(newAppointment);
     this.setStorageData(KEY_APPOINTMENTS, appointments);
+    safeAudit(() => {
+      logAction({
+        action: "create",
+        resourceType: "appointment",
+        resourceId: newAppointment.id,
+        details: "Appointment booked",
+        success: true,
+      });
+    });
     return { success: true, appointment: newAppointment };
   }
 
@@ -219,6 +357,14 @@ class ApiClient {
     if (index !== -1) {
       appointments[index] = { ...appointments[index], ...appointment, updatedAt: new Date().toISOString() };
       this.setStorageData(KEY_APPOINTMENTS, appointments);
+      safeAudit(() => {
+        logModification({
+          resourceType: "appointment",
+          resourceId: appointmentId,
+          details: "Appointment updated",
+          success: true,
+        });
+      });
       return { success: true, appointment: appointments[index] };
     }
     return { success: false, error: 'Appointment not found' };
@@ -231,6 +377,15 @@ class ApiClient {
       appointments[index].status = 'cancelled';
       appointments[index].cancelledAt = new Date().toISOString();
       this.setStorageData(KEY_APPOINTMENTS, appointments);
+      safeAudit(() => {
+        logAction({
+          action: "update",
+          resourceType: "appointment",
+          resourceId: appointmentId,
+          details: "Appointment cancelled",
+          success: true,
+        });
+      });
       return { success: true };
     }
     return { success: false, error: 'Appointment not found' };
@@ -241,6 +396,15 @@ class ApiClient {
     const newConsultation = { ...consultation, id: `con-${Date.now()}`, createdAt: new Date().toISOString(), status: 'in_progress' };
     consultations.push(newConsultation);
     this.setStorageData(KEY_CONSULTATIONS, consultations);
+    safeAudit(() => {
+      logAction({
+        action: "create",
+        resourceType: "consultation",
+        resourceId: newConsultation.id,
+        details: "Consultation started",
+        success: true,
+      });
+    });
     return { success: true, consultation: newConsultation };
   }
 
@@ -258,6 +422,14 @@ class ApiClient {
     if (index !== -1) {
       consultations[index] = { ...consultations[index], ...consultation, updatedAt: new Date().toISOString() };
       this.setStorageData(KEY_CONSULTATIONS, consultations);
+      safeAudit(() => {
+        logModification({
+          resourceType: "consultation",
+          resourceId: consultationId,
+          details: "Consultation updated",
+          success: true,
+        });
+      });
       return { success: true, consultation: consultations[index] };
     }
     return { success: false, error: 'Consultation not found' };
@@ -270,6 +442,15 @@ class ApiClient {
       consultations[index].status = 'completed';
       consultations[index].completedAt = new Date().toISOString();
       this.setStorageData(KEY_CONSULTATIONS, consultations);
+      safeAudit(() => {
+        logAction({
+          action: "update",
+          resourceType: "consultation",
+          resourceId: consultationId,
+          details: "Consultation completed",
+          success: true,
+        });
+      });
       return { success: true };
     }
     return { success: false, error: 'Consultation not found' };
@@ -285,6 +466,14 @@ class ApiClient {
     }));
     const allPrescriptions = [...newPrescriptions, ...existingPrescriptions];
     this.setStorageData(KEY_PRESCRIPTIONS, allPrescriptions);
+    safeAudit(() => {
+      logAction({
+        action: "create",
+        resourceType: "prescription",
+        details: `Created ${newPrescriptions.length} prescriptions`,
+        success: true,
+      });
+    });
     return { success: true, prescriptions: newPrescriptions };
   }
 
@@ -302,6 +491,14 @@ class ApiClient {
     if (index !== -1) {
       prescriptions[index] = { ...prescriptions[index], ...prescription, updatedAt: new Date().toISOString() };
       this.setStorageData(KEY_PRESCRIPTIONS, prescriptions);
+      safeAudit(() => {
+        logModification({
+          resourceType: "prescription",
+          resourceId: prescriptionId,
+          details: "Prescription updated",
+          success: true,
+        });
+      });
       return { success: true, prescription: prescriptions[index] };
     }
     return { success: false, error: 'Prescription not found' };
@@ -314,6 +511,15 @@ class ApiClient {
       prescriptions[index].status = 'dispensed';
       prescriptions[index].dispensedAt = new Date().toISOString();
       this.setStorageData(KEY_PRESCRIPTIONS, prescriptions);
+      safeAudit(() => {
+        logAction({
+          action: "update",
+          resourceType: "prescription",
+          resourceId: prescriptionId,
+          details: "Prescription dispensed",
+          success: true,
+        });
+      });
       return { success: true };
     }
     return { success: false, error: 'Prescription not found' };
@@ -332,6 +538,14 @@ class ApiClient {
     }));
     const allDocuments = [...newDocuments, ...documents];
     this.setStorageData(KEY_DOCUMENTS, allDocuments);
+    safeAudit(() => {
+      logAction({
+        action: "file_upload",
+        resourceType: "document",
+        details: `Uploaded ${newDocuments.length} documents`,
+        success: true,
+      });
+    });
     return { success: true, documents: newDocuments };
   }
 
@@ -347,15 +561,50 @@ class ApiClient {
     const documents = this.getStorageData(KEY_DOCUMENTS);
     const doc = documents.find((d: any) => d.id === documentId);
     if (doc) {
-      return new Blob([JSON.stringify(doc)], { type: 'application/json' });
+      // Phase 8J: Return sanitized document metadata (PHI-safe)
+      const sanitizedMetadata = {
+        id: doc.id,
+        patientId: doc.patientId,
+        type: doc.type,
+        name: doc.name,
+        uploadDate: doc.uploadDate,
+        expiryDate: doc.expiryDate,
+        signed: doc.signed,
+        signedDate: doc.signedDate,
+        signedBy: doc.signedBy,
+        renewedDate: doc.renewedDate,
+        renewedBy: doc.renewedBy,
+        // Explicitly exclude: patientName, phone, email, dob, address, document content
+      };
+      safeAudit(() => {
+        logAction({
+          action: "file_download",
+          resourceType: "document",
+          resourceId: documentId,
+          resourceLabel: doc.id, // Use ID instead of name for PHI-safe audit
+          details: "Document metadata downloaded",
+          success: true,
+        });
+      });
+      return new Blob([JSON.stringify(sanitizedMetadata)], { type: 'application/json' });
     }
     return new Blob();
   }
 
   async deleteDocument(documentId: string) {
     const documents = this.getStorageData(KEY_DOCUMENTS);
+    const doc = documents.find((d: any) => d.id === documentId);
     const filtered = documents.filter((d: any) => d.id !== documentId);
     this.setStorageData(KEY_DOCUMENTS, filtered);
+    safeAudit(() => {
+      logDeletion({
+        resourceType: "document",
+        resourceId: documentId,
+        resourceLabel: doc?.name,
+        details: "Document deleted",
+        success: true,
+      });
+    });
     return { success: true };
   }
 
@@ -364,6 +613,15 @@ class ApiClient {
     const newInvoice = { ...invoice, id: `inv-${Date.now()}`, createdAt: new Date().toISOString(), status: 'pending' };
     invoices.push(newInvoice);
     this.setStorageData(KEY_INVOICES, invoices);
+    safeAudit(() => {
+      logAction({
+        action: "create",
+        resourceType: "billing",
+        resourceId: newInvoice.id,
+        details: "Invoice created",
+        success: true,
+      });
+    });
     return { success: true, invoice: newInvoice };
   }
 
@@ -381,6 +639,14 @@ class ApiClient {
     if (index !== -1) {
       invoices[index] = { ...invoices[index], ...invoice, updatedAt: new Date().toISOString() };
       this.setStorageData(KEY_INVOICES, invoices);
+      safeAudit(() => {
+        logModification({
+          resourceType: "billing",
+          resourceId: invoiceId,
+          details: "Invoice updated",
+          success: true,
+        });
+      });
       return { success: true, invoice: invoices[index] };
     }
     return { success: false, error: 'Invoice not found' };
@@ -393,6 +659,15 @@ class ApiClient {
       invoices[index].status = 'paid';
       invoices[index].paidAt = new Date().toISOString();
       this.setStorageData(KEY_INVOICES, invoices);
+      safeAudit(() => {
+        logAction({
+          action: "update",
+          resourceType: "billing",
+          resourceId: invoiceId,
+          details: "Invoice marked as paid",
+          success: true,
+        });
+      });
       return { success: true };
     }
     return { success: false, error: 'Invoice not found' };
@@ -403,6 +678,15 @@ class ApiClient {
     const newMessage = { ...message, id: `com-${Date.now()}`, sentAt: new Date().toISOString() };
     communications.push(newMessage);
     this.setStorageData(KEY_COMMUNICATIONS, communications);
+    safeAudit(() => {
+      logAction({
+        action: "create",
+        resourceType: "communication",
+        resourceId: newMessage.id,
+        details: "Communication sent",
+        success: true,
+      });
+    });
     return { success: true, message: newMessage };
   }
 
@@ -419,6 +703,15 @@ class ApiClient {
     const newFollowUp = { ...followUp, id: `fup-${Date.now()}`, createdAt: new Date().toISOString(), status: 'scheduled' };
     followUps.push(newFollowUp);
     this.setStorageData(KEY_FOLLOWUPS, followUps);
+    safeAudit(() => {
+      logAction({
+        action: "create",
+        resourceType: "system",
+        resourceId: newFollowUp.id,
+        details: "Follow-up scheduled",
+        success: true,
+      });
+    });
     return { success: true, followUp: newFollowUp };
   }
 
@@ -436,6 +729,14 @@ class ApiClient {
     if (index !== -1) {
       followUps[index] = { ...followUps[index], ...followUp, updatedAt: new Date().toISOString() };
       this.setStorageData(KEY_FOLLOWUPS, followUps);
+      safeAudit(() => {
+        logModification({
+          resourceType: "system",
+          resourceId: followUpId,
+          details: "Follow-up updated",
+          success: true,
+        });
+      });
       return { success: true, followUp: followUps[index] };
     }
     return { success: false, error: 'Follow-up not found' };
@@ -448,6 +749,15 @@ class ApiClient {
       followUps[index].status = 'completed';
       followUps[index].completedAt = new Date().toISOString();
       this.setStorageData(KEY_FOLLOWUPS, followUps);
+      safeAudit(() => {
+        logAction({
+          action: "update",
+          resourceType: "system",
+          resourceId: followUpId,
+          details: "Follow-up completed",
+          success: true,
+        });
+      });
       return { success: true };
     }
     return { success: false, error: 'Follow-up not found' };
@@ -458,6 +768,15 @@ class ApiClient {
     const newConsent = { ...consent, id: `con-${Date.now()}`, createdAt: new Date().toISOString(), status: 'signed' };
     consents.push(newConsent);
     this.setStorageData(KEY_CONSENTS, consents);
+    safeAudit(() => {
+      logAction({
+        action: "create",
+        resourceType: "document",
+        resourceId: newConsent.id,
+        details: "Consent created",
+        success: true,
+      });
+    });
     return { success: true, consent: newConsent };
   }
 
@@ -476,6 +795,15 @@ class ApiClient {
       consents[index].status = 'signed';
       consents[index].signedAt = new Date().toISOString();
       this.setStorageData(KEY_CONSENTS, consents);
+      safeAudit(() => {
+        logAction({
+          action: "update",
+          resourceType: "document",
+          resourceId: consentId,
+          details: "Consent signed",
+          success: true,
+        });
+      });
       return { success: true };
     }
     return { success: false, error: 'Consent not found' };

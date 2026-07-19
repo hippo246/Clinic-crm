@@ -1,0 +1,991 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Enums
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+  PENDING
+}
+
+enum StaffStatus {
+  ACTIVE
+  INACTIVE
+  ON_LEAVE
+  TERMINATED
+}
+
+enum PatientStatus {
+  ACTIVE
+  INACTIVE
+  DECEASED
+  TRANSFERRED
+}
+
+enum AppointmentStatus {
+  SCHEDULED
+  CONFIRMED
+  CHECKED_IN
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum QueueStatus {
+  WAITING
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  SKIPPED
+}
+
+enum ConsultationStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum PrescriptionStatus {
+  DRAFT
+  ISSUED
+  DISPENSED
+  CANCELLED
+  EXPIRED
+}
+
+enum LabOrderStatus {
+  ORDERED
+  SAMPLE_COLLECTED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum LabResultStatus {
+  PENDING
+  REVIEWED
+  APPROVED
+  REJECTED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  PENDING
+  PAID
+  PARTIALLY_PAID
+  OVERDUE
+  CANCELLED
+  WRITTEN_OFF
+}
+
+enum PaymentStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REFUNDED
+}
+
+enum CommunicationStatus {
+  DRAFT
+  SCHEDULED
+  SENT
+  DELIVERED
+  FAILED
+  CANCELLED
+}
+
+enum CommunicationChannel {
+  EMAIL
+  SMS
+  PHONE
+  IN_PERSON
+  MAIL
+}
+
+enum PrivacyRequestType {
+  ACCESS
+  DELETION
+  CORRECTION
+  RESTRICTION
+}
+
+enum PrivacyRequestStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  DENIED
+  EXPIRED
+}
+
+enum ConsentStatus {
+  ACTIVE
+  EXPIRED
+  REVOKED
+  PENDING
+}
+
+enum SecuritySeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum ExportJobStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum ImportJobStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum RetentionJobStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+// Core Identity
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  authId    String?  @unique // Firebase Auth UID or other auth provider ID
+  authProvider String? // 'firebase', 'local', etc.
+  status    UserStatus @default(ACTIVE)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+  deletedBy String?
+
+  userRoles UserRole[]
+  staffMember StaffMember?
+
+  @@index([email])
+  @@index([authId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model Role {
+  id          String   @id @default(uuid())
+  name        String   @unique
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  userRoles UserRole[]
+  permissions Permission[]
+
+  @@index([name])
+}
+
+model Permission {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  roles Role[]
+
+  @@index([key])
+}
+
+model UserRole {
+  id        String   @id @default(uuid())
+  userId    String
+  roleId    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role Role @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roleId])
+  @@index([userId])
+  @@index([roleId])
+}
+
+// Staff
+model StaffMember {
+  id            String      @id @default(uuid())
+  userId        String?     @unique
+  employeeId    String?     @unique
+  firstName     String?
+  lastName      String?
+  email         String?
+  phone         String?
+  department    String?
+  specialization String?
+  status        StaffStatus @default(ACTIVE)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  deletedAt     DateTime?
+  deletedBy     String?
+
+  user          User?           @relation(fields: [userId], references: [id])
+  schedules     StaffSchedule[]
+  activities    StaffActivity[]
+
+  @@index([userId])
+  @@index([employeeId])
+  @@index([email])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model StaffSchedule {
+  id          String   @id @default(uuid())
+  staffId     String
+  date        DateTime
+  startTime   String
+  endTime     String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  staff StaffMember @relation(fields: [staffId], references: [id], onDelete: Cascade)
+
+  @@index([staffId])
+  @@index([date])
+  @@index([staffId, date])
+}
+
+model StaffActivity {
+  id          String   @id @default(uuid())
+  staffId     String
+  action      String
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  staff StaffMember @relation(fields: [staffId], references: [id], onDelete: Cascade)
+
+  @@index([staffId])
+  @@index([createdAt])
+  @@index([staffId, createdAt])
+}
+
+// Patients
+model Patient {
+  id                String              @id @default(uuid())
+  externalId        String?             @unique
+  firstName         String
+  lastName          String
+  dateOfBirth       DateTime
+  gender            String
+  phone             String?
+  email             String?
+  address           String?
+  emergencyContact  String?
+  emergencyPhone    String?
+  status            PatientStatus       @default(ACTIVE)
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+  deletedAt         DateTime?
+  deletedBy         String?
+
+  notes             PatientNote[]
+  timelineEvents    PatientTimelineEvent[]
+  alerts            PatientAlert[]
+  documents         Document[]
+  appointments      Appointment[]
+  consultations     Consultation[]
+  prescriptions     Prescription[]
+  labOrders         LabOrder[]
+  invoices          Invoice[]
+  communications    Communication[]
+
+  @@index([externalId])
+  @@index([status])
+  @@index([createdAt])
+  @@index([lastName, firstName])
+}
+
+model PatientNote {
+  id          String   @id @default(uuid())
+  patientId   String
+  content     String
+  createdBy   String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  deletedAt   DateTime?
+  deletedBy   String?
+
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  @@index([patientId])
+  @@index([createdAt])
+  @@index([createdBy])
+  @@index([deletedAt])
+}
+
+model PatientTimelineEvent {
+  id          String   @id @default(uuid())
+  patientId   String
+  eventType  String
+  description String
+  metadata   Json?
+  createdAt   DateTime @default(now())
+
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  @@index([patientId])
+  @@index([createdAt])
+  @@index([eventType])
+  @@index([patientId, createdAt])
+}
+
+model PatientAlert {
+  id          String   @id @default(uuid())
+  patientId   String
+  alertType   String
+  message     String
+  severity    String
+  isResolved  Boolean  @default(false)
+  resolvedAt  DateTime?
+  resolvedBy  String?
+  createdAt   DateTime @default(now())
+
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  @@index([patientId])
+  @@index([isResolved])
+  @@index([createdAt])
+  @@index([severity])
+}
+
+// Privacy
+model ConsentRecord {
+  id          String       @id @default(uuid())
+  patientId   String
+  consentType String
+  status      ConsentStatus @default(ACTIVE)
+  signedAt    DateTime
+  expiresAt   DateTime?
+  metadata    Json?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([patientId])
+  @@index([consentType])
+  @@index([status])
+  @@index([expiresAt])
+}
+
+model CommunicationPreference {
+  id          String   @id @default(uuid())
+  patientId   String
+  channel     CommunicationChannel
+  preferred   Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([patientId, channel])
+  @@index([patientId])
+}
+
+model PrivacyRequest {
+  id          String             @id @default(uuid())
+  patientId   String
+  requestType PrivacyRequestType
+  status      PrivacyRequestStatus @default(PENDING)
+  requestedAt DateTime            @default(now())
+  completedAt DateTime?
+  metadata    Json?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  events PrivacyRequestEvent[]
+
+  @@index([patientId])
+  @@index([requestType])
+  @@index([status])
+  @@index([requestedAt])
+}
+
+model PrivacyRequestEvent {
+  id          String   @id @default(uuid())
+  requestId   String
+  eventType   String
+  description String
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  request PrivacyRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@index([requestId])
+  @@index([createdAt])
+}
+
+// Appointments/Workflow
+model Appointment {
+  id          String            @id @default(uuid())
+  patientId   String
+  staffId     String?
+  date        DateTime
+  time        String
+  duration    Int?
+  status      AppointmentStatus @default(SCHEDULED)
+  notes       String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  @@index([patientId])
+  @@index([staffId])
+  @@index([date])
+  @@index([status])
+  @@index([patientId, date])
+}
+
+model QueueEntry {
+  id          String     @id @default(uuid())
+  patientId   String
+  appointmentId String?
+  status      QueueStatus @default(WAITING)
+  priority    Int        @default(0)
+  enteredAt   DateTime   @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+
+  @@index([patientId])
+  @@index([appointmentId])
+  @@index([status])
+  @@index([priority])
+  @@index([enteredAt])
+}
+
+model Consultation {
+  id          String             @id @default(uuid())
+  patientId   String
+  staffId     String?
+  appointmentId String?
+  status      ConsultationStatus @default(SCHEDULED)
+  chiefComplaint String?
+  diagnosis   String?
+  notes       String?
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  @@index([patientId])
+  @@index([staffId])
+  @@index([appointmentId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model ConsultationTemplate {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  template    Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([name])
+}
+
+// Clinical
+model Prescription {
+  id          String             @id @default(uuid())
+  patientId   String
+  staffId     String?
+  medication  String
+  dosage      String
+  frequency   String?
+  status      PrescriptionStatus @default(DRAFT)
+  prescribedAt DateTime?
+  dispensedAt DateTime?
+  expiresAt   DateTime?
+  notes       String?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  refills  PrescriptionRefill[]
+
+  @@index([patientId])
+  @@index([staffId])
+  @@index([status])
+  @@index([prescribedAt])
+  @@index([expiresAt])
+}
+
+model PrescriptionRefill {
+  id             String   @id @default(uuid())
+  prescriptionId String
+  refillDate     DateTime
+  dispensedBy    String?
+  notes          String?
+  createdAt      DateTime @default(now())
+
+  prescription Prescription @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
+
+  @@index([prescriptionId])
+  @@index([refillDate])
+}
+
+model LabOrder {
+  id          String        @id @default(uuid())
+  patientId   String
+  staffId     String?
+  testType    String
+  status      LabOrderStatus @default(ORDERED)
+  orderedAt   DateTime     @default(now())
+  sampleCollectedAt DateTime?
+  completedAt DateTime?
+  notes       String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  results LabResult[]
+
+  @@index([patientId])
+  @@index([staffId])
+  @@index([status])
+  @@index([orderedAt])
+  @@index([testType])
+}
+
+model LabResult {
+  id          String        @id @default(uuid())
+  labOrderId  String
+  resultType  String
+  resultValue String
+  status      LabResultStatus @default(PENDING)
+  reviewedAt  DateTime?
+  reviewedBy  String?
+  notes       String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  labOrder LabOrder @relation(fields: [labOrderId], references: [id], onDelete: Cascade)
+
+  @@index([labOrderId])
+  @@index([status])
+  @@index([resultType])
+  @@index([createdAt])
+}
+
+// Documents
+model Document {
+  id          String   @id @default(uuid())
+  patientId   String?
+  storageKey  String   @unique
+  fileName    String
+  fileType    String
+  fileSize    Int
+  category    String?
+  uploadedBy  String
+  uploadedAt  DateTime @default(now())
+  archivedAt  DateTime?
+  archivedBy  String?
+  deletedAt   DateTime?
+  deletedBy   String?
+
+  patient Patient? @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  events  DocumentEvent[]
+
+  @@index([patientId])
+  @@index([storageKey])
+  @@index([category])
+  @@index([uploadedAt])
+  @@index([archivedAt])
+}
+
+model DocumentEvent {
+  id          String   @id @default(uuid())
+  documentId  String
+  eventType   String
+  description String
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([documentId])
+  @@index([eventType])
+  @@index([createdAt])
+}
+
+// Billing
+model Invoice {
+  id          String        @id @default(uuid())
+  patientId   String
+  invoiceNumber String?     @unique
+  totalAmount Decimal
+  status      InvoiceStatus @default(DRAFT)
+  issuedAt    DateTime?
+  dueDate     DateTime?
+  paidAt      DateTime?
+  notes       String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  items   InvoiceItem[]
+  payments Payment[]
+
+  @@index([patientId])
+  @@index([invoiceNumber])
+  @@index([status])
+  @@index([issuedAt])
+  @@index([dueDate])
+}
+
+model InvoiceItem {
+  id          String   @id @default(uuid())
+  invoiceId   String
+  description String
+  quantity    Int
+  unitPrice   Decimal
+  totalPrice Decimal
+  createdAt   DateTime @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+}
+
+model Payment {
+  id          String        @id @default(uuid())
+  invoiceId   String
+  amount      Decimal
+  paymentMethod String
+  status      PaymentStatus @default(PENDING)
+  paidAt      DateTime?
+  reference   String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+  @@index([status])
+  @@index([paidAt])
+}
+
+model InsuranceRecord {
+  id          String   @id @default(uuid())
+  patientId   String
+  provider    String
+  policyNumber String?
+  groupNumber String?
+  validFrom   DateTime
+  validTo     DateTime?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([patientId])
+  @@index([provider])
+  @@index([isActive])
+  @@index([validFrom, validTo])
+}
+
+// Communications
+model Communication {
+  id          String              @id @default(uuid())
+  patientId   String
+  channel     CommunicationChannel
+  status      CommunicationStatus @default(DRAFT)
+  subject     String?
+  message     String
+  scheduledAt DateTime?
+  sentAt      DateTime?
+  deliveredAt DateTime?
+  failedReason String?
+  createdBy   String
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  @@index([patientId])
+  @@index([channel])
+  @@index([status])
+  @@index([scheduledAt])
+  @@index([createdBy])
+}
+
+model ScheduledCommunication {
+  id          String              @id @default(uuid())
+  patientId   String
+  templateId  String?
+  channel     CommunicationChannel
+  scheduledAt DateTime
+  status      CommunicationStatus @default(SCHEDULED)
+  metadata    Json?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  @@index([patientId])
+  @@index([templateId])
+  @@index([scheduledAt])
+  @@index([status])
+}
+
+model CommunicationTemplate {
+  id          String   @id @default(uuid())
+  name        String
+  channel     CommunicationChannel
+  subject     String?
+  body        String
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([name])
+  @@index([channel])
+  @@index([isActive])
+}
+
+model CallLog {
+  id          String   @id @default(uuid())
+  patientId   String?
+  phoneNumber String
+  direction   String // INCOMING, OUTGOING
+  duration    Int?
+  notes       String?
+  calledBy    String?
+  createdAt   DateTime @default(now())
+
+  @@index([patientId])
+  @@index([phoneNumber])
+  @@index([createdAt])
+  @@index([calledBy])
+}
+
+// Reports/Admin
+model ReportMetadata {
+  id          String   @id @default(uuid())
+  reportType  String
+  parameters Json?
+  generatedBy String
+  generatedAt DateTime @default(now())
+  fileUrl     String?
+
+  @@index([reportType])
+  @@index([generatedBy])
+  @@index([generatedAt])
+}
+
+model ExportJob {
+  id          String        @id @default(uuid())
+  jobType     String
+  status      ExportJobStatus @default(PENDING)
+  parameters  Json?
+  startedBy   String
+  startedAt   DateTime?
+  completedAt DateTime?
+  fileUrl     String?
+  error       String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([jobType])
+  @@index([status])
+  @@index([startedBy])
+  @@index([startedAt])
+}
+
+model ImportJob {
+  id          String        @id @default(uuid())
+  jobType     String
+  status      ImportJobStatus @default(PENDING)
+  parameters  Json?
+  startedBy   String
+  startedAt   DateTime?
+  completedAt DateTime?
+  fileUrl     String?
+  error       String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([jobType])
+  @@index([status])
+  @@index([startedBy])
+  @@index([startedAt])
+}
+
+model BackupArchive {
+  id          String   @id @default(uuid())
+  archiveType String
+  fileUrl     String
+  fileSize    Int
+  createdBy   String
+  createdAt   DateTime @default(now())
+  expiresAt   DateTime?
+
+  @@index([archiveType])
+  @@index([createdBy])
+  @@index([createdAt])
+  @@index([expiresAt])
+}
+
+model RetentionPolicy {
+  id          String   @id @default(uuid())
+  policyName  String   @unique
+  auditLogsRetentionDays Int
+  securityEventsRetentionDays Int
+  workflowActivityRetentionDays Int
+  uiActivityRetentionDays Int
+  backupArchivesRetentionDays Int
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([policyName])
+  @@index([isActive])
+}
+
+model RetentionCleanupJob {
+  id          String            @id @default(uuid())
+  policyId    String
+  status      RetentionJobStatus @default(PENDING)
+  startedAt   DateTime?
+  completedAt DateTime?
+  recordsDeleted Int?
+  error       String?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  @@index([policyId])
+  @@index([status])
+  @@index([startedAt])
+}
+
+// Audit/Security
+model AuditLog {
+  id          String   @id @default(uuid())
+  action      String
+  resourceType String
+  resourceId  String
+  actorId     String?
+  actorRole   String?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  @@index([resourceType, resourceId])
+  @@index([actorId])
+  @@index([actorRole])
+  @@index([action])
+  @@index([createdAt])
+  @@index([resourceType])
+}
+
+model AdminAuditLog {
+  id          String   @id @default(uuid())
+  action      String
+  module      String
+  resourceType String?
+  resourceId  String?
+  actor       String
+  role        String
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  @@index([module])
+  @@index([actor])
+  @@index([role])
+  @@index([action])
+  @@index([createdAt])
+  @@index([resourceType, resourceId])
+}
+
+model SecurityEvent {
+  id          String         @id @default(uuid())
+  eventType   String
+  severity    SecuritySeverity
+  description String
+  metadata    Json?
+  createdAt   DateTime       @default(now())
+
+  @@index([eventType])
+  @@index([severity])
+  @@index([createdAt])
+}
+
+model DeniedAction {
+  id          String   @id @default(uuid())
+  action      String
+  resourceType String?
+  resourceId  String?
+  actor       String
+  role        String
+  reason      String?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  @@index([action])
+  @@index([actor])
+  @@index([role])
+  @@index([createdAt])
+}
+
+model DestructiveActionLog {
+  id          String   @id @default(uuid())
+  action      String
+  resourceType String
+  resourceId  String
+  actor       String
+  role        String
+  reason      String?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  @@index([resourceType, resourceId])
+  @@index([actor])
+  @@index([role])
+  @@index([action])
+  @@index([createdAt])
+}
+
+// System
+model ClinicSettings {
+  id          String   @id @default(uuid())
+  settingKey String   @unique
+  settingValue String
+  description String?
+  updatedAt   DateTime @updatedAt
+  updatedBy  String?
+
+  @@index([settingKey])
+}
+
+model SystemSetting {
+  id          String   @id @default(uuid())
+  settingKey String   @unique
+  settingValue String
+  description String?
+  updatedAt   DateTime @updatedAt
+
+  @@index([settingKey])
+}

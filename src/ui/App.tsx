@@ -1,25 +1,11 @@
-import React, { useState, useCallback, useEffect, useRef } from "react";
+import React, { useState, useCallback, useEffect, useRef, lazy, Suspense, useMemo } from "react";
 import type { Patient, AuditEntry, UserRole } from "./types";
 import GlobalStyles from "./GlobalStyles";
-import PatientList from "./PatientList";
-import PatientProfile from "./PatientProfile";
-import PatientForm from "./PatientForm";
-import { AppointmentsPage } from "./StubPages";
-import BillingPage from "./Billing";
-import Dashboard from "./Dashboard";
-import QueuePage from "./Queue";
-import ConsultationsPage from "./Consultations";
-import LabPage from "./Lab";
-import DocumentsPage from "./Documents";
-import CommunicationsPage from "./Communications";
-import StaffPage from "./Staff";
-import AuditPage from "./Audit";
-import PrescriptionsPage from "./Prescriptions";
-import ReportsPage from "./Reports";
-import SettingsPage from "./Settings";
 import { ToastProvider, useToast } from "./Toast";
 import { getInitialPatients } from "./mockData";
 import { apiClient } from "./api";
+import { listPatients as listPatientsService, getPatient, createPatient as createPatientService, updatePatient as updatePatientService } from "../services/patientService";
+import { isApiMode } from "../utils/apiModeHelper";
 import {
   getPatientStats,
   createAuditEntry,
@@ -31,6 +17,93 @@ import {
   fmtDate,
 } from "./utils";
 import { Notifications } from "./components/Notifications";
+import { logAccess } from "../shared/services/auditLogger";
+import { logDeniedAction } from "../shared/services/deniedActionLogger";
+import { logAdminOperation } from "../shared/services/adminAudit";
+import { ROLES, ROLE_LABELS, normalizeRole, getDeniedMessage } from "../shared/permissions/permissions";
+
+// ─── Tab Permission Map (Phase 6B) ─────────────────────────────────────────────
+// Maps tabs to allowed roles based on intended access model
+const TAB_PERMISSIONS: Record<NavTab, UserRole[]> = {
+  dashboard:     ["admin", "doctor"],
+  queue:         ["admin", "doctor", "nurse", "receptionist"],
+  appointments:  ["admin", "doctor", "nurse", "receptionist"],
+  consultations: ["admin", "doctor", "nurse"],
+  prescriptions: ["admin", "doctor"],
+  lab:           ["admin", "doctor", "nurse"],
+  billing:       ["admin", "billing", "receptionist"],
+  documents:     ["admin", "doctor", "nurse", "receptionist", "readonly"],
+  communications:["admin", "doctor", "nurse", "receptionist"],
+  reports:       ["admin", "auditor", "doctor"],
+  staff:         ["admin"],
+  settings:      ["admin"],
+  audit:         ["admin", "auditor"],
+  patients:      ["admin", "doctor", "nurse", "receptionist", "billing", "auditor", "readonly"],
+};
+
+// Helper to check if a role can access a tab
+function canAccessTab(tab: NavTab, role: UserRole): boolean {
+  return TAB_PERMISSIONS[tab]?.includes(role) || false;
+}
+
+// Helper to get first allowed tab for a role
+function getFirstAllowedTab(role: UserRole): NavTab {
+  // Prefer dashboard if allowed
+  if (canAccessTab("dashboard", role)) return "dashboard";
+  // Otherwise patients if allowed
+  if (canAccessTab("patients", role)) return "patients";
+  // Otherwise first allowed tab
+  for (const tab of NAV_TABS) {
+    if (canAccessTab(tab.id, role)) return tab.id;
+  }
+  // Fallback to dashboard (will show denied access)
+  return "dashboard";
+}
+
+// ─── Denied Access Helper (Phase 6B → 6D) ─────────────────────────────────────────────
+// Now uses shared denied-action logger for consistent security logging
+interface DenyAccessOptions {
+  reason: string;
+  target?: string;
+  role?: UserRole;
+  showToast?: (message: string, type: "success" | "error" | "info") => void;
+}
+
+function denyAccess(options: DenyAccessOptions): void {
+  const { reason, target, role, showToast } = options;
+  
+  // Show feedback if toast function provided
+  if (showToast) {
+    showToast(`Access denied: ${reason}`, "error");
+  }
+  
+  // Log denied access attempt using shared denied-action logger
+  logDeniedAction({
+    role: role?.toString(),
+    action: "tab_access",
+    resource: target || "system",
+    reason,
+    severity: "medium",
+  });
+}
+
+// ─── Lazy page imports — only loaded when the tab is first visited ─────────────
+const PatientList      = lazy(() => import("./PatientList"));
+const PatientProfile   = lazy(() => import("./PatientProfile"));
+const PatientForm      = lazy(() => import("./PatientForm"));
+const Dashboard        = lazy(() => import("./Dashboard"));
+const QueuePage        = lazy(() => import("./Queue"));
+const AppointmentsPage = lazy(() => import("./StubPages").then((m) => ({ default: m.AppointmentsPage })));
+const ConsultationsPage = lazy(() => import("./Consultations"));
+const PrescriptionsPage = lazy(() => import("./Prescriptions"));
+const BillingPage      = lazy(() => import("./Billing"));
+const LabPage          = lazy(() => import("./Lab"));
+const DocumentsPage    = lazy(() => import("./Documents"));
+const CommunicationsPage = lazy(() => import("./Communications"));
+const ReportsPage      = lazy(() => import("./Reports"));
+const StaffPage        = lazy(() => import("./Staff"));
+const SettingsPage     = lazy(() => import("./Settings"));
+const AuditPage        = lazy(() => import("./Audit"));
 
 // ─── Nav Tabs ─────────────────────────────────────────────────────────────────
 const NAV_TABS = [
@@ -72,9 +145,75 @@ type ApiClientWithStatus = typeof apiClient & {
 
 // ─── Load initial data ────────────────────────────────────────────────────────
 async function getPatients(): Promise<Patient[]> {
-  const saved = await loadPatients();
-  if (saved && saved.length > 0) return saved;
-  return getInitialPatients();
+  if (isApiMode()) {
+    try {
+      const response = await listPatientsService();
+      return response.data;
+    } catch (error) {
+      console.error('Failed to load patients from API:', error);
+      throw error; // Do not silently fall back to localStorage in API mode
+    }
+  } else {
+    const saved = await loadPatients();
+    if (saved && saved.length > 0) return saved;
+    return getInitialPatients();
+  }
+}
+
+// ─── Lazy-load fallback ───────────────────────────────────────────────────────
+function AppPageFallback() {
+  return (
+    <div style={{
+      flex: 1, display: "flex", alignItems: "center", justifyContent: "center",
+      padding: 32, color: "var(--muted)", fontSize: "var(--font-sm)",
+    }}>
+      <span style={{
+        display: "inline-flex", alignItems: "center", gap: 8,
+        background: "var(--surface2)", border: "1px solid var(--border)",
+        borderRadius: "var(--radius)", padding: "10px 18px",
+      }}>
+        <i className="ti ti-loader-2" style={{ fontSize: 16, animation: "spin 1s linear infinite" }} />
+        Loading…
+      </span>
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+    </div>
+  );
+}
+
+// ─── Denied Access Panel (Phase 6B) ─────────────────────────────────────────────
+function DeniedAccessPanel({ tab, onReturn }: { tab: string; onReturn: () => void }) {
+  return (
+    <div style={{
+      flex: 1, display: "flex", alignItems: "center", justifyContent: "center",
+      padding: 32, flexDirection: "column", gap: 16,
+    }}>
+      <div style={{
+        display: "inline-flex", alignItems: "center", justifyContent: "center",
+        width: 64, height: 64, borderRadius: "50%",
+        background: "var(--red-bg)", border: "1px solid var(--red-border)",
+      }}>
+        <i className="ti ti-lock" style={{ fontSize: 32, color: "var(--red)" }} />
+      </div>
+      <div style={{ textAlign: "center", maxWidth: 400 }}>
+        <div style={{ fontSize: 18, fontWeight: 700, color: "var(--text)", marginBottom: 8 }}>
+          Access Denied
+        </div>
+        <div style={{ fontSize: 14, color: "var(--muted)", marginBottom: 16 }}>
+          You do not have permission to access <strong>{tab}</strong>. Please contact your administrator if you believe this is an error.
+        </div>
+        <button
+          onClick={onReturn}
+          style={{
+            padding: "8px 16px", borderRadius: "var(--radius)",
+            background: "var(--accent)", color: "#fff", border: "none",
+            fontSize: 13, fontWeight: 600, cursor: "pointer",
+          }}
+        >
+          Return to Dashboard
+        </button>
+      </div>
+    </div>
+  );
 }
 
 // ─── Sidebar ──────────────────────────────────────────────────────────────────
@@ -94,7 +233,7 @@ const NAV_SECTIONS = [
 ];
 
 function Sidebar({
-  dark, activeTab, setActiveTab, stats, userRole, setUserRole, patients, onLogout, setDark,
+  dark, activeTab, setActiveTab, stats, userRole, setUserRole, patients, onLogout, setDark, requestConfirm,
 }: {
   dark: boolean;
   activeTab: NavTab;
@@ -105,6 +244,7 @@ function Sidebar({
   patients: Patient[];
   onLogout: () => void;
   setDark: (d: boolean) => void;
+  requestConfirm: (config: { title: string; message: string; confirmLabel?: string; cancelLabel?: string; isDanger?: boolean; onConfirm: () => void }) => void;
 }) {
   // Tablet viewports (between mobile's bottom-nav and desktop's full sidebar) get a
   // collapsed icon-only rail instead of either a 224px sidebar or nothing at all.
@@ -118,6 +258,22 @@ function Sidebar({
   }, []);
   const collapsed = railWidth === 68;
   const urgentCount = stats.followUpDue + stats.insExpiring;
+
+  // Phase 6B: Filter navigation sections based on role permissions
+  const filteredNavSections = NAV_SECTIONS.map(section => ({
+    ...section,
+    tabs: section.tabs.filter(tab => canAccessTab(tab, userRole))
+  })).filter(section => section.tabs.length > 0);
+
+  // Phase 6B: Guard tab navigation in sidebar
+  const handleNavTabClick = useCallback((tab: NavTab) => {
+    if (!canAccessTab(tab, userRole)) {
+      // Use a simple alert since we don't have toast access here
+      // The main guard in handleSetActiveTab will catch this too
+      return;
+    }
+    setActiveTab(tab);
+  }, [userRole, setActiveTab]);
 
   return (
     <div className="desktop-only qpsb-root" style={{
@@ -223,7 +379,7 @@ function Sidebar({
 
       {/* Sectioned nav */}
       <nav style={{ flex: 1, overflowY: "auto", padding: collapsed ? "4px 10px 8px" : "4px 8px 8px", display: "flex", flexDirection: "column" }}>
-        {NAV_SECTIONS.map((section) => (
+        {filteredNavSections.map((section) => (
           <div key={section.label} style={{ marginBottom: 2 }}>
             {!collapsed && (
               <div style={{
@@ -243,7 +399,7 @@ function Sidebar({
                 <button
                   key={id}
                   className={`qpsb-link${active ? " active" : ""}`}
-                  onClick={() => setActiveTab(id)}
+                  onClick={() => handleNavTabClick(id)}
                   title={collapsed ? tab.label : undefined}
                   style={{
                     display: "flex", alignItems: "center", gap: 9,
@@ -310,13 +466,35 @@ function Sidebar({
           <select
             value={userRole}
             onChange={(e) => {
-              const next = e.target.value as UserRole;
+              const next = normalizeRole(e.target.value);
               if (next === userRole) return;
-              if (window.confirm(`Switch active role to ${next.charAt(0).toUpperCase() + next.slice(1)}? This changes what you can view and edit.`)) {
-                setUserRole(next);
-              } else {
-                e.target.value = userRole;
-              }
+              const selectEl = e.target;
+              requestConfirm({
+                title: "Switch role?",
+                message: `Switch active role to ${ROLE_LABELS[next]}? This changes what you can view and edit. (Demo-only - no real authentication)`,
+                confirmLabel: "Switch Role",
+                onConfirm: () => {
+                  // Phase 10F: Log role switch safely (PHI-safe)
+                  try {
+                    logAdminOperation({
+                      action: "role_switch",
+                      module: "app",
+                      resourceType: "user_role",
+                      metadata: {
+                        fromRole: userRole,
+                        toRole: next,
+                      },
+                      actor: userRole,
+                      role: userRole,
+                    });
+                  } catch {
+                    // Fail silently
+                  }
+                  setUserRole(next);
+                },
+              });
+              // Reset the select visually until the user confirms
+              selectEl.value = userRole;
             }}
             style={{
               width: "100%", fontSize: 11, padding: "5px 8px",
@@ -325,9 +503,12 @@ function Sidebar({
               color: "var(--muted)", cursor: "pointer",
             }}
           >
-            <option value="receptionist">👤 Receptionist</option>
-            <option value="doctor">🩺 Doctor</option>
-            <option value="admin">🛡 Admin</option>
+            {ROLES.map((role) => (
+              <option key={role} value={role}>
+                {role === "receptionist" ? "� " : role === "doctor" ? "🩺 " : role === "nurse" ? "💉 " : role === "billing" ? "💰 " : role === "auditor" ? "📋 " : role === "readonly" ? "👁 " : role === "admin" ? "� " : ""}
+                {ROLE_LABELS[role]}
+              </option>
+            ))}
           </select>
         )}
 
@@ -592,13 +773,35 @@ function ContentTopBar({
         className="qptb-role-select"
         value={userRole}
         onChange={(e) => {
-          const next = e.target.value as UserRole;
+          const next = normalizeRole(e.target.value);
           if (next === userRole) return;
-          if (window.confirm(`Switch active role to ${next.charAt(0).toUpperCase() + next.slice(1)}? This changes what you can view and edit.`)) {
-            setUserRole(next);
-          } else {
-            e.target.value = userRole;
-          }
+          const selectEl = e.target;
+          requestConfirm({
+            title: "Switch role?",
+            message: `Switch active role to ${ROLE_LABELS[next]}? This changes what you can view and edit. (Demo-only - no real authentication)`,
+            confirmLabel: "Switch Role",
+            onConfirm: () => {
+              // Phase 10F: Log role switch safely (PHI-safe)
+              try {
+                logAdminOperation({
+                  action: "role_switch",
+                  module: "app",
+                  resourceType: "user_role",
+                  metadata: {
+                    fromRole: userRole,
+                    toRole: next,
+                  },
+                  actor: userRole,
+                  role: userRole,
+                });
+              } catch {
+                // Fail silently
+              }
+              setUserRole(next);
+            },
+          });
+          // Reset the select visually until the user confirms
+          selectEl.value = userRole;
         }}
         style={{
           fontSize: 11, padding: "4px 8px",
@@ -609,9 +812,11 @@ function ContentTopBar({
           transition: "background 0.12s",
         }}
       >
-        <option value="receptionist">Receptionist</option>
-        <option value="doctor">Doctor</option>
-        <option value="admin">Admin</option>
+        {ROLES.map((role) => (
+          <option key={role} value={role}>
+            {ROLE_LABELS[role]}
+          </option>
+        ))}
       </select>
 
       {/* Avatar + name */}
@@ -732,17 +937,21 @@ function MobileTopBar({
 const BOTTOM_NAV_TABS: NavTab[] = ["dashboard", "queue", "patients", "billing", "consultations"];
 
 function BottomNav({
-  dark, activeTab, setActiveTab, setDark, onLogout,
+  dark, activeTab, setActiveTab, setDark, onLogout, userRole,
 }: {
   dark: boolean;
   activeTab: NavTab;
   setActiveTab: (t: NavTab) => void;
   setDark: (d: boolean) => void;
   onLogout: () => void;
+  userRole: UserRole;
 }) {
   const [sheetOpen, setSheetOpen] = useState(false);
   const [pressed, setPressed] = useState<string | null>(null);
   const isMoreActive = !BOTTOM_NAV_TABS.includes(activeTab as any);
+
+  // Phase 6B: Filter bottom nav tabs based on role permissions
+  const filteredBottomNavTabs = BOTTOM_NAV_TABS.filter(tab => canAccessTab(tab, userRole));
 
   function NavBtn({ id, icon, label, onClick }: { id: string; icon: string; label: string; onClick: () => void }) {
     const active = id === "more" ? (isMoreActive || sheetOpen) : activeTab === id;
@@ -837,7 +1046,7 @@ function BottomNav({
               paddingBottom: 10, paddingLeft: 2,
             }}>Pages</div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
-              {NAV_TABS.filter((t) => !BOTTOM_NAV_TABS.includes(t.id as any) && t.id !== "settings" && t.id !== "audit").map(({ id, label, icon }) => {
+              {NAV_TABS.filter((t) => !BOTTOM_NAV_TABS.includes(t.id as any) && t.id !== "settings" && t.id !== "audit" && canAccessTab(t.id, userRole)).map(({ id, label, icon }) => {
                 const active = activeTab === id;
                 return (
                   <button key={id} className="qpbn-sheet-item" onClick={() => { setActiveTab(id); setSheetOpen(false); }}
@@ -863,7 +1072,7 @@ function BottomNav({
             </div>
             {/* System row — smaller, separated, desktop-intent pages accessible but de-emphasised */}
             <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${dark ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.07)"}`, display: "flex", gap: 8, flexWrap: "wrap" }}>
-              {(["settings", "audit"] as NavTab[]).map((id) => {
+              {(["settings", "audit"] as NavTab[]).filter(id => canAccessTab(id, userRole)).map((id) => {
                 const tab = NAV_TABS.find((t) => t.id === id)!;
                 const active = activeTab === id;
                 return (
@@ -1135,6 +1344,73 @@ function AppInner() {
   const [listSearch,      setListSearch]      = useState("");  // lifted search for stat bar clicks
   const [loading,         setLoading]         = useState(true);
   const searchRef = useRef<HTMLInputElement | null>(null);
+  const previousTabRef = useRef<NavTab | null>(null);
+
+  // ── Confirm modal (replaces all window.confirm calls) ────────────────────────
+  type ConfirmModalState = {
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    cancelLabel?: string;
+    isDanger?: boolean;
+    onConfirm: () => void;
+  };
+  const [confirmModal, setConfirmModal] = useState<ConfirmModalState | null>(null);
+
+  const requestConfirm = useCallback((config: ConfirmModalState) => {
+    setConfirmModal(config);
+  }, []);
+
+  const closeConfirm = useCallback(() => {
+    setConfirmModal(null);
+  }, []);
+
+  const handleConfirm = useCallback(() => {
+    if (!confirmModal) return;
+    const action = confirmModal.onConfirm;
+    setConfirmModal(null);
+    action();
+  }, [confirmModal]);
+
+  // Phase 6B: Guard tab activation with permission check
+  const handleSetActiveTab = useCallback((tab: NavTab) => {
+    if (!canAccessTab(tab, userRole)) {
+      denyAccess({
+        reason: `You do not have permission to access ${NAV_TABS.find(t => t.id === tab)?.label || tab}`,
+        target: tab,
+        role: userRole,
+        showToast: toast,
+      });
+      return;
+    }
+    setActiveTab(tab);
+  }, [userRole, toast]);
+
+  // Log tab navigation only when it actually changes (Phase 2B)
+  useEffect(() => {
+    if (previousTabRef.current !== null && previousTabRef.current !== activeTab) {
+      const tab = NAV_TABS.find((t) => t.id === activeTab);
+      try {
+        logAccess({
+          resourceType: "system",
+          resourceLabel: tab?.label || activeTab,
+          details: `Navigated to ${tab?.label || activeTab}`,
+        });
+      } catch {
+        // Fail silently
+      }
+    }
+    previousTabRef.current = activeTab;
+  }, [activeTab]);
+
+  // Phase 6B: Safe fallback when role changes - redirect to first allowed tab
+  useEffect(() => {
+    if (!canAccessTab(activeTab, userRole)) {
+      const firstAllowed = getFirstAllowedTab(userRole);
+      setActiveTab(firstAllowed);
+      toast(`Role changed - redirected to ${NAV_TABS.find(t => t.id === firstAllowed)?.label || firstAllowed}`, "info");
+    }
+  }, [userRole, toast]);
 
   // App connection/status — local vs backend vs Firebase. Purely informational;
   // the app keeps working in localStorage mode regardless of what this reports.
@@ -1345,7 +1621,7 @@ function AppInner() {
     return () => window.removeEventListener("keydown", handler);
   }, [formMode, selectedPatient]);
 
-  const stats = getPatientStats(patients);
+  const stats = useMemo(() => getPatientStats(patients), [patients]);
 
   // ── Handlers ────────────────────────────────────────────────────────────────
   const handleSelect = useCallback((p: Patient) => {
@@ -1386,45 +1662,45 @@ function AppInner() {
     // Tab-level quick actions
     switch (action) {
       case "add-patient":
-        setActiveTab("patients");
+        handleSetActiveTab("patients");
         setSelectedPatient(null);
         setFormMode("create");
         return;
       case "book-appointment":
-        setActiveTab("appointments");
+        handleSetActiveTab("appointments");
         return;
       case "check-in":
-        setActiveTab("queue");
+        handleSetActiveTab("queue");
         return;
       case "create-invoice":
       case "collect-payment":
       case "pending-bills":
       case "print-receipt":
-        setActiveTab("billing");
+        handleSetActiveTab("billing");
         return;
       case "start-consult":
       case "add-note":
-        setActiveTab("consultations");
+        handleSetActiveTab("consultations");
         return;
       case "create-rx":
-        setActiveTab("prescriptions");
+        handleSetActiveTab("prescriptions");
         return;
       case "view-labs":
-        setActiveTab("lab");
+        handleSetActiveTab("lab");
         return;
       case "upload-doc":
-        setActiveTab("documents");
+        handleSetActiveTab("documents");
         return;
       case "send-message":
-        setActiveTab("communications");
+        handleSetActiveTab("communications");
         return;
       case "view-reports":
-        setActiveTab("reports");
+        handleSetActiveTab("reports");
         return;
       default:
         toast(`"${action}" isn't wired up yet`, "error");
     }
-  }, [patients, handleSelect, toast]);
+  }, [patients, handleSelect, toast, handleSetActiveTab]);
 
   const handleUpdatePatient = useCallback(async (updated: Patient, action = "edited") => {
     // Optimistic local update first
@@ -1453,25 +1729,47 @@ function AppInner() {
 
   const handleDeletePatient = useCallback(async (id: string) => {
     const p = patients.find((x) => x.id === id);
-    if (!window.confirm(`Permanently delete ${p ? p.name : "this patient"}'s record? This cannot be undone.`)) {
-      return;
-    }
+    requestConfirm({
+      title: "Delete patient?",
+      message: `Archive ${p ? p.name : "this patient"}'s record? This will mark the patient as archived and can be restored later.`,
+      confirmLabel: "Archive Patient",
+      isDanger: true,
+      onConfirm: async () => {
+        try {
+          await apiClient.deletePatient(id, CURRENT_USER.name, "Archived via patient management");
+          // Reload patients from storage to get updated soft-deleted state (Phase 7C)
+          const updated = await apiClient.getPatients();
+          setPatients(updated);
+          setSelectedPatient((prev) => (prev?.id === id ? null : prev));
+          setActiveTab("patients");
+          setLastSavedAt(new Date());
+          if (p) {
+            const entry = createAuditEntry({ patientId: id, message: `${CURRENT_USER.name} archived patient record ${id}`, type: "archived", user: CURRENT_USER.name });
+            setAuditMap((prev) => addAuditEntry(prev, id, entry));
+            toast(`Patient archived`, "error");
+          }
+        } catch (error) {
+          console.error("Failed to archive patient:", error);
+          toast(`Failed to archive patient: ${error}`, "error");
+        }
+      },
+    });
+  }, [patients, toast, requestConfirm]);
+
+  const handleRestorePatient = useCallback(async (id: string) => {
     try {
-      await apiClient.deletePatient(id);
-      setPatients((prev) => prev.filter((x) => x.id !== id));
-      setSelectedPatient((prev) => (prev?.id === id ? null : prev));
-      setActiveTab("patients");
-      setLastSavedAt(new Date());
-      if (p) {
-        const entry = createAuditEntry({ patientId: id, message: `${CURRENT_USER.name} deleted ${p.name}`, type: "deleted", user: CURRENT_USER.name });
-        setAuditMap((prev) => addAuditEntry(prev, id, entry));
-        toast(`Patient deleted`, "error");
-      }
+      await apiClient.restorePatient(id, CURRENT_USER.name);
+      // Reload patients from storage to get updated state
+      const updated = await apiClient.getPatients();
+      setPatients(updated);
+      const entry = createAuditEntry({ patientId: id, message: `${CURRENT_USER.name} restored patient record ${id}`, type: "restored", user: CURRENT_USER.name });
+      setAuditMap((prev) => addAuditEntry(prev, id, entry));
+      toast(`Patient restored`, "success");
     } catch (error) {
-      console.error("Failed to delete patient:", error);
-      toast(`Failed to delete patient: ${error}`, "error");
+      console.error("Failed to restore patient:", error);
+      toast(`Failed to restore patient: ${error}`, "error");
     }
-  }, [patients, toast]);
+  }, [toast]);
 
   const handleSave = useCallback(async (data: Partial<Patient>) => {
     try {
@@ -1566,10 +1864,10 @@ function AppInner() {
       toast("No patient found", "error");
     } else if (matches.length === 1) {
       setSelectedPatient(matches[0]);
-      setActiveTab("patients");
+      handleSetActiveTab("patients");
     } else {
       // Multiple matches — go to patients list so PatientList search can filter
-      setActiveTab("patients");
+      handleSetActiveTab("patients");
       setSelectedPatient(null);
       setListSearch(q);
       setTimeout(() => {
@@ -1577,23 +1875,36 @@ function AppInner() {
         if (real) { real.value = q; real.focus(); real.dispatchEvent(new Event("input", { bubbles: true })); }
       }, 60);
     }
-  }, [patients, toast]);
+  }, [patients, toast, handleSetActiveTab]);
 
   // Handle logout (frontend-only mode - just clears data)
-  const handleLogout = async () => {
-    if (!window.confirm("Log out now? Any unsaved changes in open forms will be lost.")) {
-      return;
-    }
-    try {
-      setPatients([]);
-      setAuditMap({});
-      setSelectedPatient(null);
-      toast("Logged out successfully", "success");
-    } catch (error) {
-      console.error("Logout error:", error);
-      toast("Failed to logout", "error");
-    }
-  };
+  const handleLogout = useCallback(() => {
+    requestConfirm({
+      title: "Log out?",
+      message: "You will return to the login screen. Local app data remains on this device.",
+      confirmLabel: "Log Out",
+      onConfirm: async () => {
+        try {
+          setPatients([]);
+          setAuditMap({});
+          setSelectedPatient(null);
+          toast("Logged out successfully", "success");
+        } catch (error) {
+          console.error("Logout error:", error);
+          toast("Failed to logout", "error");
+        }
+      },
+    });
+  }, [requestConfirm, toast]);
+
+  // ── Stable callbacks for JSX props ─────────────────────────────────────────
+  const handleStatsFilter  = useCallback((q: string) => { setListSearch(q); }, []);
+  const handleViewPatient  = useCallback((p: Patient) => { setSelectedPatient(p); handleSetActiveTab("patients"); }, [handleSetActiveTab]);
+  const handleEditPatient  = useCallback(() => setFormMode("edit"), []);
+  const handleNewPatient   = useCallback(() => setFormMode("create"), []);
+  const handleOpenImport   = useCallback(() => setImportOpen(true), []);
+  const handleCloseForm    = useCallback(() => setFormMode(null), []);
+  const handleCloseImport  = useCallback(() => setImportOpen(false), []);
 
   // ── Render ───────────────────────────────────────────────────────────────────
   // Show main CRM interface (frontend-only mode)
@@ -1620,9 +1931,10 @@ function AppInner() {
         patients={patients}
         onLogout={handleLogout}
         setDark={setDark}
+        requestConfirm={requestConfirm}
       />
 
-      <BottomNav dark={dark} activeTab={activeTab} setActiveTab={setActiveTab} setDark={setDark} onLogout={handleLogout} />
+      <BottomNav dark={dark} activeTab={activeTab} setActiveTab={setActiveTab} setDark={setDark} onLogout={handleLogout} userRole={userRole} />
 
       {/* Main content area */}
       <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column", minWidth: 0 }}>
@@ -1654,7 +1966,7 @@ function AppInner() {
       {activeTab === "patients" && !selectedPatient && (
         <StatsBar
           stats={stats}
-          onFilter={(q) => { setListSearch(q); }}
+          onFilter={handleStatsFilter}
         />
       )}
 
@@ -1679,100 +1991,151 @@ function AppInner() {
 
       {/* Page content */}
       <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }} className="page-content-wrap">
-        {activeTab === "dashboard" && (
-          <div style={{ flex: 1, overflow: "auto" }}>
-            <Dashboard patients={patients} userRole={userRole} onAction={handleDashboardAction} onUpdatePatient={handleUpdatePatient} />
-          </div>
-        )}
-        {activeTab === "queue" && (
-          <div style={{ flex: 1, overflow: "auto" }}>
-            <QueuePage patients={patients} onUpdatePatient={handleUpdatePatient} onAction={handleDashboardAction} userRole={userRole} />
-          </div>
-        )}
-        {activeTab === "appointments" && (
-          <div style={{ flex: 1, overflow: "auto" }}>
-            <AppointmentsPage
-              patients={patients}
-              onUpdatePatient={handleUpdatePatient}
-              onViewPatient={(p: Patient) => { setSelectedPatient(p); setActiveTab("patients"); }}
-              userRole={userRole}
-            />
-          </div>
-        )}
-        {activeTab === "consultations" && (
-          <div style={{ flex: 1, overflow: "auto" }}>
-            <ConsultationsPage patients={patients} onUpdatePatient={handleUpdatePatient} userRole={userRole} />
-          </div>
-        )}
-        {activeTab === "prescriptions" && (
-          <div style={{ flex: 1, overflow: "auto" }}>
-            <PrescriptionsPage patients={patients} onUpdatePatient={handleUpdatePatient} userRole={userRole} />
-          </div>
-        )}
-        {activeTab === "lab" && (
-          <div style={{ flex: 1, overflow: "auto" }}>
-            <LabPage patients={patients} onUpdatePatient={handleUpdatePatient} userRole={userRole} />
-          </div>
-        )}
-        {activeTab === "billing" && (
-          <div style={{ flex: 1, overflow: "auto" }}>
-            <BillingPage patients={patients} onUpdatePatient={handleUpdatePatient} userRole={userRole} />
-          </div>
-        )}
-        {activeTab === "documents" && (
-          <div style={{ flex: 1, overflow: "auto" }}>
-            <DocumentsPage patients={patients} onUpdatePatient={handleUpdatePatient} userRole={userRole} />
-          </div>
-        )}
-        {activeTab === "communications" && (
-          <div style={{ flex: 1, overflow: "auto" }}>
-            <CommunicationsPage patients={patients} onUpdatePatient={handleUpdatePatient} userRole={userRole} />
-          </div>
-        )}
-        {activeTab === "reports" && (
-          <div style={{ flex: 1, overflow: "auto" }}>
-            <ReportsPage patients={patients} onUpdatePatient={handleUpdatePatient} userRole={userRole} />
-          </div>
-        )}
-        {activeTab === "staff" && (
-          <div style={{ flex: 1, overflow: "auto" }}>
-            <StaffPage />
-          </div>
-        )}
-        {activeTab === "settings" && (
-          <div style={{ flex: 1, overflow: "auto" }}>
-            <SettingsPage dark={dark} setDark={setDark} role={userRole} setRole={setUserRole} />
-          </div>
-        )}
-        {activeTab === "audit" && (
-          <div style={{ flex: 1, overflow: "auto" }}>
-            <AuditPage />
-          </div>
-        )}
-        {activeTab === "patients" && (
-          selectedPatient ? (
-            <PatientProfile
-              patient={selectedPatient}
-              auditEntries={auditMap[selectedPatient.id] || []}
-              onBack={handleBack}
-              onEditPatient={() => setFormMode("edit")}
-              onUpdatePatient={handleUpdatePatient}
-              onDeletePatient={handleDeletePatient}
-              role={userRole}
-            />
-          ) : (
-            <PatientList
-              patients={patients}
-              onSelect={handleSelect}
-              selectedId={selectedPatient?.id}
-              onNewPatient={() => setFormMode("create")}
-              onImport={() => setImportOpen(true)}
-              role={userRole}
-              onUpdatePatient={handleUpdatePatient}
-              onDeletePatient={handleDeletePatient}
-            />
-          )
-        )}
+        <Suspense fallback={<AppPageFallback />}>
+        {(() => {
+          // Phase 6B: Guard component rendering - check permissions before rendering
+          const tabInfo = NAV_TABS.find(t => t.id === activeTab);
+          
+          // If user doesn't have access to this tab, show denied panel
+          if (!canAccessTab(activeTab, userRole)) {
+            return (
+              <DeniedAccessPanel 
+                tab={tabInfo?.label || activeTab} 
+                onReturn={() => handleSetActiveTab(getFirstAllowedTab(userRole))}
+              />
+            );
+          }
+
+          // Otherwise render the appropriate component
+          switch (activeTab) {
+            case "dashboard":
+              return (
+                <div style={{ flex: 1, overflow: "auto" }}>
+                  <Dashboard patients={patients} userRole={userRole} onAction={handleDashboardAction} onUpdatePatient={handleUpdatePatient} />
+                </div>
+              );
+            case "queue":
+              return (
+                <div style={{ flex: 1, overflow: "auto" }}>
+                  <QueuePage patients={patients} onUpdatePatient={handleUpdatePatient} onAction={handleDashboardAction} userRole={userRole} />
+                </div>
+              );
+            case "appointments":
+              return (
+                <div style={{ flex: 1, overflow: "auto" }}>
+                  <AppointmentsPage patients={patients} onUpdatePatient={handleUpdatePatient} onViewPatient={handleViewPatient} userRole={userRole} />
+                </div>
+              );
+            case "consultations":
+              return (
+                <div style={{ flex: 1, overflow: "auto" }}>
+                  <ConsultationsPage patients={patients} userRole={userRole} />
+                </div>
+              );
+            case "prescriptions":
+              return (
+                <div style={{ flex: 1, overflow: "auto" }}>
+                  <PrescriptionsPage patients={patients} userRole={userRole} />
+                </div>
+              );
+            case "lab":
+              return (
+                <div style={{ flex: 1, overflow: "auto" }}>
+                  <LabPage patients={patients} userRole={userRole} />
+                </div>
+              );
+            case "billing":
+              return (
+                <div style={{ flex: 1, overflow: "auto" }}>
+                  <BillingPage patients={patients} userRole={userRole} />
+                </div>
+              );
+            case "documents":
+              return (
+                <div style={{ flex: 1, overflow: "auto" }}>
+                  <DocumentsPage patients={patients} onUpdatePatient={handleUpdatePatient} userRole={userRole} />
+                </div>
+              );
+            case "communications":
+              return (
+                <div style={{ flex: 1, overflow: "auto" }}>
+                  <CommunicationsPage patients={patients} userRole={userRole} />
+                </div>
+              );
+            case "reports":
+              return (
+                <div style={{ flex: 1, overflow: "auto" }}>
+                  <ReportsPage patients={patients} userRole={userRole} />
+                </div>
+              );
+            case "staff":
+              return (
+                <div style={{ flex: 1, overflow: "auto" }}>
+                  <StaffPage />
+                </div>
+              );
+            case "settings":
+              return (
+                <div style={{ flex: 1, overflow: "auto" }}>
+                  <SettingsPage />
+                </div>
+              );
+            case "audit":
+              return (
+                <div style={{ flex: 1, overflow: "auto" }}>
+                  <AuditPage />
+                </div>
+              );
+            case "patients":
+              if (selectedPatient) {
+                return (
+                  <div style={{ flex: 1, overflow: "auto" }}>
+                    <PatientProfile
+                      patient={selectedPatient}
+                      onBack={handleBack}
+                      onEditPatient={handleEditPatient}
+                      onUpdatePatient={handleUpdatePatient}
+                      onDeletePatient={handleDeletePatient}
+                      role={userRole}
+                    />
+                  </div>
+                );
+              } else if (formMode === "create" || formMode === "edit") {
+                return (
+                  <div style={{ flex: 1, overflow: "auto" }}>
+                    <PatientForm
+                      mode={formMode}
+                      patient={formMode === "edit" ? selectedPatient : undefined}
+                      onSave={handleSave}
+                      onCancel={handleCloseForm}
+                      onImport={handleOpenImport}
+                      role={userRole}
+                    />
+                  </div>
+                );
+              } else {
+                return (
+                  <div style={{ flex: 1, overflow: "auto" }}>
+                    <PatientList
+                      patients={patients}
+                      onUpdatePatient={handleUpdatePatient}
+                      onDeletePatient={handleDeletePatient}
+                      onRestorePatient={handleRestorePatient}
+                      role={userRole}
+                    />
+                  </div>
+                );
+              }
+            default:
+              return (
+                <DeniedAccessPanel 
+                  tab={tabInfo?.label || activeTab} 
+                  onReturn={() => handleSetActiveTab(getFirstAllowedTab(extendedRole))}
+                />
+              );
+          }
+        })()}
+        </Suspense>
       </div>
 
       {/* Modals */}
@@ -1781,13 +2144,69 @@ function AppInner() {
           mode={formMode}
           patient={formMode === "edit" ? selectedPatient : null}
           onSave={handleSave}
-          onClose={() => setFormMode(null)}
+          onClose={handleCloseForm}
           role={userRole}
         />
       )}
       {importOpen && (
-        <ImportModal onImport={handleImport} onClose={() => setImportOpen(false)} />
+        <ImportModal onImport={handleImport} onClose={handleCloseImport} />
       )}
+
+      {/* Confirm modal — replaces all window.confirm() calls */}
+      {confirmModal && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="confirm-modal-title"
+          style={{
+            position: "fixed", inset: 0,
+            background: "rgba(0,0,0,0.45)",
+            zIndex: 9999,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            padding: 16,
+          }}
+          onClick={(e) => { if (e.target === e.currentTarget) closeConfirm(); }}
+          onKeyDown={(e) => { if (e.key === "Escape") closeConfirm(); }}
+        >
+          <div style={{
+            background: "var(--surface)",
+            borderRadius: "var(--radius)",
+            padding: "24px",
+            maxWidth: 400,
+            width: "100%",
+            boxShadow: "0 8px 32px rgba(0,0,0,0.22)",
+          }}>
+            <div id="confirm-modal-title" style={{ fontWeight: 700, fontSize: "var(--font-lg,1rem)", marginBottom: 8, color: "var(--fg)" }}>
+              {confirmModal.title}
+            </div>
+            <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)", marginBottom: 24, lineHeight: 1.5 }}>
+              {confirmModal.message}
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button
+                className="btn btn-ghost"
+                onClick={closeConfirm}
+                autoFocus
+              >
+                {confirmModal.cancelLabel ?? "Cancel"}
+              </button>
+              <button
+                className="btn"
+                onClick={handleConfirm}
+                style={{
+                  background: confirmModal.isDanger ? "var(--red,#dc2626)" : "var(--accent,#2563eb)",
+                  color: "#fff",
+                  border: "none",
+                  fontWeight: 600,
+                }}
+              >
+                {confirmModal.confirmLabel ?? "Confirm"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       </div>{/* /main content area */}
     </div>
   );

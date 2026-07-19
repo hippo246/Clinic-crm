@@ -1,8 +1,10 @@
 import React, { useState, useMemo, useCallback, useEffect } from "react";
 import type { Patient, UserRole, PatientStatus } from "./types";
 import { DOCTORS, STATUSES, PAGE_SIZE } from "./constants";
-import { applySmartSearch, sortPatients, fmtDate, calcRiskScore, detectDuplicates, exportPatientsToCSV, fuzzyMatch, getHighlightParts } from "./utils";
+import { applySmartSearch, sortPatients, fmtDate, calcRiskScore, detectDuplicates, exportPatientsToCSV, fuzzyMatch, getHighlightParts, getActivePatients, getArchivedPatients, buildPatientImportPreview, getPatientImportSummary, createPatientBackup, restorePatientBackup, clearPatientBackup, filterReviewedDuplicates, saveReviewedDuplicate, buildMergePreview, isDuplicateReviewed } from "./utils";
 import { StatusBadge, InsuranceBadge, AlertChip, AvatarCircle, RiskBadge } from "./Badges";
+import { hasRole, normalizeRole } from "../shared/permissions/permissions";
+import { logDeniedAction } from "../shared/services/deniedActionLogger";
 
 // ─── localStorage helpers ─────────────────────────────────────────────────────
 function readJSON<T>(key: string, fallback: T): T {
@@ -43,6 +45,7 @@ interface PatientListProps {
   role: UserRole;
   onUpdatePatient?: (p: Patient) => void;
   onDeletePatient?: (id: string) => void;
+  onRestorePatient?: (id: string) => void; // Phase 7C
 }
 
 function QualityBar({ patients, onSearch }: { patients: Patient[]; onSearch: (q: string) => void }) {
@@ -174,7 +177,11 @@ export default function PatientList({
   role,
   onUpdatePatient,
   onDeletePatient,
+  onRestorePatient,
 }: PatientListProps) {
+  // Normalize role to ensure it's a valid UserRole
+  const normalizedRole = normalizeRole(role) as UserRole;
+
   const [search,          setSearch]         = useState("");
   const [filterStatus,    setFilterStatus]   = useState("All");
   const [filterDoctor,    setFilterDoctor]   = useState("All");
@@ -221,7 +228,11 @@ export default function PatientList({
   const [customPrintTitle, setCustomPrintTitle] = useState("");
   const [quickFilter, setQuickFilter] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"table" | "card" | "dashboard" | "timeline">("table");
+  const [patientListMode, setPatientListMode] = useState<"active" | "archived">("active"); // Phase 7C
+  const [exportPreset, setExportPreset] = useState<"demographics" | "contact" | "clinical" | "full">("full"); // Phase 7D
   const [showDuplicateModal, setShowDuplicateModal] = useState(false);
+  const [mergePreview, setMergePreview] = useState<any | null>(null); // Phase 7E
+  const [showMergeModal, setShowMergeModal] = useState(false); // Phase 7E
   const [groupBy, setGroupBy] = useState<"none" | "status" | "doctor" | "risk" | "tags">("none");
   const [showImportModal, setShowImportModal] = useState(false);
   const [showExportModal, setShowExportModal] = useState(false);
@@ -465,7 +476,10 @@ export default function PatientList({
   }
 
   function handleDeleteSearch(id: string) {
-    if (!requireAdmin()) return;
+    if (!canManageSavedSearches) {
+      handleDeniedAccess("delete", "saved search");
+      return;
+    }
     const s = savedSearches.find(s => s.id === id);
     setConfirmModal({
       title: "Delete Saved Search",
@@ -484,8 +498,41 @@ export default function PatientList({
     resetPage();
   }
 
-  function handleToggleReminder(id: string) {
-    setReminders(reminders.map(r => r.id === id ? { ...r, completed: !r.completed } : r));
+  const handleToggleReminder = useCallback((id: string) => {
+    setReminders(prev => prev.map(r => r.id === id ? { ...r, completed: !r.completed } : r));
+  }, []);
+
+  // ── role gating (Phase 6G) ──────────────────────────────────────────────────────
+  const isAdmin = String(role).toLowerCase() === "admin";
+
+  // ─── Local Permission Guards (Phase 6G) ─────────────────────────────────────────────
+  const canExportPatients = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canCreatePatient = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canEditPatient = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canDeletePatient = hasRole(normalizedRole, ["admin"]);
+  const canArchivePatient = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canManageSavedSearches = hasRole(normalizedRole, ["admin"]);
+  const canManageSavedFilters = hasRole(normalizedRole, ["admin"]);
+  const canManageReminders = hasRole(normalizedRole, ["admin"]);
+
+  // ─── Local Denied Helper (Phase 6G) ───────────────────────────────────────────────
+  const handleDeniedAccess = (action: string, resource: string) => {
+    showFeedback(`You do not have permission to ${action} ${resource}.`, "error");
+    logDeniedAction({
+      role: normalizedRole,
+      action,
+      resource,
+      reason: "Insufficient permissions",
+      severity: "medium",
+    });
+  };
+
+  function requireAdmin(): boolean {
+    if (!isAdmin) {
+      showFeedback("You do not have permission for this action in the current role.", "error");
+      return false;
+    }
+    return true;
   }
 
   // ── add reminder modal ──────────────────────────────────────────────────────
@@ -517,8 +564,11 @@ export default function PatientList({
     setReminderPatient(null);
   }
 
-  function handleDeleteReminder(id: string) {
-    if (!requireAdmin()) return;
+  const handleDeleteReminder = useCallback((id: string) => {
+    if (!canManageReminders) {
+      handleDeniedAccess("delete", "reminder");
+      return;
+    }
     const r = reminders.find(r => r.id === id);
     setConfirmModal({
       title: "Delete Reminder",
@@ -526,36 +576,26 @@ export default function PatientList({
       confirmLabel: "Delete",
       danger: true,
       onConfirm: () => {
-        setReminders(reminders.filter(r => r.id !== id));
+        setReminders(prev => prev.filter(r => r.id !== id));
         showFeedback("Reminder deleted", "success");
       },
     });
-  }
+  }, [reminders, canManageReminders, showFeedback]);
 
   function handleToggleOnboardingTask(id: string) {
     setOnboardingTasks(onboardingTasks.map(t => t.id === id ? { ...t, completed: !t.completed } : t));
   }
 
-  function logAuditTrail(action: string, patientId: string, patientName: string) {
+  function logAuditTrail(action: string, patientId: string, patientName?: string) {
+    // Phase 7K: Remove PHI from persistent audit logs - only store patientId
     const entry = {
       id: `audit-${Date.now()}`,
       action,
       patientId,
-      patientName,
       timestamp: new Date().toISOString(),
       user: "Current User"
     };
     setAuditTrail(prev => [entry, ...prev].slice(0, 100));
-  }
-
-  // ── role gating ──────────────────────────────────────────────────────────────
-  const isAdmin = String(role).toLowerCase() === "admin";
-  function requireAdmin(): boolean {
-    if (!isAdmin) {
-      showFeedback("You do not have permission for this action in the current role.", "error");
-      return false;
-    }
-    return true;
   }
 
   function handleSaveFilter() {
@@ -614,7 +654,10 @@ export default function PatientList({
   }
 
   function handleDeleteFilter(id: string) {
-    if (!requireAdmin()) return;
+    if (!canManageSavedFilters) {
+      handleDeniedAccess("delete", "saved filter");
+      return;
+    }
     const filter = savedFilters.find(f => f.id === id);
     setConfirmModal({
       title: "Delete Saved Filter",
@@ -817,7 +860,7 @@ export default function PatientList({
     const updatedPatient = { ...patient, tags: updatedTags };
     if (onUpdatePatient) {
       onUpdatePatient(updatedPatient);
-      logAuditTrail(`Added tag "${tagValue}"`, patient.id, patient.name);
+      logAuditTrail(`Added tag "${tagValue}"`, patient.id, "multiple");
       showFeedback(`Added tag "${tagValue}"`, "success");
     } else {
       showFeedback("Update not available", "error");
@@ -831,7 +874,7 @@ export default function PatientList({
     const updatedPatient = { ...patient, tags: updatedTags };
     if (onUpdatePatient) {
       onUpdatePatient(updatedPatient);
-      logAuditTrail(`Removed tag "${tag}"`, patient.id, patient.name);
+      logAuditTrail(`Removed tag "${tag}"`, patient.id, "multiple");
       showFeedback(`Removed tag "${tag}"`, "success");
     } else {
       showFeedback("Update not available", "error");
@@ -845,16 +888,17 @@ export default function PatientList({
     return Array.from(tags).sort();
   }, [patients]);
 
-  // Detect duplicate patients
+  // Detect duplicate patients (exclude soft-deleted)
   const duplicateGroups = useMemo(() => {
     const groups: Patient[][] = [];
     const processed = new Set<string>();
+    const activePatients = getActivePatients(patients);
 
-    patients.forEach((p1) => {
+    activePatients.forEach((p1) => {
       if (processed.has(p1.id)) return;
 
       const duplicates: Patient[] = [p1];
-      patients.forEach((p2) => {
+      activePatients.forEach((p2) => {
         if (p1.id === p2.id) return;
         if (processed.has(p2.id)) return;
 
@@ -877,13 +921,30 @@ export default function PatientList({
       processed.add(p1.id);
     });
 
-    return groups;
-  }, [patients]);
+    // Phase 7E: Filter out reviewed duplicates
+    return groups.filter(group => {
+      const ids = group.map(p => p.id);
+      for (let i = 0; i < ids.length; i++) {
+        for (let j = i + 1; j < ids.length; j++) {
+          if (isDuplicateReviewed(ids[i], ids[j])) {
+            return false;
+          }
+        }
+      }
+      return true;
+    });
+  }, [patients, patientListMode]);
 
   const duplicateCount = duplicateGroups.length;
 
   const filtered = useMemo(() => {
-    let list = applySmartSearch(patients, search);
+    // Phase 7C: Filter based on patientListMode (active vs archived)
+    let list = patientListMode === "active" 
+      ? getActivePatients(patients) 
+      : getArchivedPatients(patients);
+    
+    // Apply search
+    list = applySmartSearch(list, search);
     
     // Collect all active filter conditions
     const filterConditions: Array<(p: Patient) => boolean> = [];
@@ -946,7 +1007,7 @@ export default function PatientList({
     }
     
     return sortPatients(list, sortKey, sortDir);
-  }, [patients, search, filterStatus, filterDoctor, filterInsurance, filterRisk, filterTag, sortKey, sortDir, dateRangeFrom, dateRangeTo, quickFilter]);
+  }, [patients, search, filterStatus, filterDoctor, filterInsurance, filterRisk, filterTag, filterLogic, sortKey, sortDir, dateRangeFrom, dateRangeTo, quickFilter, patientListMode]);
 
   // Group patients based on selected criteria
   const groupedPatients = useMemo(() => {
@@ -1005,7 +1066,10 @@ export default function PatientList({
     setPage(1);
   }, [search, filterStatus, filterDoctor, filterInsurance, filterRisk, filterTag, filterLogic, dateRangeFrom, dateRangeTo, quickFilter, sortKey, sortDir, groupBy]);
 
-  const activeFilterCount = [filterStatus !== "All", filterDoctor !== "All", filterInsurance !== "All", filterRisk !== "All", filterTag !== "All"].filter(Boolean).length;
+  const activeFilterCount = useMemo(
+    () => [filterStatus !== "All", filterDoctor !== "All", filterInsurance !== "All", filterRisk !== "All", filterTag !== "All"].filter(Boolean).length,
+    [filterStatus, filterDoctor, filterInsurance, filterRisk, filterTag]
+  );
 
   // On phone-sized screens, the dense table doesn't fit — fall back to the card layout automatically
   const effectiveView = isMobile && viewMode === "table" ? "card" : viewMode;
@@ -1052,13 +1116,17 @@ export default function PatientList({
   }
 
   function handleBulkExport() {
+    if (!canExportPatients) {
+      handleDeniedAccess("export", "patients");
+      return;
+    }
     const selected = patients.filter(p => selectedPatients.has(p.id));
     if (selected.length === 0) {
       showFeedback("Select at least one patient first", "error");
       return;
     }
-    exportPatientsToCSV(selected);
-    logAuditTrail(`Exported ${selected.length} selected patient${selected.length !== 1 ? "s" : ""}`, "bulk", "multiple");
+    exportPatientsToCSV(selected, exportPreset, CURRENT_USER.name);
+    logAuditTrail(`Exported ${selected.length} selected patient${selected.length !== 1 ? "s" : ""} (${exportPreset})`, "bulk", "multiple");
     showFeedback(`Exported ${selected.length} patient${selected.length !== 1 ? "s" : ""}`, "success");
     clearSelection();
   }
@@ -1068,23 +1136,61 @@ export default function PatientList({
       showFeedback("Select at least one patient first", "error");
       return;
     }
-    if (!requireAdmin()) return;
+    if (!canDeletePatient) {
+      handleDeniedAccess("delete", "patients");
+      return;
+    }
     if (!onDeletePatient) {
-      showFeedback("Delete is not available", "error");
+      showFeedback("Archive is not available", "error");
       return;
     }
     setConfirmModal({
-      title: "Delete Patients",
-      message: `Are you sure you want to delete ${selectedPatients.size} patient${selectedPatients.size !== 1 ? "s" : ""}? This cannot be undone.`,
-      confirmLabel: "Delete",
+      title: "Archive Patients",
+      message: `Are you sure you want to archive ${selectedPatients.size} patient${selectedPatients.size !== 1 ? "s" : ""}? This will mark them as archived and can be restored later.`,
+      confirmLabel: "Archive",
       danger: true,
-      requireTypedWord: "DELETE",
+      requireTypedWord: "ARCHIVE",
       onConfirm: () => {
         const count = selectedPatients.size;
         selectedPatients.forEach(id => onDeletePatient!(id));
-        logAuditTrail(`Bulk deleted ${count} patients`, "bulk", "multiple");
+        logAuditTrail(`Bulk archived ${count} patients`, "bulk", "multiple");
         clearSelection();
-        showFeedback(`Deleted ${count} patient${count !== 1 ? "s" : ""}`, "success");
+        showFeedback(`Archived ${count} patient${count !== 1 ? "s" : ""}`, "success");
+      },
+    });
+  }
+
+  // Phase 7C: Restore patient from archived state
+  function handleRestore(patientId: string) {
+    if (!isAdmin) {
+      handleDeniedAccess("restore", "patient");
+      return;
+    }
+    const patient = patients.find(p => p.id === patientId);
+    setConfirmModal({
+      title: "Restore Patient",
+      message: `Restore ${patient?.name || "this patient"}'s record to active patient management? The patient will return to their previous status (${patient?.statusBeforeArchive || "Active"}).`,
+      confirmLabel: "Restore",
+      danger: false,
+      onConfirm: async () => {
+        try {
+          if (onRestorePatient) {
+            onRestorePatient(patientId);
+          } else {
+            await apiClient.restorePatient(patientId, CURRENT_USER.name);
+            // Reload patients from storage to get updated state
+            const updated = await apiClient.getPatients();
+            if (onUpdatePatient) {
+              // Trigger parent to reload patients
+              window.location.reload();
+            }
+          }
+          logAuditTrail(`Restored patient record ${patientId}`, "restore", patientId);
+          showFeedback(`Patient restored successfully`, "success");
+        } catch (error) {
+          console.error("Failed to restore patient:", error);
+          showFeedback(`Failed to restore patient: ${error}`, "error");
+        }
       },
     });
   }
@@ -1149,7 +1255,7 @@ export default function PatientList({
       case "call":
         if (patient.phone) {
           setCallingPatient(patient);
-          logAuditTrail("Called patient", patient.id, patient.name);
+          logAuditTrail("Called patient", patient.id, "multiple");
         } else {
           showFeedback(`No phone number on file for ${patient.name}`, "error");
         }
@@ -1157,7 +1263,7 @@ export default function PatientList({
       case "email":
         if (patient.email) {
           window.location.href = `mailto:${patient.email}`;
-          logAuditTrail("Emailed patient", patient.id, patient.name);
+          logAuditTrail("Emailed patient", patient.id, "multiple");
         } else {
           showFeedback(`No email address on file for ${patient.name}`, "error");
         }
@@ -1186,6 +1292,9 @@ export default function PatientList({
         setSelectedPatientForTags(patient);
         setShowTagManager(true);
         break;
+      case "restore":
+        handleRestore(patient.id);
+        break;
       case "reminder":
         setReminderPatient(patient);
         setReminderType("follow-up");
@@ -1193,6 +1302,66 @@ export default function PatientList({
         setReminderNotes("");
         setShowAddReminderModal(true);
         break;
+    }
+  }
+
+  // Phase 7E: Dismiss duplicate pair
+  function handleDismissDuplicate(patientId1: string, patientId2: string) {
+    saveReviewedDuplicate({
+      patientId1,
+      patientId2,
+      dismissedAt: new Date().toISOString(),
+      dismissedBy: CURRENT_USER.name
+    });
+    logAuditTrail(`Dismissed duplicate pair ${patientId1}/${patientId2}`, "dismiss_duplicate", "multiple");
+    showFeedback("Duplicate pair dismissed", "success");
+  }
+
+  // Phase 7E: Open merge preview
+  function handleOpenMerge(masterPatient: Patient, duplicatePatient: Patient) {
+    if (!hasRole(normalizedRole, ["admin", "doctor"])) {
+      handleDeniedAccess("merge", "patient");
+      return;
+    }
+    const preview = buildMergePreview(masterPatient, duplicatePatient);
+    setMergePreview(preview);
+    setShowMergeModal(true);
+  }
+
+  // Phase 7E: Commit merge
+  async function handleCommitMerge() {
+    if (!mergePreview || !onUpdatePatient || !onDeletePatient) {
+      showFeedback("Merge not ready", "error");
+      return;
+    }
+
+    try {
+      const { masterPatient, duplicatePatient, fieldDifferences } = mergePreview;
+      
+      // Build merged patient data
+      const mergedData: Partial<Patient> = { ...masterPatient };
+      fieldDifferences.forEach(diff => {
+        if (!diff.useMaster && diff.duplicateValue) {
+          mergedData[diff.field] = diff.duplicateValue;
+        }
+      });
+      mergedData.updatedAt = new Date().toISOString();
+
+      // Update master patient
+      const updatedMaster = await onUpdatePatient(mergedData as Patient);
+      
+      // Archive duplicate patient using soft delete
+      await onDeletePatient(duplicatePatient.id);
+      
+      // Log merge safely
+      logAuditTrail(`Merged patient records: duplicate ${duplicatePatient.id} archived into master ${masterPatient.id}`, "merge", masterPatient.id);
+      
+      showFeedback("Merge completed successfully", "success");
+      setShowMergeModal(false);
+      setMergePreview(null);
+    } catch (error) {
+      console.error("Merge failed:", error);
+      showFeedback("Merge failed", "error");
     }
   }
 
@@ -1212,12 +1381,15 @@ export default function PatientList({
     return patients.filter(p => selectedPatients.has(p.id));
   }, [patients, selectedPatients]);
 
-  const dupeCount = useMemo(() => detectDuplicates(patients).length, [patients]);
+  const dupeCount = duplicateGroups.length;
   const [reviewedDuplicates, setReviewedDuplicates] = useState<Set<string>>(new Set());
 
-  // ── import modal state/handlers ─────────────────────────────────────────────
+  // ── import modal state/handlers (Phase 7D) ───────────────────────────────────────
   const [importText, setImportText] = useState("");
   const [importResult, setImportResult] = useState<{ matched: number; newRows: number; skipped: number } | null>(null);
+  const [importPreview, setImportPreview] = useState<any[] | null>(null); // Phase 7D
+  const [importSummary, setImportSummary] = useState<any | null>(null); // Phase 7D
+  const [showImportPreview, setShowImportPreview] = useState(false); // Phase 7D
 
   function parseCSV(text: string): Array<Record<string, string>> {
     const lines = text.split(/\r?\n/).filter(l => l.trim().length > 0);
@@ -1229,6 +1401,111 @@ export default function PatientList({
       headers.forEach((h, i) => { row[h] = cells[i] ?? ""; });
       return row;
     });
+  }
+
+  // Phase 7D: Parse and validate import for preview
+  function handleImportPreview() {
+    if (!importText.trim()) {
+      showFeedback("Paste CSV text or choose a file first", "error");
+      return;
+    }
+    const rows = parseCSV(importText);
+    if (rows.length === 0) {
+      showFeedback("No rows found to import", "error");
+      return;
+    }
+
+    // Convert CSV rows to partial patient objects
+    const patientRows = rows.map((row) => {
+      const firstName = row.firstName || (row.name ? row.name.split(" ")[0] : "");
+      const lastName = row.lastName || (row.name ? row.name.split(" ").slice(1).join(" ") : "");
+      const name = row.name || `${firstName} ${lastName}`.trim();
+      return {
+        id: row.id || undefined,
+        name,
+        phone: row.phone || "",
+        email: row.email || "",
+        dob: row.dob || "",
+        age: row.age ? parseInt(row.age) : undefined,
+        gender: row.gender || undefined,
+        bloodGroup: row.bloodGroup || undefined,
+        address: row.address || "",
+        doctor: row.doctor || "",
+        status: row.status || undefined,
+        insurer: row.insurer || "",
+        insuranceStatus: row.insuranceStatus || undefined,
+        insuranceExpiry: row.insuranceExpiry || "",
+      } as Partial<Patient>;
+    });
+
+    // Build preview with validation
+    const preview = buildPatientImportPreview(patientRows, patients);
+    const summary = getPatientImportSummary(preview);
+    
+    setImportPreview(preview);
+    setImportSummary(summary);
+    setShowImportPreview(true);
+  }
+
+  // Phase 7D: Commit import with rollback backup
+  async function handleCommitImport() {
+    if (!importPreview || !onUpdatePatient) {
+      showFeedback("Import not ready", "error");
+      return;
+    }
+
+    try {
+      // Create backup before commit
+      await createPatientBackup(patients);
+
+      let created = 0;
+      let updated = 0;
+      let skipped = 0;
+
+      const validRows = importPreview.filter(r => r.status === "valid" || r.status === "update");
+      
+      for (const row of validRows) {
+        if (row.status === "update" && row.matchedPatientId) {
+          // Update existing patient
+          const existing = patients.find(p => p.id === row.matchedPatientId);
+          if (existing) {
+            onUpdatePatient({ ...existing, ...row.data });
+            updated++;
+          }
+        } else if (row.status === "valid") {
+          // Create new patient - trigger via parent
+          if (onImport) {
+            onImport();
+            created++;
+          }
+        } else {
+          skipped++;
+        }
+      }
+
+      setImportResult({ matched: updated, newRows: created, skipped });
+      setShowImportPreview(false);
+      setImportText("");
+      setImportPreview(null);
+      setImportSummary(null);
+      
+      logAuditTrail(`Import committed: ${created} created, ${updated} updated, ${skipped} skipped`, "import", "bulk");
+      showFeedback(`Import completed: ${created} created, ${updated} updated, ${skipped} skipped`, "success");
+      
+      // Clear backup after successful import
+      await clearPatientBackup();
+    } catch (error) {
+      console.error("Import failed, restoring backup:", error);
+      
+      // Restore from backup
+      const backup = await restorePatientBackup();
+      if (backup) {
+        setPatients(backup);
+        showFeedback("Import failed, restored previous data", "error");
+      } else {
+        showFeedback("Import failed and could not restore backup", "error");
+      }
+    }
   }
 
   function handleImport() {
@@ -1339,6 +1616,10 @@ export default function PatientList({
   }
 
   function handleExport() {
+    if (!canExportPatients) {
+      handleDeniedAccess("export", "patients");
+      return;
+    }
     const rows = exportScope === "selected"
       ? patients.filter(p => selectedPatients.has(p.id))
       : filtered;
@@ -1368,10 +1649,10 @@ export default function PatientList({
       const cols = Array.from(selectedColumns);
       downloadFile(buildCSV(cols, rows as any), `patients_${stamp}.csv`, "text/csv");
     } else {
-      exportPatientsToCSV(rows);
+      exportPatientsToCSV(rows, exportPreset, CURRENT_USER.name);
     }
 
-    logAuditTrail(`Exported ${rows.length} patient${rows.length !== 1 ? "s" : ""} (${exportFormat}, ${exportScope})`, "bulk", "multiple");
+    logAuditTrail(`Exported ${rows.length} patient${rows.length !== 1 ? "s" : ""} (${exportFormat}, ${exportScope}, ${exportPreset})`, "bulk", "multiple");
     showFeedback(`Exported ${rows.length} patient${rows.length !== 1 ? "s" : ""}`, "success");
     setShowExportModal(false);
   }
@@ -1743,6 +2024,37 @@ export default function PatientList({
 
         {/* View Toggle — hidden on mobile (view is forced to card) */}
         <div className="pl-hide-mobile" style={{ display: "flex", gap: 4, marginLeft: 8 }}>
+          {/* Phase 7C: Active/Archived toggle (admin-only) */}
+          {isAdmin && (
+            <div style={{ display: "flex", gap: 2, marginRight: 8 }}>
+              <button
+                onClick={() => setPatientListMode("active")}
+                className="btn-icon"
+                title="Active patients"
+                style={{ 
+                  background: patientListMode === "active" ? "var(--accent-soft)" : "transparent", 
+                  color: patientListMode === "active" ? "var(--accent)" : "var(--muted)",
+                  fontSize: "var(--font-xs)",
+                  padding: "4px 8px"
+                }}
+              >
+                Active
+              </button>
+              <button
+                onClick={() => setPatientListMode("archived")}
+                className="btn-icon"
+                title="Archived patients"
+                style={{ 
+                  background: patientListMode === "archived" ? "var(--accent-soft)" : "transparent", 
+                  color: patientListMode === "archived" ? "var(--accent)" : "var(--muted)",
+                  fontSize: "var(--font-xs)",
+                  padding: "4px 8px"
+                }}
+              >
+                Archived
+              </button>
+            </div>
+          )}
           {!isMobile && (
             <button
               onClick={() => setViewMode("table")}
@@ -1928,18 +2240,24 @@ export default function PatientList({
             <span className="desktop-only">Print</span>
           </button>
           <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)" }} onClick={() => {
+            if (!canExportPatients) {
+              handleDeniedAccess("export", "patients");
+              return;
+            }
             if (filtered.length === 0) { showFeedback("No patients match the current filters", "error"); return; }
-            exportPatientsToCSV(filtered);
-            logAuditTrail(`Exported ${filtered.length} filtered patient${filtered.length !== 1 ? "s" : ""}`, "bulk", "multiple");
+            exportPatientsToCSV(filtered, exportPreset, CURRENT_USER.name);
+            logAuditTrail(`Exported ${filtered.length} filtered patient${filtered.length !== 1 ? "s" : ""} (${exportPreset})`, "bulk", "multiple");
             showFeedback(`Exported ${filtered.length} patient${filtered.length !== 1 ? "s" : ""}`, "success");
           }}>
             <i className="ti ti-download" style={{ fontSize: 14 }} />
             <span className="desktop-only">Export</span>
           </button>
-          <button className="btn btn-primary" style={{ fontSize: "var(--font-sm)" }} onClick={onNewPatient}>
-            <i className="ti ti-user-plus" style={{ fontSize: 14 }} />
-            <span className="desktop-only">New Patient</span>
-          </button>
+          {canCreatePatient && (
+            <button className="btn btn-primary" style={{ fontSize: "var(--font-sm)" }} onClick={onNewPatient}>
+              <i className="ti ti-user-plus" style={{ fontSize: 14 }} />
+              <span className="desktop-only">New Patient</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -2813,12 +3131,28 @@ export default function PatientList({
             <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
               {duplicateGroups.map((group, groupIndex) => {
                 const groupKey = group.map(p => p.id).join("-");
-                const reviewed = reviewedDuplicates.has(groupKey);
                 return (
-                <div key={groupIndex} style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 16, opacity: reviewed ? 0.6 : 1 }}>
+                <div key={groupIndex} style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", padding: 16 }}>
                   <div style={{ marginBottom: 12, fontWeight: 600, color: "var(--text)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                     <span>Group {groupIndex + 1} ({group.length} patients) — matched by {group[0]?.phone && group[1]?.phone === group[0]?.phone ? "phone" : group[0]?.email && group[1]?.email === group[0]?.email ? "email" : "name"}</span>
-                    {reviewed && <span className="badge" style={{ background: "var(--green-bg)", color: "var(--green)" }}>Reviewed</span>}
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button 
+                        className="btn btn-ghost" 
+                        style={{ fontSize: "var(--font-xs)" }}
+                        onClick={() => handleDismissDuplicate(group[0].id, group[1].id)}
+                      >
+                        Dismiss
+                      </button>
+                      {hasRole(normalizedRole, ["admin", "doctor"]) && (
+                        <button 
+                          className="btn btn-primary" 
+                          style={{ fontSize: "var(--font-xs)" }}
+                          onClick={() => handleOpenMerge(group[0], group[1])}
+                        >
+                          Merge
+                        </button>
+                      )}
+                    </div>
                   </div>
                   <div style={{ display: "grid", gap: 12 }}>
                     {group.map((patient) => (
@@ -2880,6 +3214,97 @@ export default function PatientList({
             </div>
             <div style={{ marginTop: 16, display: "flex", justifyContent: "flex-end", gap: 8 }}>
               <button className="btn btn-ghost" onClick={() => setShowDuplicateModal(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Phase 7E: Merge Preview Modal */}
+      {showMergeModal && mergePreview && (
+        <div className="modal-backdrop" onClick={() => setShowMergeModal(false)}>
+          <div className="modal" style={{ maxWidth: 700, maxHeight: "80vh", overflow: "auto" }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700 }}>Merge Patients</h2>
+              <button className="btn-icon" onClick={() => setShowMergeModal(false)}>
+                <i className="ti ti-x" style={{ fontSize: 16 }} />
+              </button>
+            </div>
+            <div style={{ marginBottom: 16, padding: 12, background: "var(--surface2)", borderRadius: "var(--radius-sm)" }}>
+              <div style={{ fontSize: "var(--font-sm)", marginBottom: 8 }}>
+                <strong>Master:</strong> {mergePreview.masterPatient.name} (ID: {mergePreview.masterPatient.id})
+              </div>
+              <div style={{ fontSize: "var(--font-sm)", marginBottom: 8 }}>
+                <strong>Duplicate:</strong> {mergePreview.duplicatePatient.name} (ID: {mergePreview.duplicatePatient.id})
+              </div>
+              <div style={{ fontSize: "var(--font-xs)", color: "var(--orange)" }}>
+                ⚠️ The duplicate record will be archived (soft-deleted), not permanently deleted.
+              </div>
+            </div>
+            
+            {mergePreview.fieldDifferences.length > 0 ? (
+              <>
+                <h3 style={{ fontSize: "var(--font-md)", fontWeight: 600, marginBottom: 12 }}>Field Differences</h3>
+                <div style={{ marginBottom: 16, maxHeight: 300, overflow: "auto" }}>
+                  {mergePreview.fieldDifferences.map((diff, idx) => (
+                    <div key={idx} style={{ 
+                      padding: 12, 
+                      background: "var(--surface2)", 
+                      borderRadius: "var(--radius-sm)",
+                      marginBottom: 8,
+                      border: "1px solid var(--border)"
+                    }}>
+                      <div style={{ fontWeight: 600, fontSize: "var(--font-sm)", marginBottom: 8 }}>
+                        {String(diff.field)}
+                      </div>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, fontSize: "var(--font-xs)" }}>
+                        <div>
+                          <span style={{ color: "var(--muted)" }}>Master:</span> {String(diff.masterValue || "—")}
+                        </div>
+                        <div>
+                          <span style={{ color: "var(--muted)" }}>Duplicate:</span> {String(diff.duplicateValue || "—")}
+                        </div>
+                      </div>
+                      <div style={{ marginTop: 8 }}>
+                        <label style={{ fontSize: "var(--font-xs)", display: "flex", alignItems: "center", gap: 8 }}>
+                          <input 
+                            type="radio" 
+                            checked={diff.useMaster}
+                            onChange={() => {
+                              const updated = [...mergePreview.fieldDifferences];
+                              updated[idx].useMaster = true;
+                              setMergePreview({ ...mergePreview, fieldDifferences: updated });
+                            }}
+                          />
+                          Keep master value
+                        </label>
+                        <label style={{ fontSize: "var(--font-xs)", display: "flex", alignItems: "center", gap: 8, marginLeft: 16 }}>
+                          <input 
+                            type="radio" 
+                            checked={!diff.useMaster}
+                            onChange={() => {
+                              const updated = [...mergePreview.fieldDifferences];
+                              updated[idx].useMaster = false;
+                              setMergePreview({ ...mergePreview, fieldDifferences: updated });
+                            }}
+                          />
+                          Use duplicate value
+                        </label>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div style={{ marginBottom: 16, padding: 12, background: "var(--green-bg)", borderRadius: "var(--radius-sm)", color: "var(--green)" }}>
+                No field differences found. Records are identical.
+              </div>
+            )}
+            
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+              <button className="btn btn-ghost" onClick={() => setShowMergeModal(false)}>Cancel</button>
+              <button className="btn btn-primary" onClick={handleCommitMerge}>
+                Confirm Merge
+              </button>
             </div>
           </div>
         </div>
@@ -2952,7 +3377,93 @@ export default function PatientList({
             )}
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
               <button className="btn btn-ghost" onClick={() => { setShowImportModal(false); setImportText(""); setImportResult(null); }}>Close</button>
-              <button className="btn btn-primary" onClick={handleImport}>Import</button>
+              <button className="btn btn-primary" onClick={handleImportPreview}>Preview Import</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Phase 7D: Import Preview Modal */}
+      {showImportPreview && importSummary && (
+        <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1001 }}>
+          <div style={{ background: "var(--surface)", borderRadius: "var(--radius)", padding: 24, width: "100%", maxWidth: 700, maxHeight: "80vh", overflow: "auto", position: "relative" }}>
+            <h2 style={{ fontSize: "var(--font-lg)", fontWeight: 700, margin: 0, marginBottom: 16 }}>Import Preview</h2>
+            <button onClick={() => { setShowImportPreview(false); setImportPreview(null); setImportSummary(null); }} style={{ position: "absolute", top: 16, right: 16, background: "none", border: "none", fontSize: "1.5rem", cursor: "pointer" }}>×</button>
+            
+            <div style={{ marginBottom: 16, padding: 12, background: "var(--surface2)", borderRadius: "var(--radius-sm)" }}>
+              <div style={{ fontSize: "var(--font-sm)", marginBottom: 8 }}>
+                <strong>Total rows:</strong> {importSummary.total}
+              </div>
+              <div style={{ fontSize: "var(--font-sm)", marginBottom: 8, color: "var(--green)" }}>
+                <strong>Valid (will create):</strong> {importSummary.valid}
+              </div>
+              <div style={{ fontSize: "var(--font-sm)", marginBottom: 8, color: "var(--blue)" }}>
+                <strong>Updates (existing patients):</strong> {importSummary.update}
+              </div>
+              <div style={{ fontSize: "var(--font-sm)", marginBottom: 8, color: "var(--orange)" }}>
+                <strong>Duplicates (review needed):</strong> {importSummary.duplicate}
+              </div>
+              <div style={{ fontSize: "var(--font-sm)", color: "var(--red)" }}>
+                <strong>Invalid (will skip):</strong> {importSummary.invalid}
+              </div>
+            </div>
+
+            {importPreview && importPreview.length > 0 && (
+              <div style={{ marginBottom: 16 }}>
+                <h3 style={{ fontSize: "var(--font-md)", fontWeight: 600, marginBottom: 8 }}>Row Details</h3>
+                <div style={{ maxHeight: 200, overflow: "auto", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "var(--font-xs)" }}>
+                    <thead style={{ position: "sticky", top: 0, background: "var(--surface)" }}>
+                      <tr>
+                        <th style={{ padding: 8, textAlign: "left", borderBottom: "1px solid var(--border)" }}>#</th>
+                        <th style={{ padding: 8, textAlign: "left", borderBottom: "1px solid var(--border)" }}>Name</th>
+                        <th style={{ padding: 8, textAlign: "left", borderBottom: "1px solid var(--border)" }}>Status</th>
+                        <th style={{ padding: 8, textAlign: "left", borderBottom: "1px solid var(--border)" }}>Issues</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {importPreview.slice(0, 50).map((row, idx) => (
+                        <tr key={idx} style={{ borderBottom: "1px solid var(--border)" }}>
+                          <td style={{ padding: 8 }}>{row.index + 1}</td>
+                          <td style={{ padding: 8 }}>{row.data.name || "(unnamed)"}</td>
+                          <td style={{ padding: 8 }}>
+                            <span style={{
+                              padding: "2px 6px",
+                              borderRadius: "var(--radius-sm)",
+                              fontSize: "var(--font-xs)",
+                              background: row.status === "valid" ? "var(--green-soft)" : 
+                                         row.status === "update" ? "var(--blue-soft)" :
+                                         row.status === "duplicate" ? "var(--orange-soft)" : "var(--red-soft)",
+                              color: row.status === "valid" ? "var(--green)" :
+                                     row.status === "update" ? "var(--blue)" :
+                                     row.status === "duplicate" ? "var(--orange)" : "var(--red)"
+                            }}>
+                              {row.status}
+                            </span>
+                          </td>
+                          <td style={{ padding: 8 }}>{row.issues.length > 0 ? row.issues.join(", ") : "-"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {importPreview.length > 50 && (
+                  <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginTop: 4 }}>
+                    Showing first 50 of {importPreview.length} rows
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+              <button className="btn btn-ghost" onClick={() => { setShowImportPreview(false); setImportPreview(null); setImportSummary(null); }}>Cancel</button>
+              <button 
+                className="btn btn-primary" 
+                onClick={handleCommitImport}
+                disabled={importSummary.valid + importSummary.update === 0}
+              >
+                Commit Import ({importSummary.valid + importSummary.update} rows)
+              </button>
             </div>
           </div>
         </div>
@@ -2990,16 +3501,31 @@ export default function PatientList({
               </select>
             </div>
             {exportFormat === "csv" && (
-              <div style={{ marginBottom: 16 }}>
-                <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "var(--font-sm)" }}>
-                  <input
-                    type="checkbox"
-                    checked={exportVisibleColumnsOnly}
-                    onChange={(e) => setExportVisibleColumnsOnly(e.target.checked)}
-                  />
-                  Export visible columns only ({selectedColumns.size} selected)
-                </label>
-              </div>
+              <>
+                <div style={{ marginBottom: 16 }}>
+                  <label style={{ display: "block", marginBottom: 8, fontSize: "var(--font-sm)", fontWeight: 600 }}>Export Preset (Phase 7D)</label>
+                  <select
+                    value={exportPreset}
+                    onChange={(e) => setExportPreset(e.target.value as any)}
+                    style={{ width: "100%", padding: 8, border: "1px solid var(--border)", borderRadius: "var(--radius-sm)" }}
+                  >
+                    <option value="demographics">Demographics Only (ID, name, DOB, age, gender, blood group, address)</option>
+                    <option value="contact">Contact List (ID, name, phone, email, address)</option>
+                    <option value="clinical">Clinical Summary (ID, name, doctor, status, alerts, conditions, medications, visits)</option>
+                    <option value="full">Full Export (all fields)</option>
+                  </select>
+                </div>
+                <div style={{ marginBottom: 16 }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "var(--font-sm)" }}>
+                    <input
+                      type="checkbox"
+                      checked={exportVisibleColumnsOnly}
+                      onChange={(e) => setExportVisibleColumnsOnly(e.target.checked)}
+                    />
+                    Export visible columns only ({selectedColumns.size} selected)
+                  </label>
+                </div>
+              </>
             )}
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
               <button className="btn btn-ghost" onClick={() => setShowExportModal(false)}>Cancel</button>
@@ -3443,9 +3969,13 @@ export default function PatientList({
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 16 }}>
                 <button className="btn btn-ghost" onClick={() => setShowExportOptions(false)}>Cancel</button>
                 <button className="btn btn-primary" onClick={() => {
+                  if (!canExportPatients) {
+                    handleDeniedAccess("export", "patients");
+                    return;
+                  }
                   if (filtered.length === 0) { showFeedback("No patients match the current filters", "error"); return; }
-                  exportPatientsToCSV(filtered);
-                  logAuditTrail(`Exported ${filtered.length} filtered patient${filtered.length !== 1 ? "s" : ""}`, "bulk", "multiple");
+                  exportPatientsToCSV(filtered, exportPreset, CURRENT_USER.name);
+                  logAuditTrail(`Exported ${filtered.length} filtered patient${filtered.length !== 1 ? "s" : ""} (${exportPreset})`, "bulk", "multiple");
                   showFeedback("Export started", "success");
                   setShowExportOptions(false);
                 }}>Export</button>
@@ -4087,9 +4617,13 @@ export default function PatientList({
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 16 }}>
                 <button className="btn btn-ghost" onClick={() => setShowExportTimeline(false)}>Cancel</button>
                 <button className="btn btn-primary" onClick={() => {
+                  if (!canExportPatients) {
+                    handleDeniedAccess("export", "patients");
+                    return;
+                  }
                   if (filtered.length === 0) { showFeedback("No patients match the current filters", "error"); return; }
-                  exportPatientsToCSV(filtered);
-                  logAuditTrail(`Exported ${filtered.length} filtered patient${filtered.length !== 1 ? "s" : ""}`, "bulk", "multiple");
+                  exportPatientsToCSV(filtered, exportPreset, CURRENT_USER.name);
+                  logAuditTrail(`Exported ${filtered.length} filtered patient${filtered.length !== 1 ? "s" : ""} (${exportPreset})`, "bulk", "multiple");
                   showFeedback("Timeline exported", "success");
                   setShowExportTimeline(false);
                 }}>Export</button>
@@ -4183,6 +4717,7 @@ export default function PatientList({
                 { action: "Send Message", icon: "ti ti-mail", shortcut: "M" },
                 { action: "View Timeline", icon: "ti ti-clock", shortcut: "L" },
                 { action: "Export Data", icon: "ti ti-download", shortcut: "X" },
+                ...(patientListMode === "archived" ? [{ action: "restore", icon: "ti ti-refresh", shortcut: "R" }] : []),
                 { action: "Delete Patient", icon: "ti ti-trash", shortcut: "Del" },
               ].map((item, index) => (
                 <div key={index} style={{ 

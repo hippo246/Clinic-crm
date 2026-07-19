@@ -1,9 +1,10 @@
-import React, { useState, useCallback, useMemo } from "react";
+import React, { useState, useCallback, useMemo, useEffect } from "react";
 import type { Patient, AuditEntry, UserRole, TimelineEvent, PatientNote, PatientDocument, Prescription, LabResult } from "./types";
 import {
   fmtDate, getAvatarColor, getInitials, calcRiskScore,
   calcVisitReadiness, calcNextBestAction, buildSmartSnapshot,
   createAuditEntry,
+  maskPhone, maskEmail, maskAddress, canViewClinicalField, canViewBillingField,
 } from "./utils";
 import { QUICK_ACTIONS, ALERT_SEVERITY, CONSENT_TYPES } from "./constants";
 import {
@@ -11,6 +12,9 @@ import {
   RiskBadge, AvatarCircle, VerifiedDot, ConsentBadge,
 } from "./Badges";
 import { can } from "./constants";
+import { hasRole, normalizeRole } from "../shared/permissions/permissions";
+import { logDeniedAction } from "../shared/services/deniedActionLogger";
+import { logAdminOperation } from "../shared/services/adminAudit";
 import { AppointmentBooking } from "./components/AppointmentBooking";
 import { ConsultationWorkflow } from "./components/ConsultationWorkflow";
 import { PrescriptionManager } from "./components/PrescriptionManager";
@@ -18,8 +22,49 @@ import { FileUpload } from "./components/FileUpload";
 import { InvoiceGenerator } from "./components/InvoiceGenerator";
 import { PatientCommunication } from "./components/PatientCommunication";
 import { FollowUpScheduler } from "./components/FollowUpScheduler";
+import { apiClient } from "./api";
 import { ConsentManager } from "./components/ConsentManager";
 import { useToast } from "./Toast";
+import {
+  createPrivacyRequest,
+  updatePrivacyRequestStatus,
+  completePrivacyRequest,
+  cancelPrivacyRequest,
+  getPrivacyRequestsForPatient,
+  type PrivacyRequest,
+  type PrivacyRequestType,
+  type PrivacyRequestStatus,
+} from "../shared/privacy/privacyRequests";
+import {
+  getConsentStatus,
+  getPatientConsents,
+  getConsentHistory,
+  getExpiringConsents,
+  getExpiredConsents,
+  getConsentSummary,
+  grantConsent,
+  revokeConsent,
+  type ConsentRecord,
+} from "../shared/privacy/consentManager";
+import {
+  getCommunicationPreferences,
+  updateCommunicationPreference,
+  getOptedOutChannels,
+  type CommunicationChannel,
+} from "../shared/privacy/optOutManager";
+import {
+  generatePortabilityExport,
+  downloadExportFile,
+  type PatientDataExport,
+} from "../shared/privacy/dataPortability";
+
+// Phase 7F: Current user constant for audit logging
+const CURRENT_USER = { name: "Current User", role: "doctor" };
+
+// Phase 7F: Local audit trail function (simplified for this component)
+function logAuditTrail(action: string, type: string, patientId: string) {
+  console.log(`[AUDIT] ${type}: ${action} for patient ${patientId}`);
+}
 
 // ─── Tabs ─────────────────────────────────────────────────────────────────────
 const PROFILE_TABS = [
@@ -31,6 +76,7 @@ const PROFILE_TABS = [
   { id: "notes",     label: "Notes",      icon: "ti-notes" },
   { id: "followup",  label: "Follow-Up",  icon: "ti-phone" },
   { id: "consents",  label: "Consents",   icon: "ti-writing" },
+  { id: "privacy",   label: "Privacy",    icon: "ti-shield" },
   { id: "audit",     label: "Audit Log",  icon: "ti-history" },
 ] as const;
 
@@ -56,6 +102,9 @@ export default function PatientProfile({
   onDeletePatient,
   role,
 }: PatientProfileProps) {
+  // Normalize role to ensure it's a valid UserRole
+  const normalizedRole = normalizeRole(role) as UserRole;
+
   const [tab,          setTab]          = useState<TabId>("overview");
   const [showEmergency,setShowEmergency] = useState(false);
   const [showDelete,   setShowDelete]   = useState(false);
@@ -72,6 +121,23 @@ export default function PatientProfile({
   const [showConsent, setShowConsent] = useState(false);
   const [activeWorkflowLoading, setActiveWorkflowLoading] = useState<string | null>(null);
 
+  // Phase 10D: Privacy modals and state
+  const [showPrivacyRequestModal, setShowPrivacyRequestModal] = useState(false);
+  const [privacyRequestType, setPrivacyRequestType] = useState<PrivacyRequestType | null>(null);
+  const [privacyRequestReason, setPrivacyRequestReason] = useState("");
+  const [showPortabilityConfirm, setShowPortabilityConfirm] = useState(false);
+  const [showConsentModal, setShowConsentModal] = useState(false);
+  const [showCommPreferencesModal, setShowCommPreferencesModal] = useState(false);
+  const [commPreferences, setCommPreferences] = useState<Record<CommunicationChannel, boolean> | null>(null);
+
+  // Phase 10D: Privacy data
+  const [privacyRequests, setPrivacyRequests] = useState<PrivacyRequest[]>([]);
+  const [patientConsents, setPatientConsents] = useState<ConsentRecord[]>([]);
+  const [consentHistory, setConsentHistory] = useState<any[]>([]);
+  const [expiringConsents, setExpiringConsents] = useState<ConsentRecord[]>([]);
+  const [expiredConsents, setExpiredConsents] = useState<ConsentRecord[]>([]);
+  const [optedOutChannels, setOptedOutChannels] = useState<CommunicationChannel[]>([]);
+
   const { toast } = useToast();
 
   const nba  = calcNextBestAction(patient);
@@ -79,6 +145,50 @@ export default function PatientProfile({
   const readiness = calcVisitReadiness(patient);
   const snapshot  = buildSmartSnapshot(patient);
   const avatarBg  = getAvatarColor(patient.name);
+
+  // ─── Local Permission Guards (Phase 6G) ─────────────────────────────────────────────
+  const canViewClinicalSections = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canEditClinicalSections = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canViewPrescriptions = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canManagePrescriptions = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canViewLabResults = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canViewClinicalNotes = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canManageClinicalNotes = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canViewDocuments = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist", "readonly"]);
+  const canManageDocuments = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canViewAuditEntries = hasRole(normalizedRole, ["admin", "auditor"]);
+  const canViewConsents = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist", "readonly"]);
+  const canManageConsents = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canEditPatient = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canDeletePatient = hasRole(normalizedRole, ["admin"]);
+
+  // Phase 10D: Privacy permission guards
+  const canViewPrivacy = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist", "readonly"]);
+  const canManagePrivacyRequests = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canExportPortability = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canManageCommunicationPreferences = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+
+  // Phase 7I: Field-level privacy guards
+  const shouldMaskContact = hasRole(normalizedRole, ["auditor", "readonly"]);
+  const shouldMaskBilling = !canViewBillingField(normalizedRole, "insuranceId");
+  const shouldMaskClinical = !canViewClinicalField(normalizedRole, "alerts");
+
+  // Phase 7K: Patient profile view audit logging (one-time per mount)
+  useEffect(() => {
+    logAuditTrail(`Patient profile viewed`, "profile", patient.id);
+  }, [patient.id]); // Only log when patient ID changes (mount or patient switch)
+
+  // ─── Local Denied Helper (Phase 6G) ───────────────────────────────────────────────
+  const handleDeniedAccess = (action: string, resource: string) => {
+    toast({ title: `You do not have permission to ${action} ${resource}.`, variant: "error" });
+    logDeniedAction({
+      role: normalizedRole,
+      action,
+      resource,
+      reason: "Insufficient permissions",
+      severity: "medium",
+    });
+  };
 
   // ── Local helpers ──────────────────────────────────────────────────────────
   function appendTimeline(event: Omit<TimelineEvent, "id">, basePatient?: Patient): Patient {
@@ -113,6 +223,171 @@ export default function PatientProfile({
     if (successMessage) toast({ title: successMessage, variant: "success" });
   }
 
+  // Phase 10D: Privacy request handlers
+  useEffect(() => {
+    if (tab === "privacy") {
+      setPrivacyRequests(getPrivacyRequestsForPatient(patient.id));
+      setPatientConsents(getPatientConsents(patient.id));
+      setConsentHistory(getConsentHistory(patient.id));
+      setExpiringConsents(getExpiringConsents(patient.id));
+      setExpiredConsents(getExpiredConsents(patient.id));
+      setOptedOutChannels(getOptedOutChannels(patient.id));
+      
+      const prefs = getCommunicationPreferences(patient.id);
+      if (prefs) {
+        setCommPreferences(prefs.preferences);
+      }
+    }
+  }, [tab, patient.id]);
+
+  const handleCreatePrivacyRequest = () => {
+    if (!privacyRequestType || !canManagePrivacyRequests) {
+      if (!canManagePrivacyRequests) {
+        handleDeniedAccess("create", "privacy request");
+      }
+      return;
+    }
+
+    const request = createPrivacyRequest(
+      patient.id,
+      privacyRequestType,
+      normalizedRole,
+      privacyRequestReason,
+      "medium"
+    );
+
+    if (request) {
+      setPrivacyRequests([...privacyRequests, request]);
+      setShowPrivacyRequestModal(false);
+      setPrivacyRequestType(null);
+      setPrivacyRequestReason("");
+      
+      // Audit log (PHI-safe)
+      logAdminOperation({
+        action: "privacy_request_created",
+        module: "privacy",
+        resourceType: privacyRequestType,
+        resourceId: request.id,
+        metadata: { patientId: patient.id },
+        actor: normalizedRole,
+        role: normalizedRole,
+      });
+      
+      toast({ title: "Privacy request created successfully", variant: "success" });
+    } else {
+      toast({ title: "Failed to create privacy request", variant: "error" });
+    }
+  };
+
+  const handleUpdatePrivacyRequestStatus = (requestId: string, newStatus: PrivacyRequestStatus) => {
+    if (!canManagePrivacyRequests) {
+      handleDeniedAccess("update", "privacy request status");
+      return;
+    }
+
+    const success = updatePrivacyRequestStatus(requestId, newStatus, normalizedRole);
+    if (success) {
+      setPrivacyRequests(getPrivacyRequestsForPatient(patient.id));
+      
+      // Audit log (PHI-safe)
+      logAdminOperation({
+        action: "privacy_request_status_updated",
+        module: "privacy",
+        resourceType: "privacy_request",
+        resourceId: requestId,
+        metadata: { patientId: patient.id, newStatus },
+        actor: normalizedRole,
+        role: normalizedRole,
+      });
+      
+      toast({ title: `Request status updated to ${newStatus}`, variant: "success" });
+    } else {
+      toast({ title: "Failed to update request status", variant: "error" });
+    }
+  };
+
+  const handlePortabilityExport = () => {
+    if (!canExportPortability) {
+      handleDeniedAccess("generate", "portability export");
+      return;
+    }
+
+    const exportData = generatePortabilityExport(patient.id, normalizedRole);
+    if (exportData) {
+      downloadExportFile(exportData);
+      setShowPortabilityConfirm(false);
+      
+      // Audit log (PHI-safe)
+      logAdminOperation({
+        action: "portability_export",
+        module: "privacy",
+        resourceType: "patient_data",
+        resourceId: patient.id,
+        exportType: "portability",
+        count: exportData.metadata.recordCount,
+        metadata: { sections: exportData.metadata.sections },
+        actor: normalizedRole,
+        role: normalizedRole,
+      });
+      
+      toast({ title: "Portability export downloaded", variant: "success" });
+    } else {
+      toast({ title: "Failed to generate portability export", variant: "error" });
+    }
+  };
+
+  const handleConsentChange = (consentType: string, action: 'grant' | 'revoke') => {
+    if (!canManageConsents) {
+      handleDeniedAccess(action, "consent");
+      return;
+    }
+
+    if (action === 'grant') {
+      grantConsent(patient.id, consentType as any, normalizedRole, "patient_profile");
+    } else {
+      revokeConsent(patient.id, consentType as any, normalizedRole, "patient_profile");
+    }
+
+    setPatientConsents(getPatientConsents(patient.id));
+    setConsentHistory(getConsentHistory(patient.id));
+    
+    // Audit log (PHI-safe)
+    logAdminOperation({
+      action: `consent_${action}ed`,
+      module: "privacy",
+      resourceType: "consent",
+      resourceId: consentType,
+      metadata: { patientId: patient.id },
+      actor: normalizedRole,
+      role: normalizedRole,
+    });
+    
+    toast({ title: `Consent ${action}ed successfully`, variant: "success" });
+  };
+
+  const handleCommunicationPreferenceChange = (channel: CommunicationChannel, optedOut: boolean) => {
+    if (!canManageCommunicationPreferences) {
+      handleDeniedAccess("update", "communication preferences");
+      return;
+    }
+
+    updateCommunicationPreference(patient.id, channel, optedOut, normalizedRole);
+    setOptedOutChannels(getOptedOutChannels(patient.id));
+    
+    // Audit log (PHI-safe)
+    logAdminOperation({
+      action: "communication_preference_updated",
+      module: "privacy",
+      resourceType: "communication_preference",
+      resourceId: channel,
+      metadata: { patientId: patient.id, optedOut },
+      actor: normalizedRole,
+      role: normalizedRole,
+    });
+    
+    toast({ title: "Communication preferences updated", variant: "success" });
+  };
+
   function closeAllWorkflowModals() {
     setShowAppointment(false);
     setShowConsultation(false);
@@ -134,43 +409,125 @@ export default function PatientProfile({
     const newEvent: TimelineEvent = {
       ...event,
       id: `tl-${Date.now()}`,
+      // Phase 7F: Add metadata
+      sourceType: event.sourceType || "manual",
+      sourceId: event.sourceId,
+      createdAt: new Date().toISOString(),
+      createdBy: CURRENT_USER.name,
+      immutable: event.immutable || false,
     };
     onUpdatePatient(
       { ...patient, timeline: [...(patient.timeline || []), newEvent] },
       "timeline event added",
     );
+    // Phase 7F: Safe audit logging
+    logAuditTrail(`Timeline event added: ${event.type} (source: ${event.sourceType || "manual"})`, "timeline", patient.id);
   }
 
   function handleDeleteTimelineEvent(id: string) {
+    const eventToDelete = (patient.timeline || []).find(e => e.id === id);
     onUpdatePatient(
       { ...patient, timeline: (patient.timeline || []).filter((e) => e.id !== id) },
       "timeline event deleted",
     );
+    // Phase 7F: Safe audit logging
+    if (eventToDelete) {
+      logAuditTrail(`Timeline event deleted: ${eventToDelete.type}`, "timeline", patient.id);
+    }
   }
 
   function handleAddNote(note: Omit<PatientNote, "id">) {
-    const newNote: PatientNote = { ...note, id: `note-${Date.now()}` };
+    if (!canManageClinicalNotes) {
+      handleDeniedAccess("add", "clinical note");
+      return;
+    }
+    const newNote: PatientNote = { 
+      ...note, 
+      id: `note-${Date.now()}`,
+      author: CURRENT_USER.name,
+      date: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      updatedBy: CURRENT_USER.name,
+      versions: [],
+    };
     onUpdatePatient(
       { ...patient, notes: [...(patient.notes || []), newNote] },
       "note added",
     );
+    // Phase 7F: Safe audit logging
+    logAuditTrail(`Note added: ${note.category || "general"}`, "note", patient.id);
+  }
+
+  function handleEditNote(id: string, updatedText: string) {
+    if (!canManageClinicalNotes) {
+      handleDeniedAccess("edit", "clinical note");
+      return;
+    }
+    const noteToEdit = (patient.notes || []).find(n => n.id === id);
+    if (!noteToEdit) return;
+    
+    // Phase 7I: Preserve previous version
+    const previousVersion = {
+      text: noteToEdit.text,
+      updatedAt: noteToEdit.updatedAt || noteToEdit.date,
+      updatedBy: noteToEdit.updatedBy || noteToEdit.author || CURRENT_USER.name,
+    };
+    
+    const updatedNotes = (patient.notes || []).map(n => 
+      n.id === id ? { 
+        ...n, 
+        text: updatedText,
+        updatedAt: new Date().toISOString(),
+        updatedBy: CURRENT_USER.name,
+        versions: [...(n.versions || []), previousVersion],
+      } : n
+    );
+    onUpdatePatient(
+      { ...patient, notes: updatedNotes },
+      "note edited",
+    );
+    // Phase 7I: Safe audit logging
+    logAuditTrail(`Note edited: ${noteToEdit.category || "general"}`, "note", patient.id);
   }
 
   function handleDeleteNote(id: string) {
+    if (!canManageClinicalNotes) {
+      handleDeniedAccess("delete", "clinical note");
+      return;
+    }
+    const noteToDelete = (patient.notes || []).find(n => n.id === id);
+    // Phase 7F: Soft-delete instead of permanent delete
+    const updatedNotes = (patient.notes || []).map(n => 
+      n.id === id ? { ...n, deletedAt: new Date().toISOString(), deletedBy: CURRENT_USER.name } : n
+    );
     onUpdatePatient(
-      { ...patient, notes: (patient.notes || []).filter((n) => n.id !== id) },
+      { ...patient, notes: updatedNotes },
       "note deleted",
     );
+    // Phase 7F: Safe audit logging
+    if (noteToDelete) {
+      logAuditTrail(`Note deleted: ${noteToDelete.category || "general"}`, "note", patient.id);
+    }
   }
 
   function handleToggleNotePin(id: string) {
+    if (!canManageClinicalNotes) {
+      handleDeniedAccess("edit", "clinical note");
+      return;
+    }
     onUpdatePatient({
       ...patient,
       notes: (patient.notes || []).map((n) => n.id === id ? { ...n, pinned: !n.pinned } : n),
     }, "note pinned");
+    // Phase 7F: Safe audit logging
+    logAuditTrail(`Note pin toggled`, "note", patient.id);
   }
 
   function handleAddDocument(doc: Omit<PatientDocument, "id">) {
+    if (!canManageDocuments) {
+      handleDeniedAccess("add", "document");
+      return;
+    }
     const newDoc: PatientDocument = { ...doc, id: `doc-${Date.now()}` };
     onUpdatePatient(
       { ...patient, documents: [...(patient.documents || []), newDoc] },
@@ -179,6 +536,10 @@ export default function PatientProfile({
   }
 
   function handleDeleteDocument(id: string) {
+    if (!canManageDocuments) {
+      handleDeniedAccess("delete", "document");
+      return;
+    }
     onUpdatePatient(
       { ...patient, documents: (patient.documents || []).filter((d) => d.id !== id) },
       "document deleted",
@@ -186,9 +547,33 @@ export default function PatientProfile({
   }
 
   function handleToggleConsent(key: string) {
+    if (!canManageConsents) {
+      handleDeniedAccess("edit", "consent");
+      return;
+    }
     const consents = { ...(patient.consents || {}), [key]: !(patient.consents || {})[key] };
     const allSigned = CONSENT_TYPES.every((c) => consents[c.key]);
-    onUpdatePatient({ ...patient, consents, consentSigned: allSigned }, "consent updated");
+    
+    // Phase 7I: Track consent history
+    const consentRecord = {
+      type: key,
+      status: consents[key] ? "granted" as const : "revoked" as const,
+      changedAt: new Date().toISOString(),
+      changedBy: CURRENT_USER.name,
+      source: "manual",
+    };
+    
+    const updatedPatient = { 
+      ...patient, 
+      consents, 
+      consentSigned: allSigned,
+      consentHistory: [...((patient as any).consentHistory || []), consentRecord],
+    };
+    
+    onUpdatePatient(updatedPatient, "consent updated");
+    // Phase 7F: Safe audit logging
+    const status = consents[key] ? "granted" : "revoked";
+    logAuditTrail(`Consent ${status}: ${key}`, "consent", patient.id);
   }
 
   function handleAcknowledgeAlerts() {
@@ -239,7 +624,6 @@ export default function PatientProfile({
     ].filter(Boolean).join(" · ");
     let backendOk = true;
     try {
-      const { apiClient } = await import('./api');
       if (typeof apiClient.bookAppointment === "function") {
         await apiClient.bookAppointment(appointment);
       }
@@ -281,7 +665,6 @@ export default function PatientProfile({
       .filter(Boolean).join(" · ") || "Consultation recorded";
     let backendOk = true;
     try {
-      const { apiClient } = await import('./api');
       if (typeof apiClient.startConsultation === "function") {
         await apiClient.startConsultation(consultation);
       }
@@ -313,6 +696,10 @@ export default function PatientProfile({
 
   const handleSavePrescriptions = async (prescriptions: any[]) => {
     if (activeWorkflowLoading) return;
+    if (!canManagePrescriptions) {
+      handleDeniedAccess("manage", "prescriptions");
+      return;
+    }
     const validRx = prescriptions.filter((rx) => !!(rx.medication ?? rx.name ?? "").trim());
     if (validRx.length === 0) {
       toast({ title: "At least one medication name is required", variant: "error" });
@@ -335,7 +722,6 @@ export default function PatientProfile({
     const tlNote = `${normalizedRx.length} medication${normalizedRx.length !== 1 ? "s" : ""}${firstName ? ` · ${firstName}` : ""}`;
     let backendOk = true;
     try {
-      const { apiClient } = await import('./api');
       if (typeof apiClient.createPrescriptions === "function") {
         await apiClient.createPrescriptions(validRx);
       }
@@ -371,6 +757,10 @@ export default function PatientProfile({
 
   const handleUploadFiles = async (files: File[]) => {
     if (activeWorkflowLoading) return;
+    if (!canManageDocuments) {
+      handleDeniedAccess("upload", "documents");
+      return;
+    }
     if (!files || files.length === 0) {
       toast({ title: "At least one file is required", variant: "error" });
       return;
@@ -388,7 +778,6 @@ export default function PatientProfile({
     const tlNote = `${files.length} file${files.length !== 1 ? "s" : ""} uploaded`;
     let backendOk = true;
     try {
-      const { apiClient } = await import('./api');
       if (typeof apiClient.uploadFiles === "function") {
         await apiClient.uploadFiles(files, { patient_id: patient.id });
       }
@@ -434,7 +823,6 @@ export default function PatientProfile({
     ].filter(Boolean).join(" · ") || "Invoice created";
     let backendOk = true;
     try {
-      const { apiClient } = await import('./api');
       if (typeof apiClient.createInvoice === "function") {
         await apiClient.createInvoice(invoice);
       }
@@ -503,7 +891,6 @@ export default function PatientProfile({
     const tlNote = `${channel} sent to patient`;
     let backendOk = true;
     try {
-      const { apiClient } = await import('./api');
       if (typeof apiClient.sendCommunication === "function") {
         await apiClient.sendCommunication(message);
       }
@@ -544,7 +931,6 @@ export default function PatientProfile({
     const tlNote = [followUp.follow_up_date, followUp.reason].filter(Boolean).join(" · ");
     let backendOk = true;
     try {
-      const { apiClient } = await import('./api');
       if (typeof apiClient.scheduleFollowUp === "function") {
         await apiClient.scheduleFollowUp(followUp);
       }
@@ -592,7 +978,6 @@ export default function PatientProfile({
     const tlNote = `${consent.consent_type} consent signed`;
     let backendOk = true;
     try {
-      const { apiClient } = await import('./api');
       if (typeof apiClient.createConsent === "function") {
         await apiClient.createConsent(consent);
       }
@@ -626,7 +1011,7 @@ export default function PatientProfile({
 
   const consentsSigned = CONSENT_TYPES.filter((c) => (patient.consents || {})[c.key]).length;
 
-  const tabCounts: Partial<Record<TabId, number>> = {
+  const tabCounts: Partial<Record<TabId, number>> = useMemo(() => ({
     timeline:      (patient.timeline     || []).length,
     prescriptions: (patient.prescriptions|| []).length,
     labresults:    (patient.labResults   || []).length,
@@ -635,7 +1020,7 @@ export default function PatientProfile({
     consents:      consentsSigned > 0 ? consentsSigned : undefined,
     audit:         auditEntries.length,
     followup:      patient.followUpDate ? 1 : 0,
-  };
+  }), [patient.timeline, patient.prescriptions, patient.labResults, patient.documents, patient.notes, consentsSigned, auditEntries, patient.followUpDate]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
@@ -783,7 +1168,7 @@ export default function PatientProfile({
           {/* Right actions */}
           <div className="pp-actions" style={{ display: "flex", gap: 6, flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end" }}>
             {patient.phone && (
-              <button className="btn btn-ghost" onClick={() => { window.open(`tel:${patient.phone}`, "_self"); }} title={`Call ${patient.phone}`} style={{ fontSize: "var(--font-sm)" }}>
+              <button className="btn btn-ghost" onClick={() => { window.open(`tel:${patient.phone}`, "_self"); }} title={`Call ${shouldMaskContact ? maskPhone(patient.phone) : patient.phone}`} style={{ fontSize: "var(--font-sm)" }}>
                 <i className="ti ti-phone" style={{ fontSize: 14, color: "var(--green)" }} />
                 <span className="desktop-only">Call</span>
               </button>
@@ -800,13 +1185,13 @@ export default function PatientProfile({
               <i className="ti ti-emergency-bed" style={{ fontSize: 14, color: "var(--red)" }} />
               <span className="desktop-only">Emergency</span>
             </button>
-            {can(role, "editPatient") && (
+            {canEditPatient && (
               <button className="btn btn-primary" onClick={onEditPatient} style={{ fontSize: "var(--font-sm)" }}>
                 <i className="ti ti-edit" style={{ fontSize: 14 }} />
                 <span className="desktop-only">Edit</span>
               </button>
             )}
-            {can(role, "deletePatient") && (
+            {canDeletePatient && (
               <button className="btn btn-danger" onClick={() => { closeAllWorkflowModals(); setShowDelete(true); }} style={{ fontSize: "var(--font-sm)" }}>
                 <i className="ti ti-trash" style={{ fontSize: 14 }} />
               </button>
@@ -836,7 +1221,16 @@ export default function PatientProfile({
 
         {/* Tab bar */}
         <div className="pp-tabs" style={{ padding: "0 16px", display: "flex", gap: 2, overflowX: "auto" }}>
-          {PROFILE_TABS.map(({ id, label, icon }) => (
+          {PROFILE_TABS.filter(({ id }) => {
+            // Filter tabs based on permissions
+            if (id === "prescriptions") return canViewPrescriptions;
+            if (id === "labresults") return canViewLabResults;
+            if (id === "notes") return canViewClinicalNotes;
+            if (id === "documents") return canViewDocuments;
+            if (id === "audit") return canViewAuditEntries;
+            if (id === "consents") return canViewConsents;
+            return true; // overview, timeline, followup are always visible
+          }).map(({ id, label, icon }) => (
             <button
               key={id}
               onClick={() => setTab(id)}
@@ -872,13 +1266,76 @@ export default function PatientProfile({
       {/* ── Tab Content ── */}
       <div style={{ flex: 1, overflow: "auto", background: "var(--bg)" }}>
         <div className="fade-in pp-tab-content" key={tab} style={{ padding: 16 }}>
+          {/* Fallback if current tab becomes restricted */}
+          {tab === "prescriptions" && !canViewPrescriptions && (
+            <div style={{ textAlign: "center", padding: 40, color: "var(--muted)" }}>
+              <i className="ti ti-lock" style={{ fontSize: 32, marginBottom: 12 }} />
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>Restricted Section</div>
+              <div style={{ fontSize: "var(--font-sm)" }}>You do not have permission to view prescriptions.</div>
+              <button className="btn btn-ghost" style={{ marginTop: 16 }} onClick={() => setTab("overview")}>
+                Return to Overview
+              </button>
+            </div>
+          )}
+          {tab === "labresults" && !canViewLabResults && (
+            <div style={{ textAlign: "center", padding: 40, color: "var(--muted)" }}>
+              <i className="ti ti-lock" style={{ fontSize: 32, marginBottom: 12 }} />
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>Restricted Section</div>
+              <div style={{ fontSize: "var(--font-sm)" }}>You do not have permission to view lab results.</div>
+              <button className="btn btn-ghost" style={{ marginTop: 16 }} onClick={() => setTab("overview")}>
+                Return to Overview
+              </button>
+            </div>
+          )}
+          {tab === "notes" && !canViewClinicalNotes && (
+            <div style={{ textAlign: "center", padding: 40, color: "var(--muted)" }}>
+              <i className="ti ti-lock" style={{ fontSize: 32, marginBottom: 12 }} />
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>Restricted Section</div>
+              <div style={{ fontSize: "var(--font-sm)" }}>You do not have permission to view clinical notes.</div>
+              <button className="btn btn-ghost" style={{ marginTop: 16 }} onClick={() => setTab("overview")}>
+                Return to Overview
+              </button>
+            </div>
+          )}
+          {tab === "documents" && !canViewDocuments && (
+            <div style={{ textAlign: "center", padding: 40, color: "var(--muted)" }}>
+              <i className="ti ti-lock" style={{ fontSize: 32, marginBottom: 12 }} />
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>Restricted Section</div>
+              <div style={{ fontSize: "var(--font-sm)" }}>You do not have permission to view documents.</div>
+              <button className="btn btn-ghost" style={{ marginTop: 16 }} onClick={() => setTab("overview")}>
+                Return to Overview
+              </button>
+            </div>
+          )}
+          {tab === "audit" && !canViewAuditEntries && (
+            <div style={{ textAlign: "center", padding: 40, color: "var(--muted)" }}>
+              <i className="ti ti-lock" style={{ fontSize: 32, marginBottom: 12 }} />
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>Restricted Section</div>
+              <div style={{ fontSize: "var(--font-sm)" }}>You do not have permission to view audit logs.</div>
+              <button className="btn btn-ghost" style={{ marginTop: 16 }} onClick={() => setTab("overview")}>
+                Return to Overview
+              </button>
+            </div>
+          )}
+          {tab === "consents" && !canViewConsents && (
+            <div style={{ textAlign: "center", padding: 40, color: "var(--muted)" }}>
+              <i className="ti ti-lock" style={{ fontSize: 32, marginBottom: 12 }} />
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>Restricted Section</div>
+              <div style={{ fontSize: "var(--font-sm)" }}>You do not have permission to view consents.</div>
+              <button className="btn btn-ghost" style={{ marginTop: 16 }} onClick={() => setTab("overview")}>
+                Return to Overview
+              </button>
+            </div>
+          )}
+
+          {/* Normal tab content */}
           {tab === "overview"  && (
-            <OverviewTab 
-              patient={patient} 
-              role={role} 
-              onVerificationToggle={handleVerificationToggle} 
-              snapshot={snapshot} 
-              readiness={readiness} 
+            <OverviewTab
+              patient={patient}
+              role={role}
+              onVerificationToggle={handleVerificationToggle}
+              snapshot={snapshot}
+              readiness={readiness}
               onQuickAction={setQuickAction}
               onBookAppointment={() => setShowAppointment(true)}
               onStartConsultation={() => setShowConsultation(true)}
@@ -894,13 +1351,29 @@ export default function PatientProfile({
             />
           )}
           {tab === "timeline"  && <TimelineTab patient={patient} role={role} onAddEvent={handleAddTimelineEvent} onDeleteEvent={handleDeleteTimelineEvent} />}
-          {tab === "prescriptions" && <PrescriptionHistoryTab patient={patient} role={role} onUpdatePatient={onUpdatePatient} onAddPrescription={() => setShowPrescription(true)} />}
-          {tab === "labresults" && <LabResultsTab patient={patient} role={role} onAddLabResult={() => alert("Lab result modal would open here. For now, please use the Documents tab to upload lab result files.")} />}
-          {tab === "documents" && <DocumentsTab patient={patient} role={role} onAddDoc={handleAddDocument} onDeleteDoc={handleDeleteDocument} onUploadFiles={() => setShowFileUpload(true)} />}
-          {tab === "notes"     && <NotesTab patient={patient} role={role} onAddNote={handleAddNote} onDeleteNote={handleDeleteNote} onTogglePin={handleToggleNotePin} />}
+          {tab === "prescriptions" && canViewPrescriptions && <PrescriptionHistoryTab patient={patient} role={role} onUpdatePatient={onUpdatePatient} onAddPrescription={canManagePrescriptions ? () => setShowPrescription(true) : undefined} />}
+          {tab === "labresults" && canViewLabResults && <LabResultsTab patient={patient} role={role} onAddLabResult={() => toast("Lab result modal would open here. For now, please use the Documents tab to upload lab result files.", "info")} />}
+          {tab === "documents" && canViewDocuments && <DocumentsTab patient={patient} role={role} onAddDoc={handleAddDocument} onDeleteDoc={handleDeleteDocument} onUploadFiles={canManageDocuments ? () => setShowFileUpload(true) : undefined} />}
+          {tab === "notes"     && canViewClinicalNotes && <NotesTab patient={patient} role={role} onAddNote={handleAddNote} onDeleteNote={handleDeleteNote} onTogglePin={handleToggleNotePin} />}
           {tab === "followup"  && <FollowUpTab patient={patient} onUpdate={handleUpdateFollowUp} onScheduleFollowUp={() => setShowFollowUp(true)} />}
-          {tab === "consents"  && <ConsentsTab patient={patient} onToggle={handleToggleConsent} onSignNewConsent={() => setShowConsent(true)} />}
-          {tab === "audit"     && <AuditTab entries={auditEntries} />}
+          {tab === "consents"  && canViewConsents && <ConsentsTab patient={patient} onToggle={handleToggleConsent} onSignNewConsent={canManageConsents ? () => setShowConsent(true) : undefined} />}
+          {tab === "privacy"   && canViewPrivacy && <PrivacyTab 
+            patient={patient} 
+            role={normalizedRole}
+            privacyRequests={privacyRequests}
+            patientConsents={patientConsents}
+            consentHistory={consentHistory}
+            expiringConsents={expiringConsents}
+            expiredConsents={expiredConsents}
+            optedOutChannels={optedOutChannels}
+            commPreferences={commPreferences}
+            onCreateRequest={canManagePrivacyRequests ? (type: PrivacyRequestType) => { setPrivacyRequestType(type); setShowPrivacyRequestModal(true); } : undefined}
+            onUpdateRequestStatus={canManagePrivacyRequests ? handleUpdatePrivacyRequestStatus : undefined}
+            onPortabilityExport={canExportPortability ? () => setShowPortabilityConfirm(true) : undefined}
+            onConsentChange={canManageConsents ? handleConsentChange : undefined}
+            onCommPreferenceChange={canManageCommunicationPreferences ? handleCommunicationPreferenceChange : undefined}
+          />}
+          {tab === "audit"     && canViewAuditEntries && <AuditTab entries={auditEntries} />}
         </div>
       </div>
 
@@ -997,6 +1470,83 @@ export default function PatientProfile({
           onCancel={() => setShowConsent(false)}
         />
       )}
+
+      {/* Phase 10D: Privacy Request Modal */}
+      {showPrivacyRequestModal && privacyRequestType && (
+        <div style={{
+          position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
+          background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center",
+          zIndex: 1000
+        }} onClick={(e) => { if (e.target === e.currentTarget) setShowPrivacyRequestModal(false); }}>
+          <div style={{
+            background: "var(--surface)", borderRadius: "var(--radius)",
+            padding: 24, maxWidth: 500, width: "90%", maxHeight: "90vh", overflowY: "auto"
+          }}>
+            <h3 style={{ fontSize: "var(--font-md)", fontWeight: 700, marginBottom: 16 }}>
+              Create {privacyRequestType.replace(/_/g, ' ').toUpperCase()}
+            </h3>
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, display: "block", marginBottom: 8 }}>
+                Reason (optional)
+              </label>
+              <textarea
+                value={privacyRequestReason}
+                onChange={(e) => setPrivacyRequestReason(e.target.value)}
+                placeholder="Enter reason for this request..."
+                style={{
+                  width: "100%", minHeight: 80, padding: "8px 12px",
+                  borderRadius: "var(--radius)", border: "1px solid var(--border)",
+                  fontSize: "var(--font-sm)", resize: "vertical"
+                }}
+                maxLength={500}
+              />
+              <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginTop: 4 }}>
+                {privacyRequestReason.length}/500 characters
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button className="btn btn-ghost" onClick={() => setShowPrivacyRequestModal(false)}>
+                Cancel
+              </button>
+              <button className="btn btn-primary" onClick={handleCreatePrivacyRequest}>
+                Create Request
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Phase 10D: Portability Export Confirmation Modal */}
+      {showPortabilityConfirm && (
+        <div style={{
+          position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
+          background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center",
+          zIndex: 1000
+        }} onClick={(e) => { if (e.target === e.currentTarget) setShowPortabilityConfirm(false); }}>
+          <div style={{
+            background: "var(--surface)", borderRadius: "var(--radius)",
+            padding: 24, maxWidth: 500, width: "90%"
+          }}>
+            <h3 style={{ fontSize: "var(--font-md)", fontWeight: 700, marginBottom: 16 }}>
+              Confirm Data Portability Export
+            </h3>
+            <div style={{ marginBottom: 16, fontSize: "var(--font-sm)", color: "var(--muted)" }}>
+              This will generate a patient-specific data portability export for patient ID: <strong>{patient.id}</strong>
+            </div>
+            <div style={{ marginBottom: 16, padding: 12, background: "var(--amber-bg)", borderRadius: "var(--radius)", fontSize: "var(--font-xs)", color: "var(--amber)" }}>
+              <i className="ti ti-alert-triangle" /> This export contains patient data by design for portability purposes. Handle with appropriate security measures.
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button className="btn btn-ghost" onClick={() => setShowPortabilityConfirm(false)}>
+                Cancel
+              </button>
+              <button className="btn btn-primary" onClick={handlePortabilityExport}>
+                Confirm Export
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1027,7 +1577,7 @@ function OverviewTab({
   consentsTotal?: number;
 }) {
   // Profile completeness score
-  const completenessChecks = [
+  const completenessChecks = useMemo(() => [
     !!patient.phone,
     !!patient.dob,
     !!patient.emergencyName,
@@ -1036,8 +1586,8 @@ function OverviewTab({
     !!patient.documentsComplete,
     !!patient.doctor,
     !!patient.bloodGroup,
-  ];
-  const completenessScore = completenessChecks.filter(Boolean).length;
+  ], [patient.phone, patient.dob, patient.emergencyName, patient.insuranceStatus, patient.insurer, patient.consentSigned, patient.documentsComplete, patient.doctor, patient.bloodGroup]);
+  const completenessScore = useMemo(() => completenessChecks.filter(Boolean).length, [completenessChecks]);
   const completenessTotal = completenessChecks.length;
 
   return (
@@ -1143,20 +1693,22 @@ function OverviewTab({
             ["Gender",          patient.gender],
             ["Blood Group",     patient.bloodGroup],
             ["Nationality",     patient.nationality],
-            ["Address",         patient.address],
+            ["Address",         shouldMaskContact ? maskAddress(patient.address || "") : patient.address],
           ]} />
           {/* Clickable contact row */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px 16px", marginTop: 8 }}>
             <div>
               <div style={{ fontSize: "var(--font-2xs)", color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 700, marginBottom: 2 }}>Phone</div>
               {patient.phone
-                ? <a href={`tel:${patient.phone}`} style={{ fontSize: "var(--font-sm)", color: "var(--accent)", fontWeight: 500, textDecoration: "none" }}>{patient.phone}</a>
+                ? <a href={`tel:${patient.phone}`} style={{ fontSize: "var(--font-sm)", color: "var(--accent)", fontWeight: 500, textDecoration: "none" }}>{shouldMaskContact ? maskPhone(patient.phone) : patient.phone}</a>
                 : <span style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>—</span>}
             </div>
             <div>
               <div style={{ fontSize: "var(--font-2xs)", color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 700, marginBottom: 2 }}>Email</div>
               {patient.email
-                ? <a href={`mailto:${patient.email}`} style={{ fontSize: "var(--font-sm)", color: "var(--accent)", fontWeight: 500, textDecoration: "none" }}>{patient.email}</a>
+                ? shouldMaskContact 
+                  ? <span style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>{maskEmail(patient.email)}</span>
+                  : <a href={`mailto:${patient.email}`} style={{ fontSize: "var(--font-sm)", color: "var(--accent)", fontWeight: 500, textDecoration: "none" }}>{patient.email}</a>
                 : <span style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>—</span>}
             </div>
           </div>
@@ -1500,17 +2052,17 @@ function TimelineTab({
   const [dateRangeFrom, setDateRangeFrom] = useState("");
   const [dateRangeTo, setDateRangeTo] = useState("");
 
-  const allEvents = [...(patient.timeline || [])].sort(
+  const allEvents = useMemo(() => [...(patient.timeline || [])].sort(
     (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
-  );
+  ), [patient.timeline]);
 
-  const filteredEvents = allEvents.filter((ev) => {
+  const filteredEvents = useMemo(() => allEvents.filter((ev) => {
     if (filterType !== "All" && ev.type !== filterType) return false;
     if (filterDoctor !== "All" && ev.doctor !== filterDoctor) return false;
     if (dateRangeFrom && new Date(ev.date) < new Date(dateRangeFrom)) return false;
     if (dateRangeTo && new Date(ev.date) > new Date(dateRangeTo)) return false;
     return true;
-  });
+  }), [allEvents, filterType, filterDoctor, dateRangeFrom, dateRangeTo]);
 
   const allDoctors = useMemo(() => {
     const doctors = new Set<string>();
@@ -1806,11 +2358,13 @@ function NotesTab({
     { id: "followup",  label: "Follow-Up", color: "var(--blue)" },
   ];
 
-  const notes = [...(patient.notes || [])].sort((a, b) => {
+  const notes = useMemo(() => [...(patient.notes || [])]
+    .filter(n => !n.deletedAt) // Phase 7K: Hide soft-deleted notes from normal view
+    .sort((a, b) => {
     if (a.pinned && !b.pinned) return -1;
     if (!a.pinned && b.pinned) return 1;
     return new Date(b.date).getTime() - new Date(a.date).getTime();
-  });
+  }), [patient.notes]);
 
   function submit() {
     if (!text.trim()) return;
@@ -2015,6 +2569,233 @@ function FollowUpTab({ patient, onUpdate, onScheduleFollowUp }: { patient: Patie
   );
 }
 
+// ─── Privacy Tab (Phase 10D) ───────────────────────────────────────────────────────
+interface PrivacyTabProps {
+  patient: Patient;
+  role: UserRole;
+  privacyRequests: PrivacyRequest[];
+  patientConsents: ConsentRecord[];
+  consentHistory: any[];
+  expiringConsents: ConsentRecord[];
+  expiredConsents: ConsentRecord[];
+  optedOutChannels: CommunicationChannel[];
+  commPreferences: Record<CommunicationChannel, boolean> | null;
+  onCreateRequest?: (type: PrivacyRequestType) => void;
+  onUpdateRequestStatus?: (requestId: string, status: PrivacyRequestStatus) => void;
+  onPortabilityExport?: () => void;
+  onConsentChange?: (consentType: string, action: 'grant' | 'revoke') => void;
+  onCommPreferenceChange?: (channel: CommunicationChannel, optedOut: boolean) => void;
+}
+
+function PrivacyTab({
+  patient,
+  role,
+  privacyRequests,
+  patientConsents,
+  consentHistory,
+  expiringConsents,
+  expiredConsents,
+  optedOutChannels,
+  commPreferences,
+  onCreateRequest,
+  onUpdateRequestStatus,
+  onPortabilityExport,
+  onConsentChange,
+  onCommPreferenceChange,
+}: PrivacyTabProps) {
+  const canManage = onCreateRequest !== undefined;
+
+  return (
+    <div style={{ width: '100%' }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
+        <span style={{ fontSize: "var(--font-md)", fontWeight: 700 }}>Privacy & Consent</span>
+        {onPortabilityExport && (
+          <button className="btn btn-primary" style={{ fontSize: "var(--font-sm)" }} onClick={onPortabilityExport}>
+            <i className="ti ti-download" style={{ fontSize: 13 }} />
+            Data Portability Export
+          </button>
+        )}
+      </div>
+
+      {/* Privacy Requests Section */}
+      <div className="card card-padded" style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: "var(--font-sm)", fontWeight: 700, marginBottom: 12 }}>Privacy Requests</div>
+        {privacyRequests.length === 0 ? (
+          <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>No privacy requests for this patient</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {privacyRequests.map((req) => (
+              <div key={req.id} className="card card-padded" style={{ borderLeft: `4px solid ${getStatusColor(req.status)}` }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
+                  <div>
+                    <div style={{ fontSize: "var(--font-sm)", fontWeight: 700 }}>{req.requestType.replace(/_/g, ' ').toUpperCase()}</div>
+                    <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginTop: 2 }}>
+                      ID: {req.id} · Submitted: {new Date(req.submittedAt).toLocaleDateString()}
+                    </div>
+                  </div>
+                  <span className="badge" style={{ background: `${getStatusColor(req.status)}15`, color: getStatusColor(req.status) }}>
+                    {req.status}
+                  </span>
+                </div>
+                {onUpdateRequestStatus && req.status === 'submitted' && (
+                  <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => onUpdateRequestStatus(req.id, 'under_review')}>
+                      Review
+                    </button>
+                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => onUpdateRequestStatus(req.id, 'approved')}>
+                      Approve
+                    </button>
+                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => onUpdateRequestStatus(req.id, 'rejected')}>
+                      Reject
+                    </button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        {canManage && (
+          <div style={{ marginTop: 12, display: "flex", flexWrap: "wrap", gap: 8 }}>
+            <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => onCreateRequest?.('access_request')}>
+              Access Request
+            </button>
+            <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => onCreateRequest?.('correction_request')}>
+              Correction Request
+            </button>
+            <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => onCreateRequest?.('deletion_request')}>
+              Deletion Request
+            </button>
+            <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => onCreateRequest?.('portability_request')}>
+              Portability Request
+            </button>
+            <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => onCreateRequest?.('consent_review_request')}>
+              Consent Review
+            </button>
+            <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => onCreateRequest?.('grievance_request')}>
+              Grievance
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Consent Status Section */}
+      <div className="card card-padded" style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: "var(--font-sm)", fontWeight: 700, marginBottom: 12 }}>Consent Status</div>
+        {patientConsents.length === 0 ? (
+          <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>No consent records for this patient</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {patientConsents.map((consent) => (
+              <div key={consent.id} className="card card-padded" style={{ borderLeft: `4px solid ${consent.status === 'granted' ? 'var(--green)' : consent.status === 'revoked' ? 'var(--red)' : 'var(--amber)'}` }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                  <div>
+                    <div style={{ fontSize: "var(--font-sm)", fontWeight: 700 }}>{consent.consentType.replace(/_/g, ' ').toUpperCase()}</div>
+                    <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginTop: 2 }}>
+                      Version: {consent.version} · Status: {consent.status}
+                    </div>
+                  </div>
+                  {onConsentChange && consent.status === 'granted' && (
+                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => onConsentChange(consent.consentType, 'revoke')}>
+                      Revoke
+                    </button>
+                  )}
+                  {onConsentChange && consent.status !== 'granted' && (
+                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => onConsentChange(consent.consentType, 'grant')}>
+                      Grant
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+        {expiringConsents.length > 0 && (
+          <div style={{ marginTop: 12, padding: 8, background: "var(--amber-bg)", borderRadius: "var(--radius)", fontSize: "var(--font-xs)", color: "var(--amber)" }}>
+            <i className="ti ti-alert-triangle" /> {expiringConsents.length} consent(s) expiring soon
+          </div>
+        )}
+        {expiredConsents.length > 0 && (
+          <div style={{ marginTop: 8, padding: 8, background: "var(--red-bg)", borderRadius: "var(--radius)", fontSize: "var(--font-xs)", color: "var(--red)" }}>
+            <i className="ti ti-alert-circle" /> {expiredConsents.length} consent(s) expired
+          </div>
+        )}
+      </div>
+
+      {/* Communication Preferences Section */}
+      <div className="card card-padded" style={{ marginBottom: 16 }}>
+        <div style={{ fontSize: "var(--font-sm)", fontWeight: 700, marginBottom: 12 }}>Communication Preferences</div>
+        {commPreferences ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {(Object.keys(commPreferences) as CommunicationChannel[]).map((channel) => (
+              <div key={channel} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 12px", borderRadius: "var(--radius)", background: "var(--surface)" }}>
+                <div style={{ fontSize: "var(--font-sm)" }}>{channel.replace(/_/g, ' ').toUpperCase()}</div>
+                {onCommPreferenceChange ? (
+                  <button 
+                    className="btn btn-ghost"
+                    style={{ 
+                      fontSize: "var(--font-xs)", 
+                      background: commPreferences[channel] ? "var(--green-bg)" : "var(--red-bg)",
+                      color: commPreferences[channel] ? "var(--green)" : "var(--red)"
+                    }}
+                    onClick={() => onCommPreferenceChange(channel, !commPreferences[channel])}
+                  >
+                    {commPreferences[channel] ? 'Opted In' : 'Opted Out'}
+                  </button>
+                ) : (
+                  <span style={{ fontSize: "var(--font-xs)", color: commPreferences[channel] ? "var(--green)" : "var(--red)" }}>
+                    {commPreferences[channel] ? 'Opted In' : 'Opted Out'}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>No communication preferences set</div>
+        )}
+      </div>
+
+      {/* Consent History Section */}
+      <div className="card card-padded">
+        <div style={{ fontSize: "var(--font-sm)", fontWeight: 700, marginBottom: 12 }}>Consent History</div>
+        {consentHistory.length === 0 ? (
+          <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>No consent history for this patient</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {consentHistory.map((entry, index) => (
+              <div key={index} style={{ fontSize: "var(--font-xs)", padding: "8px 12px", borderRadius: "var(--radius)", background: "var(--surface)" }}>
+                <div style={{ fontWeight: 600 }}>{entry.consentType.replace(/_/g, ' ').toUpperCase()}</div>
+                <div style={{ color: "var(--muted)", marginTop: 2 }}>
+                  {entry.status} · Version {entry.version} · {new Date(entry.timestamp).toLocaleDateString()}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function getStatusColor(status: string): string {
+  switch (status) {
+    case 'granted':
+    case 'approved':
+    case 'completed':
+      return 'var(--green)';
+    case 'revoked':
+    case 'rejected':
+    case 'cancelled':
+      return 'var(--red)';
+    case 'expired':
+    case 'under_review':
+      return 'var(--amber)';
+    case 'submitted':
+      return 'var(--blue)';
+    default:
+      return 'var(--muted)';
+  }
+}
+
 // ─── Consents Tab ─────────────────────────────────────────────────────────────
 function ConsentsTab({ patient, onToggle, onSignNewConsent }: { patient: Patient; onToggle: (key: string) => void; onSignNewConsent?: () => void }) {
   const consents = patient.consents || {};
@@ -2083,7 +2864,7 @@ function ConsentsTab({ patient, onToggle, onSignNewConsent }: { patient: Patient
 
 // ─── Audit Tab ────────────────────────────────────────────────────────────────
 function AuditTab({ entries }: { entries: AuditEntry[] }) {
-  const sorted = [...entries].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+  const sorted = useMemo(() => [...entries].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()), [entries]);
   const AUDIT_ICONS: Record<string, string> = {
     created: "ti-user-plus", edited: "ti-edit", deleted: "ti-trash",
     merged: "ti-merge", import: "ti-file-import", archived: "ti-archive",

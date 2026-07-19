@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 
 interface PatientCommunicationProps {
   patientId: string;
@@ -16,11 +16,27 @@ export function PatientCommunication({ patientId, patientName, patientPhone, pat
   const [messageType, setMessageType] = useState('sms');
   const [loading, setLoading] = useState(false);
 
+  // ── local feedback (replaces alert() and silent catch) ────────────────────
+  const [feedback, setFeedback] = useState<{
+    type: 'success' | 'error' | 'info' | 'warning';
+    message: string;
+  } | null>(null);
+  const feedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showFeedback = useCallback(
+    (msg: string, type: 'success' | 'error' | 'info' | 'warning' = 'info') => {
+      if (feedbackTimer.current) clearTimeout(feedbackTimer.current);
+      setFeedback({ type, message: msg });
+      feedbackTimer.current = setTimeout(() => setFeedback(null), 4000);
+    },
+    []
+  );
+
   const handleCall = () => {
     if (patientPhone) {
       onCallPatient(patientId);
     } else {
-      alert('Patient phone number not available');
+      showFeedback('Patient phone number is not available.', 'warning');
     }
   };
 
@@ -40,8 +56,10 @@ export function PatientCommunication({ patientId, patientName, patientPhone, pat
 
       await onSendMessage(messageData);
       setMessage('');
+      showFeedback('Message action completed. Delivery is not tracked locally.', 'info');
     } catch (error) {
       console.error('Failed to send message:', error);
+      showFeedback('Failed to send message. Please try again.', 'error');
     } finally {
       setLoading(false);
     }
@@ -125,6 +143,46 @@ export function PatientCommunication({ patientId, patientName, patientPhone, pat
             </p>
           )}
         </div>
+
+        {/* Feedback banner */}
+        {feedback && (() => {
+          const s = {
+            success: { bg: '#f0fdf4', border: '#86efac', color: '#16a34a', icon: '✓' },
+            error:   { bg: '#fef2f2', border: '#fecaca', color: '#dc2626', icon: '✕' },
+            warning: { bg: '#fffbeb', border: '#fcd34d', color: '#b45309', icon: '⚠' },
+            info:    { bg: '#eff6ff', border: '#bfdbfe', color: '#1d4ed8', icon: 'ℹ' },
+          }[feedback.type];
+          return (
+            <div
+              role="alert"
+              style={{
+                display: 'flex', alignItems: 'flex-start', gap: 8,
+                background: s.bg,
+                border: `1px solid ${s.border}`,
+                borderRadius: '8px',
+                padding: '10px 14px',
+                marginBottom: '1.5rem',
+                fontSize: '0.875rem',
+                color: s.color,
+              }}
+            >
+              <span style={{ fontWeight: 700, flexShrink: 0, lineHeight: 1.5 }}>{s.icon}</span>
+              <span style={{ flex: 1, lineHeight: 1.5 }}>{feedback.message}</span>
+              <button
+                type="button"
+                aria-label="Dismiss"
+                onClick={() => setFeedback(null)}
+                style={{
+                  background: 'none', border: 'none', cursor: 'pointer',
+                  color: s.color, padding: '0 2px', fontSize: '1rem',
+                  lineHeight: 1, flexShrink: 0,
+                }}
+              >
+                ×
+              </button>
+            </div>
+          );
+        })()}
 
         {/* Tabs */}
         <div style={{

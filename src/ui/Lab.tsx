@@ -1,6 +1,26 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import type { Patient } from "./types";
 import { fmtDate } from "./utils";
+import {
+  validateRequired,
+  validateDate,
+  validateMaxLength,
+  safeString,
+} from "../shared/validation/validators";
+import { hasRole, normalizeRole } from "../shared/permissions/permissions";
+import { logDeniedAction } from "../shared/services/deniedActionLogger";
+// Phase 8B: Import workflow audit helper and state machine
+import { logWorkflowAction } from "../shared/workflow/workflowAudit";
+import { validateWorkflowTransition, type WorkflowEntityType } from "../shared/workflow/workflowStateMachine";
+// Phase 8C: Import patient validation and handoff helpers
+import { validateWorkflowPatientReference } from "../shared/workflow/workflowValidation";
+import { logSuccessfulHandoff, logBlockedHandoff } from "../shared/workflow/workflowHandoff";
+// Phase 8D: Import clinical safety validation helpers
+import {
+  checkDuplicateLabOrder,
+  validateLabResultStructure,
+  cleanupOldDrafts,
+} from "../shared/workflow/clinicalSafety";
 
 interface LabOrder {
   id: string;
@@ -50,7 +70,6 @@ interface LabActivity {
   timestamp: string;
   action: string;
   patientId?: string;
-  patientName?: string;
   details?: string;
 }
 
@@ -116,7 +135,20 @@ export default function LabPage({ patients, onUpdatePatient, userRole = "admin" 
   // State with safe localStorage helpers
   const [labOrders, setLabOrders] = useState<LabOrder[]>(() => readJSON(LAB_ORDERS_KEY, []));
   const [labResults, setLabResults] = useState<LabResult[]>(() => readJSON(LAB_RESULTS_KEY, []));
-  const [labActivity, setLabActivity] = useState<LabActivity[]>(() => readJSON(LAB_ACTIVITY_KEY, []));
+  const [labActivity, setLabActivity] = useState<LabActivity[]>(() => {
+    const loaded = readJSON(LAB_ACTIVITY_KEY, []);
+    // Phase 8D: Clean up old activity entries (keep last 50, remove entries older than 48 hours)
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - 48 * 60 * 60 * 1000);
+    const cleaned = loaded.filter((entry: LabActivity) => {
+      const entryDate = new Date(entry.timestamp);
+      return entryDate > cutoff;
+    });
+    if (cleaned.length !== loaded.length) {
+      writeJSON(LAB_ACTIVITY_KEY, cleaned.slice(0, 50));
+    }
+    return cleaned.slice(0, 50);
+  });
   const [customTemplates, setCustomTemplates] = useState<LabTemplate[]>(() => {
     const loaded = readJSON(LAB_TEMPLATES_KEY, []);
     return loaded;
@@ -172,18 +204,127 @@ export default function LabPage({ patients, onUpdatePatient, userRole = "admin" 
     setTimeout(() => setFeedback(null), 4000);
   };
 
-  const logActivity = (action: string, patientId?: string, patientName?: string, details?: string) => {
+  // Phase 8B: Remove patientName from activity log (PHI-safe)
+  const logActivity = (action: string, patientId?: string, details?: string) => {
     const entry: LabActivity = {
       timestamp: new Date().toISOString(),
       action,
       patientId,
-      patientName,
       details,
     };
     const updated = [entry, ...labActivity].slice(0, 50);
     setLabActivity(updated);
     writeJSON(LAB_ACTIVITY_KEY, updated);
   };
+
+  // Normalized role for consistent permission checks
+  const normalizedRole = normalizeRole(userRole) as "admin" | "doctor" | "nurse" | "receptionist" | "billing" | "auditor" | "readonly";
+
+  // Local permission guards for Lab actions
+  const canCreateLabOrder = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canEditLabOrder = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canDeleteLabOrder = hasRole(normalizedRole, ["admin"]);
+  const canUpdateLabOrderStatus = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canCreateLabResult = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canEditLabResult = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canApproveLabResult = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canRejectLabResult = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canDeleteLabResult = hasRole(normalizedRole, ["admin"]);
+  const canToggleCriticalFlag = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canApplyLabTemplate = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canManageLabTemplates = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canExportLabOrders = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canExportLabResults = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canExportLabActivity = hasRole(normalizedRole, ["admin"]);
+  const canPrintLabResult = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+
+  // Local denied access helper
+  const handleDeniedAccess = (action: string, resource: string) => {
+    showFeedback(`You don't have permission to ${action} ${resource}.`, "error");
+    logDeniedAction({
+      action,
+      resource,
+      role: normalizedRole,
+      reason: "insufficient_permissions",
+    });
+  };
+
+  function validateLabOrder(order: { patient: Patient | null; testType: string; priority: string; notes: string }): { valid: boolean; errors: string[]; warnings: string[] } {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    // Validate patient
+    if (!order.patient) {
+      errors.push("Please select a patient.");
+    }
+
+    // Validate test type
+    const testTypeError = validateRequired(order.testType, "Test type");
+    if (testTypeError) errors.push(testTypeError);
+
+    // Validate priority
+    const priorityError = validateRequired(order.priority, "Priority");
+    if (priorityError) errors.push(priorityError);
+
+    // Validate notes max length
+    if (order.notes) {
+      const notesError = validateMaxLength(order.notes, 1000, "Clinical notes");
+      if (notesError) errors.push(notesError);
+    }
+
+    return { valid: errors.length === 0, errors, warnings };
+  }
+
+  function validateLabResult(result: { linkedOrder: LabOrder | null; selectedPatient: Patient | null; params: TestParameter[]; notes: string; critical: boolean; testType: string }): { valid: boolean; errors: string[]; warnings: string[] } {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    // Validate patient or linked order
+    if (!result.linkedOrder && !result.selectedPatient) {
+      errors.push("Please select a patient or link to an order.");
+    }
+
+    // Validate test type
+    const testTypeError = validateRequired(result.testType, "Test type");
+    if (testTypeError) errors.push(testTypeError);
+
+    // Validate parameters
+    if (!result.params || result.params.length === 0) {
+      errors.push("Please add at least one parameter.");
+    } else {
+      const validParams = result.params.filter(p => p.name && p.name.trim());
+      if (validParams.length === 0) {
+        errors.push("All parameters must have a name.");
+      }
+
+      // Validate each parameter
+      result.params.forEach((param, index) => {
+        if (!param.name || !param.name.trim()) return; // Skip empty params
+
+        if (!param.value || !param.value.trim()) {
+          warnings.push(`Parameter ${index + 1} (${param.name}): Value is missing.`);
+        }
+      });
+    }
+
+    // Validate notes max length
+    if (result.notes) {
+      const notesError = validateMaxLength(result.notes, 1000, "Result notes");
+      if (notesError) errors.push(notesError);
+    }
+
+    // Critical flag warnings
+    const hasCriticalParam = result.params.some(p => p.flag === "critical");
+    if (hasCriticalParam && !result.critical) {
+      warnings.push("Result has critical parameters but is not marked as critical.");
+    }
+    if (result.critical && !hasCriticalParam) {
+      warnings.push("Result is marked as critical but no parameters are flagged as critical.");
+    }
+
+    return { valid: errors.length === 0, errors, warnings };
+  }
+
 
   function persistOrders(next: LabOrder[]) {
     setLabOrders(next);
@@ -201,33 +342,103 @@ export default function LabPage({ patients, onUpdatePatient, userRole = "admin" 
   }
 
   function handleCreateOrder() {
-    if (!selectedPatient) {
-      showFeedback("Please select a patient.", "error");
-      return;
-    }
-    if (!orderTestType) {
-      showFeedback("Please select a test type.", "error");
-      return;
-    }
-    if (!orderPriority) {
-      showFeedback("Please select a priority.", "error");
+    if (!canCreateLabOrder) {
+      handleDeniedAccess("create", "lab order");
       return;
     }
 
+    // Phase 8C: Validate patient reference before creating lab order
+    if (!selectedPatient) {
+      showFeedback("Please select a patient first.", "error");
+      return;
+    }
+    const patientValidation = validateWorkflowPatientReference(selectedPatient.id, patients, {
+      requireActive: true,
+      allowDeleted: false,
+      action: "create lab order"
+    });
+    if (!patientValidation.valid) {
+      showFeedback(patientValidation.reason, "error");
+      logBlockedHandoff({
+        fromModule: "lab",
+        toModule: "lab",
+        action: "create_order",
+        patientId: selectedPatient.id,
+        reason: patientValidation.reason,
+        actor: normalizedRole,
+      });
+      return;
+    }
+
+    const validation = validateLabOrder({
+      patient: selectedPatient,
+      testType: orderTestType,
+      priority: orderPriority,
+      notes: orderNotes,
+    });
+
+    // Show errors and block creation
+    if (validation.errors.length > 0) {
+      validation.errors.forEach(error => showFeedback(error, "error"));
+      return;
+    }
+
+    // Show warnings but don't block
+    validation.warnings.forEach(warning => showFeedback(warning, "warning"));
+
+    // Phase 8D: Check for duplicate lab orders
+    const duplicateCheck = checkDuplicateLabOrder(
+      selectedPatient.id,
+      orderTestType,
+      new Date().toISOString(),
+      labOrders
+    );
+    if (duplicateCheck.isDuplicate) {
+      showFeedback(duplicateCheck.reason || "Duplicate lab order detected", "error");
+      logWorkflowAction({
+        action: "duplicate_prevented",
+        entityType: "labOrder",
+        entityId: duplicateCheck.existingRecordId,
+        patientId: selectedPatient.id,
+        metadata: {
+          reason: duplicateCheck.reason,
+          performedBy: normalizedRole,
+        },
+      });
+      return;
+    }
+
+    // Normalize data before save
+    const normalizedNotes = orderNotes ? safeString(orderNotes).trim() : undefined;
+
     const order: LabOrder = {
       id: `order-${Date.now()}`,
-      patientId: selectedPatient.id,
-      patientName: selectedPatient.name,
+      patientId: selectedPatient!.id,
+      patientName: selectedPatient!.name,
       orderNumber: `ORD-${Date.now().toString().slice(-6)}`,
-      testType: orderTestType,
+      testType: safeString(orderTestType).trim(),
       priority: orderPriority,
       status: "pending",
       orderDate: new Date().toISOString(),
       orderedBy: "Current User",
-      clinicalNotes: orderNotes || undefined,
+      clinicalNotes: normalizedNotes,
     };
     persistOrders([order, ...labOrders]);
-    logActivity("order created", selectedPatient.id, selectedPatient.name, `${order.testType} (${order.orderNumber})`);
+
+    // Phase 8B: Log workflow action for order creation
+    logWorkflowAction({
+      action: "create",
+      entityType: "labOrder",
+      entityId: order.id,
+      patientId: selectedPatient.id,
+      metadata: {
+        testType: order.testType,
+        priority: order.priority,
+        performedBy: normalizedRole,
+      },
+    });
+
+    logActivity("order created", selectedPatient.id, `${order.testType} (${order.orderNumber})`);
     showFeedback("Lab order created successfully.", "success");
     setShowNewOrder(false);
     setSelectedPatient(null);
@@ -237,22 +448,41 @@ export default function LabPage({ patients, onUpdatePatient, userRole = "admin" 
   }
 
   function handleEditOrder() {
-    if (!editingOrder || !selectedPatient) return;
-    if (!orderTestType) {
-      showFeedback("Please select a test type.", "error");
+    if (!canEditLabOrder) {
+      handleDeniedAccess("edit", "lab order");
       return;
     }
+    if (!editingOrder || !selectedPatient) return;
+
+    const validation = validateLabOrder({
+      patient: selectedPatient,
+      testType: orderTestType,
+      priority: orderPriority,
+      notes: orderNotes,
+    });
+
+    // Show errors and block update
+    if (validation.errors.length > 0) {
+      validation.errors.forEach(error => showFeedback(error, "error"));
+      return;
+    }
+
+    // Show warnings but don't block
+    validation.warnings.forEach(warning => showFeedback(warning, "warning"));
+
+    // Normalize data before save
+    const normalizedNotes = orderNotes ? safeString(orderNotes).trim() : undefined;
 
     const updated: LabOrder = {
       ...editingOrder,
       patientId: selectedPatient.id,
       patientName: selectedPatient.name,
-      testType: orderTestType,
+      testType: safeString(orderTestType).trim(),
       priority: orderPriority,
-      clinicalNotes: orderNotes || undefined,
+      clinicalNotes: normalizedNotes,
     };
     persistOrders(labOrders.map(o => o.id === editingOrder.id ? updated : o));
-    logActivity("order edited", selectedPatient.id, selectedPatient.name, updated.orderNumber);
+    logActivity("order edited", selectedPatient.id, updated.orderNumber);
     showFeedback("Lab order updated successfully.", "success");
     setEditingOrder(null);
     setShowEditOrder(false);
@@ -263,20 +493,54 @@ export default function LabPage({ patients, onUpdatePatient, userRole = "admin" 
   }
 
   function handleUpdateOrderStatus(id: string, status: LabOrder["status"]) {
+    if (!canUpdateLabOrderStatus) {
+      handleDeniedAccess("update", "lab order status");
+      return;
+    }
     const order = labOrders.find(o => o.id === id);
     if (!order) return;
+
+    // Phase 8B: Validate status transition using state machine
+    const transitionResult = validateWorkflowTransition(
+      "labOrder" as WorkflowEntityType,
+      order.status,
+      status
+    );
+    if (!transitionResult.valid) {
+      showFeedback(`Invalid status transition: ${transitionResult.reason}`, "error");
+      return;
+    }
+
     persistOrders(labOrders.map(o => o.id === id ? { ...o, status } : o));
-    logActivity("order status changed", order.patientId, order.patientName, `${order.orderNumber} → ${status}`);
+
+    // Phase 8B: Log workflow action for status change
+    logWorkflowAction({
+      action: "status_change",
+      entityType: "labOrder",
+      entityId: id,
+      patientId: order.patientId,
+      metadata: {
+        fromStatus: order.status,
+        toStatus: status,
+        performedBy: normalizedRole,
+      },
+    });
+
+    logActivity("order status changed", order.patientId, `${order.orderNumber} → ${status}`);
     showFeedback(`Order marked as ${status}.`, "success");
   }
 
   function handleDeleteOrder(id: string) {
+    if (!canDeleteLabOrder) {
+      handleDeniedAccess("delete", "lab order");
+      return;
+    }
     setConfirmModal({
       message: "Are you sure you want to delete this lab order?",
       onConfirm: () => {
         const order = labOrders.find(o => o.id === id);
         persistOrders(labOrders.filter(o => o.id !== id));
-        logActivity("order deleted", order?.patientId, order?.patientName, order?.orderNumber);
+        logActivity("order deleted", order?.patientId, order?.orderNumber);
         showFeedback("Lab order deleted.", "success");
         setConfirmModal(null);
       },
@@ -284,37 +548,56 @@ export default function LabPage({ patients, onUpdatePatient, userRole = "admin" 
   }
 
   function handleCreateResult() {
+    if (!canCreateLabResult) {
+      handleDeniedAccess("create", "lab result");
+      return;
+    }
     const linkedOrder = resultOrderId ? labOrders.find(o => o.id === resultOrderId) : null;
     const isCritical = resultCritical || resultParams.some(p => p.flag === "critical");
 
-    if (!linkedOrder && !selectedPatient) {
-      showFeedback("Please select a patient or link to an order.", "error");
+    const validation = validateLabResult({
+      linkedOrder,
+      selectedPatient,
+      params: resultParams,
+      notes: resultNotes,
+      critical: isCritical,
+      testType: linkedOrder?.testType || orderTestType || "Lab Test",
+    });
+
+    // Show errors and block creation
+    if (validation.errors.length > 0) {
+      validation.errors.forEach(error => showFeedback(error, "error"));
       return;
     }
-    if (resultParams.length === 0) {
-      showFeedback("Please add at least one parameter.", "error");
-      return;
-    }
-    if (resultParams.some(p => !p.name)) {
-      showFeedback("All parameters must have a name.", "error");
-      return;
-    }
+
+    // Show warnings but don't block
+    validation.warnings.forEach(warning => showFeedback(warning, "warning"));
+
+    // Normalize data before save
+    const normalizedParams = resultParams.map(p => ({
+      ...p,
+      name: p.name ? safeString(p.name).trim() : "",
+      value: p.value ? safeString(p.value).trim() : "0",
+      unit: p.unit ? safeString(p.unit).trim() : "",
+      referenceRange: p.referenceRange ? safeString(p.referenceRange).trim() : "",
+    }));
+    const normalizedNotes = resultNotes ? safeString(resultNotes).trim() : undefined;
 
     const result: LabResult = {
       id: `result-${Date.now()}`,
       orderId: resultOrderId || "",
       patientId: linkedOrder?.patientId || selectedPatient?.id || "",
       patientName: linkedOrder?.patientName || selectedPatient?.name || "Manual Entry",
-      testType: linkedOrder?.testType || orderTestType || "Lab Test",
-      parameters: resultParams.map(p => ({ ...p, value: p.value || "0" })),
+      testType: safeString(linkedOrder?.testType || orderTestType || "Lab Test").trim(),
+      parameters: normalizedParams,
       status: "review",
       critical: isCritical,
       resultDate: new Date().toISOString(),
-      notes: resultNotes || undefined,
+      notes: normalizedNotes,
     };
     persistResults([result, ...labResults]);
     if (resultOrderId) handleUpdateOrderStatus(resultOrderId, "completed");
-    logActivity("result created", result.patientId, result.patientName, result.testType);
+    logActivity("result created", result.patientId, result.testType);
     showFeedback("Lab result saved successfully.", "success");
     setShowEnterResults(false);
     setResultOrderId("");
@@ -327,8 +610,69 @@ export default function LabPage({ patients, onUpdatePatient, userRole = "admin" 
   }
 
   function handleUpdateResultStatus(id: string, status: LabResult["status"], rejectionReason?: string) {
+    if (status === "approved" && !canApproveLabResult) {
+      handleDeniedAccess("approve", "lab result");
+      return;
+    }
+    if (status === "rejected" && !canRejectLabResult) {
+      handleDeniedAccess("reject", "lab result");
+      return;
+    }
     const result = labResults.find(r => r.id === id);
     if (!result) return;
+
+    // Phase 8C: Validate patient reference before updating result status
+    const patientValidation = validateWorkflowPatientReference(result.patientId, patients, {
+      requireActive: false, // Allow updating results for inactive patients (view-only)
+      allowDeleted: false,
+      action: "update lab result status"
+    });
+    if (!patientValidation.valid) {
+      showFeedback(patientValidation.reason, "error");
+      logBlockedHandoff({
+        fromModule: "lab",
+        toModule: "lab",
+        action: "update_result_status",
+        patientId: result.patientId,
+        resourceId: id,
+        reason: patientValidation.reason,
+        actor: normalizedRole,
+      });
+      return;
+    }
+
+    // Phase 8D: Validate lab result structure before approval
+    if (status === "approved") {
+      const structureValidation = validateLabResultStructure(result);
+      if (!structureValidation.valid) {
+        structureValidation.errors.forEach(error => showFeedback(error, "error"));
+        logWorkflowAction({
+          action: "validation_failed",
+          entityType: "labResult",
+          entityId: id,
+          patientId: result.patientId,
+          metadata: {
+            reason: "Structural validation failed before approval",
+            errors: structureValidation.errors,
+            performedBy: normalizedRole,
+          },
+        });
+        return;
+      }
+      // Show warnings but don't block
+      structureValidation.warnings.forEach(warning => showFeedback(warning, "warning"));
+    }
+
+    // Phase 8B: Validate status transition using state machine
+    const transitionResult = validateWorkflowTransition(
+      "labResult" as WorkflowEntityType,
+      result.status,
+      status
+    );
+    if (!transitionResult.valid) {
+      showFeedback(`Invalid status transition: ${transitionResult.reason}`, "error");
+      return;
+    }
 
     const updated: LabResult = {
       ...result,
@@ -338,19 +682,46 @@ export default function LabPage({ patients, onUpdatePatient, userRole = "admin" 
       rejectionReason,
     };
 
+    // Phase 8B: Log workflow action for status change
+    logWorkflowAction({
+      action: "status_change",
+      entityType: "labResult",
+      entityId: id,
+      patientId: result.patientId,
+      metadata: {
+        fromStatus: result.status,
+        toStatus: status,
+        performedBy: normalizedRole,
+        rejectionReason,
+      },
+    });
+
+    // Phase 8C: Log handoff for lab result approval
+    if (status === "approved") {
+      logSuccessfulHandoff({
+        fromModule: "lab",
+        toModule: "patient_profile",
+        action: "lab_result_approved",
+        patientId: result.patientId,
+        resourceId: id,
+        resourceType: "labResult",
+        actor: normalizedRole,
+      });
+    }
+
     if (status === "approved" && onUpdatePatient) {
       // Note: Patient labResults sync skipped due to type mismatch
       // Lab results are stored in localStorage separately
-      logActivity("result approved", result.patientId, result.patientName, result.testType);
+      logActivity("result approved", result.patientId, result.testType);
       showFeedback("Lab result approved. Saved locally.", "success");
     } else if (status === "approved") {
-      logActivity("result approved", result.patientId, result.patientName, result.testType);
+      logActivity("result approved", result.patientId, result.testType);
       showFeedback("Lab result approved. Saved locally.", "success");
     } else if (status === "rejected") {
-      logActivity("result rejected", result.patientId, result.patientName, result.testType, rejectionReason);
+      logActivity("result rejected", result.patientId, `${result.testType} - ${rejectionReason}`);
       showFeedback("Lab result rejected.", "success");
     } else {
-      logActivity("result status changed", result.patientId, result.patientName, `${result.testType} → ${status}`);
+      logActivity("result status changed", result.patientId, `${result.testType} → ${status}`);
       showFeedback(`Result marked as ${status}.`, "success");
     }
 
@@ -360,12 +731,16 @@ export default function LabPage({ patients, onUpdatePatient, userRole = "admin" 
   }
 
   function handleDeleteResult(id: string) {
+    if (!canDeleteLabResult) {
+      handleDeniedAccess("delete", "lab result");
+      return;
+    }
     setConfirmModal({
       message: "Are you sure you want to delete this lab result?",
       onConfirm: () => {
         const result = labResults.find(r => r.id === id);
         persistResults(labResults.filter(r => r.id !== id));
-        logActivity("result deleted", result?.patientId, result?.patientName, result?.testType);
+        logActivity("result deleted", result?.patientId, result?.testType);
         showFeedback("Lab result deleted.", "success");
         setConfirmModal(null);
       },
@@ -373,8 +748,32 @@ export default function LabPage({ patients, onUpdatePatient, userRole = "admin" 
   }
 
   function handleToggleCritical(id: string) {
+    if (!canToggleCriticalFlag) {
+      handleDeniedAccess("toggle", "critical flag");
+      return;
+    }
     const result = labResults.find(r => r.id === id);
     if (!result) return;
+
+    // Phase 8D.1: Validate patient reference before toggling critical flag
+    const patientValidation = validateWorkflowPatientReference(result.patientId, patients, {
+      requireActive: false, // Allow viewing results for inactive patients
+      allowDeleted: false,
+      action: "toggle critical flag"
+    });
+    if (!patientValidation.valid) {
+      showFeedback(patientValidation.reason, "error");
+      logBlockedHandoff({
+        fromModule: "lab",
+        toModule: "lab",
+        action: "toggle_critical_flag",
+        patientId: result.patientId,
+        resourceId: id,
+        reason: patientValidation.reason,
+        actor: normalizedRole,
+      });
+      return;
+    }
 
     const hasCriticalParam = result.parameters.some(p => p.flag === "critical");
     if (hasCriticalParam && !result.critical) {
@@ -384,11 +783,35 @@ export default function LabPage({ patients, onUpdatePatient, userRole = "admin" 
 
     const updated = { ...result, critical: !result.critical };
     persistResults(labResults.map(r => r.id === id ? updated : r));
-    logActivity("critical flag toggled", result.patientId, result.patientName, result.testType, updated.critical ? "marked critical" : "cleared critical");
-    showFeedback(updated.critical ? "Result marked as critical." : "Critical flag cleared.", "success");
+
+    // Phase 8D: Log critical flag escalation/removal with PHI-safe audit logging
+    logWorkflowAction({
+      action: updated.critical ? "critical_escalation" : "critical_cleared",
+      entityType: "labResult",
+      entityId: id,
+      patientId: result.patientId,
+      metadata: {
+        orderId: result.orderId,
+        criticalStatus: updated.critical,
+        performedBy: normalizedRole,
+      },
+    });
+
+    // Phase 8D: Show escalation feedback for critical results
+    if (updated.critical) {
+      showFeedback("CRITICAL: Lab result marked as critical. Escalation logged.", "error");
+    } else {
+      showFeedback("Critical flag cleared.", "success");
+    }
+
+    logActivity("critical flag toggled", result.patientId, `${result.testType} - ${updated.critical ? "marked critical" : "cleared critical"}`);
   }
 
   function handleSaveTemplate() {
+    if (!canManageLabTemplates) {
+      handleDeniedAccess("save", "lab template");
+      return;
+    }
     if (resultParams.length === 0) {
       showFeedback("Add parameters to save as template.", "warning");
       return;
@@ -400,23 +823,31 @@ export default function LabPage({ patients, onUpdatePatient, userRole = "admin" 
       parameters: resultParams.map(({ value, ...rest }) => rest),
     };
     persistTemplates([...customTemplates, newTemplate]);
-    logActivity("template saved", undefined, undefined, newTemplate.name);
+    logActivity("template saved", undefined, newTemplate.name);
     showFeedback("Template saved successfully.", "success");
   }
 
   function handleApplyTemplate(template: LabTemplate) {
+    if (!canApplyLabTemplate) {
+      handleDeniedAccess("apply", "lab template");
+      return;
+    }
     setResultParams(template.parameters.map(p => ({ ...p, value: "" })));
     setOrderTestType(template.category);
-    logActivity("template applied", undefined, undefined, template.name);
+    logActivity("template applied", undefined, template.name);
     showFeedback(`Template "${template.name}" applied.`, "success");
   }
 
   function handleDeleteTemplate(templateId: string) {
+    if (!canManageLabTemplates) {
+      handleDeniedAccess("delete", "lab template");
+      return;
+    }
     setConfirmModal({
       message: "Are you sure you want to delete this template?",
       onConfirm: () => {
         persistTemplates(customTemplates.filter(t => t.id !== templateId));
-        logActivity("template deleted", undefined, undefined, `Template ID: ${templateId}`);
+        logActivity("template deleted", undefined, `Template ID: ${templateId}`);
         showFeedback("Template deleted.", "success");
         setConfirmModal(null);
       },
@@ -424,40 +855,26 @@ export default function LabPage({ patients, onUpdatePatient, userRole = "admin" 
   }
 
   function handleExportOrdersCSV() {
-    const filtered = labOrders.filter(o => {
-      if (orderFilterStatus && o.status !== orderFilterStatus) return false;
-      if (orderFilterPriority && o.priority !== orderFilterPriority) return false;
-      if (orderFilterTestType && o.testType !== orderFilterTestType) return false;
-      if (orderFilterDateFrom && new Date(o.orderDate) < new Date(orderFilterDateFrom)) return false;
-      if (orderFilterDateTo && new Date(o.orderDate) > new Date(orderFilterDateTo + "T23:59:59")) return false;
-      if (orderSearch) {
-        const searchLower = orderSearch.toLowerCase();
-        if (!o.patientName.toLowerCase().includes(searchLower) &&
-            !o.orderNumber.toLowerCase().includes(searchLower) &&
-            !o.testType.toLowerCase().includes(searchLower)) {
-          return false;
-        }
-      }
-      return true;
-    });
-
-    if (filtered.length === 0) {
+    if (!canExportLabOrders) {
+      handleDeniedAccess("export", "lab orders CSV");
+      return;
+    }
+    if (filteredOrders.length === 0) {
       showFeedback("No orders to export with current filters.", "info");
       return;
     }
 
-    const header = "ID,Order Number,Patient ID,Patient Name,Test Type,Priority,Status,Order Date,Ordered By,Clinical Notes\n";
-    const rows = filtered.map(o => [
+    // Phase 8H: Remove patientName and clinicalNotes from CSV export (PHI-safe)
+    const header = "ID,Order Number,Patient ID,Test Type,Priority,Status,Order Date,Ordered By\n";
+    const rows = filteredOrders.map(o => [
       `"${o.id}"`,
       `"${o.orderNumber}"`,
       `"${o.patientId}"`,
-      `"${o.patientName}"`,
       `"${o.testType}"`,
       `"${o.priority}"`,
       `"${o.status}"`,
       `"${new Date(o.orderDate).toLocaleString()}"`,
       `"${o.orderedBy}"`,
-      `"${(o.clinicalNotes || "").replace(/"/g, '""')}"`,
     ].join(",")).join("\n");
 
     const blob = new Blob(["\ufeff" + header + rows], { type: "text/csv;charset=utf-8" });
@@ -468,45 +885,33 @@ export default function LabPage({ patients, onUpdatePatient, userRole = "admin" 
     a.click();
     URL.revokeObjectURL(url);
 
-    logActivity("orders exported as CSV", undefined, undefined, `${filtered.length} records`);
-    showFeedback(`Exported ${filtered.length} order(s) as CSV.`, "success");
+    // Phase 8H: Log safe export metadata only
+    logActivity("orders exported as CSV", undefined, `${filteredOrders.length} records`);
+    showFeedback(`Exported ${filteredOrders.length} order(s) as CSV.`, "success");
   }
 
   function handleExportResultsCSV() {
-    const filtered = labResults.filter(r => {
-      if (resultFilterStatus && r.status !== resultFilterStatus) return false;
-      if (resultFilterCritical && !r.critical) return false;
-      if (resultFilterTestType && r.testType !== resultFilterTestType) return false;
-      if (resultFilterDateFrom && new Date(r.resultDate) < new Date(resultFilterDateFrom)) return false;
-      if (resultFilterDateTo && new Date(r.resultDate) > new Date(resultFilterDateTo + "T23:59:59")) return false;
-      if (resultSearch) {
-        const searchLower = resultSearch.toLowerCase();
-        if (!r.patientName.toLowerCase().includes(searchLower) &&
-            !r.testType.toLowerCase().includes(searchLower)) {
-          return false;
-        }
-      }
-      return true;
-    });
-
-    if (filtered.length === 0) {
+    if (!canExportLabResults) {
+      handleDeniedAccess("export", "lab results CSV");
+      return;
+    }
+    if (filteredResults.length === 0) {
       showFeedback("No results to export with current filters.", "info");
       return;
     }
 
-    const header = "ID,Order ID,Patient ID,Patient Name,Test Type,Status,Critical,Result Date,Reviewed By,Review Date,Notes\n";
-    const rows = filtered.map(r => [
+    // Phase 8H: Remove patientName and notes from CSV export (PHI-safe)
+    const header = "ID,Order ID,Patient ID,Test Type,Status,Critical,Result Date,Reviewed By,Review Date\n";
+    const rows = filteredResults.map(r => [
       `"${r.id}"`,
       `"${r.orderId}"`,
       `"${r.patientId}"`,
-      `"${r.patientName}"`,
       `"${r.testType}"`,
       `"${r.status}"`,
       `"${r.critical}"`,
       `"${new Date(r.resultDate).toLocaleString()}"`,
       `"${r.reviewedBy || ""}"`,
       `"${r.reviewDate ? new Date(r.reviewDate).toLocaleString() : ""}"`,
-      `"${(r.notes || "").replace(/"/g, '""')}"`,
     ].join(",")).join("\n");
 
     const blob = new Blob(["\ufeff" + header + rows], { type: "text/csv;charset=utf-8" });
@@ -517,15 +922,23 @@ export default function LabPage({ patients, onUpdatePatient, userRole = "admin" 
     a.click();
     URL.revokeObjectURL(url);
 
-    logActivity("results exported as CSV", undefined, undefined, `${filtered.length} records`);
-    showFeedback(`Exported ${filtered.length} result(s) as CSV.`, "success");
+    // Phase 8H: Log safe export metadata only
+    logActivity("results exported as CSV", undefined, `${filteredResults.length} records`);
+    showFeedback(`Exported ${filteredResults.length} result(s) as CSV.`, "success");
   }
 
   function handleExportResultTXT(result: LabResult) {
+    if (!canPrintLabResult) {
+      handleDeniedAccess("export", "lab result TXT");
+      return;
+    }
+    // Phase 8H: Remove patientName from TXT export (PHI-safe)
+    // Note: Clinical result parameters with values are retained as this is a clinical result document
+    // RBAC restricted to admin/doctor/nurse only via canPrintLabResult
     const txt = `
 LAB RESULT
 ==========
-Patient: ${result.patientName} (${result.patientId})
+Patient ID: ${result.patientId}
 Test Type: ${result.testType}
 Result Date: ${new Date(result.resultDate).toLocaleString()}
 Status: ${result.status}
@@ -555,22 +968,26 @@ Generated by Clinic CRM
     a.click();
     URL.revokeObjectURL(url);
 
-    logActivity("result exported as TXT", result.patientId, result.patientName, result.testType);
+    // Phase 8H: Log safe export metadata only (no test names or values)
+    logActivity("result exported as TXT", result.patientId, "clinical result document");
     showFeedback("Result exported as TXT.", "success");
   }
 
   function handleExportActivityCSV() {
+    if (!canExportLabActivity) {
+      handleDeniedAccess("export", "lab activity CSV");
+      return;
+    }
     if (labActivity.length === 0) {
       showFeedback("No activity to export.", "info");
       return;
     }
 
-    const header = "Timestamp,Action,Patient ID,Patient Name,Details\n";
+    const header = "Timestamp,Action,Patient ID,Details\n";
     const rows = labActivity.map(a => [
       `"${new Date(a.timestamp).toLocaleString()}"`,
       `"${a.action}"`,
       `"${a.patientId || ""}"`,
-      `"${(a.patientName || "").replace(/"/g, '""')}"`,
       `"${(a.details || "").replace(/"/g, '""')}"`,
     ].join(",")).join("\n");
 
@@ -586,6 +1003,10 @@ Generated by Clinic CRM
   }
 
   function handleClearActivity() {
+    if (!canExportLabActivity) {
+      handleDeniedAccess("clear", "lab activity");
+      return;
+    }
     setConfirmModal({
       message: "Are you sure you want to clear all activity logs?",
       onConfirm: () => {
@@ -598,6 +1019,10 @@ Generated by Clinic CRM
   }
 
   function handlePrintOrder(order: LabOrder) {
+    if (!canPrintLabResult) {
+      handleDeniedAccess("print", "lab order");
+      return;
+    }
     const win = window.open("", "_blank");
     if (!win) {
       showFeedback("Popup blocked. Please allow popups for printing.", "error");
@@ -619,10 +1044,14 @@ Generated by Clinic CRM
     win.document.close();
     win.focus();
     win.print();
-    logActivity("order printed", order.patientId, order.patientName, order.orderNumber);
+    logActivity("order printed", order.patientId, order.orderNumber);
   }
 
   function handlePrintResult(result: LabResult) {
+    if (!canPrintLabResult) {
+      handleDeniedAccess("print", "lab result");
+      return;
+    }
     const win = window.open("", "_blank");
     if (!win) {
       showFeedback("Popup blocked. Please allow popups for printing.", "error");
@@ -658,7 +1087,7 @@ Generated by Clinic CRM
     win.document.close();
     win.focus();
     win.print();
-    logActivity("result printed", result.patientId, result.patientName, result.testType);
+    logActivity("result printed", result.patientId, result.testType);
   }
 
   function handleCreateResultFromOrder(order: LabOrder) {
@@ -669,7 +1098,7 @@ Generated by Clinic CRM
       setResultParams(TEST_TEMPLATES[order.testType].map(p => ({ ...p })));
     }
     setShowEnterResults(true);
-    logActivity("creating result from order", order.patientId, order.patientName, order.orderNumber);
+    logActivity("creating result from order", order.patientId, order.orderNumber);
   }
 
   function handleViewOrder(order: LabOrder) {
@@ -691,6 +1120,10 @@ Generated by Clinic CRM
   }
 
   function handleEditResultModal(result: LabResult) {
+    if (!canEditLabResult) {
+      handleDeniedAccess("edit", "lab result");
+      return;
+    }
     setEditingResult(result);
     setSelectedPatient(patients.find(p => p.id === result.patientId) || null);
     setOrderTestType(result.testType);
@@ -701,6 +1134,10 @@ Generated by Clinic CRM
   }
 
   function handleUpdateResult() {
+    if (!canEditLabResult) {
+      handleDeniedAccess("edit", "lab result");
+      return;
+    }
     if (!editingResult) return;
     if (resultParams.length === 0) {
       showFeedback("Please add at least one parameter.", "error");
@@ -714,7 +1151,7 @@ Generated by Clinic CRM
       critical: resultCritical || resultParams.some(p => p.flag === "critical"),
     };
     persistResults(labResults.map(r => r.id === editingResult.id ? updated : r));
-    logActivity("result updated", editingResult.patientId, editingResult.patientName, editingResult.testType);
+    logActivity("result updated", editingResult.patientId, editingResult.testType);
     showFeedback("Lab result updated successfully.", "success");
     setEditingResult(null);
     setShowEditResult(false);
@@ -770,11 +1207,66 @@ Generated by Clinic CRM
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [confirmModal, showNewOrder, showEditOrder, showViewOrder, showEnterResults, showEditResult, showRejectModal, showActivity, showTemplates, viewingOrder, viewingResult, selectedPatient, orderTestType, editingOrder, editingResult, resultParams]);
 
-  const pendingOrders = labOrders.filter((o) => o.status === "pending");
-  const inProgressOrders = labOrders.filter((o) => o.status === "in-progress");
-  const completedOrders = labOrders.filter((o) => o.status === "completed");
-  const criticalResults = labResults.filter((r) => r.critical === true);
-  const pendingReview = labResults.filter((r) => r.status === "review");
+  const labStatusCounts = useMemo(() => ({
+    pendingOrders: labOrders.filter((o) => o.status === "pending"),
+    inProgressOrders: labOrders.filter((o) => o.status === "in-progress"),
+    completedOrders: labOrders.filter((o) => o.status === "completed"),
+    criticalResults: labResults.filter((r) => r.critical === true),
+    pendingReview: labResults.filter((r) => r.status === "review"),
+  }), [labOrders, labResults]);
+
+  const pendingOrders = labStatusCounts.pendingOrders;
+  const inProgressOrders = labStatusCounts.inProgressOrders;
+  const completedOrders = labStatusCounts.completedOrders;
+  const criticalResults = labStatusCounts.criticalResults;
+  const pendingReview = labStatusCounts.pendingReview;
+
+  const filteredOrders = useMemo(() => labOrders.filter(o => {
+    if (orderFilterStatus && o.status !== orderFilterStatus) return false;
+    if (orderFilterPriority && o.priority !== orderFilterPriority) return false;
+    if (orderFilterTestType && o.testType !== orderFilterTestType) return false;
+    if (orderFilterDateFrom && new Date(o.orderDate) < new Date(orderFilterDateFrom)) return false;
+    if (orderFilterDateTo && new Date(o.orderDate) > new Date(orderFilterDateTo + "T23:59:59")) return false;
+    if (orderSearch) {
+      const searchLower = orderSearch.toLowerCase();
+      if (!o.patientName.toLowerCase().includes(searchLower) &&
+          !o.orderNumber.toLowerCase().includes(searchLower) &&
+          !o.testType.toLowerCase().includes(searchLower)) {
+        return false;
+      }
+    }
+    return true;
+  }), [labOrders, orderFilterStatus, orderFilterPriority, orderFilterTestType, orderFilterDateFrom, orderFilterDateTo, orderSearch]);
+
+  const filteredResults = useMemo(() => labResults.filter(r => {
+    if (resultFilterStatus && r.status !== resultFilterStatus) return false;
+    if (resultFilterCritical && !r.critical) return false;
+    if (resultFilterTestType && r.testType !== resultFilterTestType) return false;
+    if (resultFilterDateFrom && new Date(r.resultDate) < new Date(resultFilterDateFrom)) return false;
+    if (resultFilterDateTo && new Date(r.resultDate) > new Date(resultFilterDateTo + "T23:59:59")) return false;
+    if (resultSearch) {
+      const searchLower = resultSearch.toLowerCase();
+      if (!r.patientName.toLowerCase().includes(searchLower) &&
+          !r.testType.toLowerCase().includes(searchLower)) {
+        return false;
+      }
+    }
+    return true;
+  }), [labResults, resultFilterStatus, resultFilterCritical, resultFilterTestType, resultFilterDateFrom, resultFilterDateTo, resultSearch]);
+
+  const reportStats = useMemo(() => [
+    { label: "Total Orders", value: labOrders.length, color: "var(--blue)" },
+    { label: "Pending", value: pendingOrders.length, color: "var(--amber)" },
+    { label: "In Progress", value: inProgressOrders.length, color: "var(--purple)" },
+    { label: "Completed", value: completedOrders.length, color: "var(--green)" },
+    { label: "Critical Results", value: criticalResults.length, color: "var(--red)" },
+    { label: "Pending Review", value: pendingReview.length, color: "var(--amber)" },
+    { label: "Approved Results", value: labResults.filter(r => r.status === "approved").length, color: "var(--green)" },
+  ], [labOrders, labResults, pendingOrders, inProgressOrders, completedOrders, criticalResults, pendingReview]);
+
+  const recentActivity = useMemo(() => labActivity.slice(0, 10), [labActivity]);
+
+  const availableOrders = useMemo(() => labOrders.filter(o => o.status !== "cancelled" && o.status !== "completed"), [labOrders]);
 
   return (
     <div style={{ padding: "clamp(12px, 4vw, 24px)", maxWidth: 1400 }}>
@@ -831,12 +1323,16 @@ Generated by Clinic CRM
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
             <div className="section-label" style={{ margin: 0 }}>Activity Log ({labActivity.length})</div>
             <div style={{ display: "flex", gap: 4 }}>
-              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handleExportActivityCSV}>
-                <i className="ti ti-download" style={{ fontSize: 11, marginRight: 4 }} />Export CSV
-              </button>
-              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px", color: "var(--red)" }} onClick={handleClearActivity}>
-                <i className="ti ti-trash" style={{ fontSize: 11, marginRight: 4 }} />Clear
-              </button>
+              {canExportLabActivity && (
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handleExportActivityCSV}>
+                  <i className="ti ti-download" style={{ fontSize: 11, marginRight: 4 }} />Export CSV
+                </button>
+              )}
+              {canExportLabActivity && (
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px", color: "var(--red)" }} onClick={handleClearActivity}>
+                  <i className="ti ti-trash" style={{ fontSize: 11, marginRight: 4 }} />Clear
+                </button>
+              )}
             </div>
           </div>
           {labActivity.length === 0 ? (
@@ -852,7 +1348,11 @@ Generated by Clinic CRM
                     <span style={{ fontWeight: 600 }}>{a.action}</span>
                     <span style={{ color: "var(--muted)" }}>{fmtDate(a.timestamp)}</span>
                   </div>
-                  {a.patientName && <div style={{ color: "var(--muted)" }}>Patient: {a.patientName}</div>}
+                  {a.patientId && (
+                    <div style={{ color: "var(--muted)" }}>
+                      Patient: {patients.find(p => p.id === a.patientId)?.name || a.patientId}
+                    </div>
+                  )}
                   {a.details && <div style={{ color: "var(--muted)" }}>{a.details}</div>}
                 </div>
               ))}
@@ -866,9 +1366,11 @@ Generated by Clinic CRM
         <div className="card card-padded" style={{ marginBottom: 24 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
             <div className="section-label" style={{ margin: 0 }}>Test Templates ({customTemplates.length})</div>
-            <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handleSaveTemplate}>
-              <i className="ti ti-device-floppy" style={{ fontSize: 11, marginRight: 4 }} />Save Current as Template
-            </button>
+            {canManageLabTemplates && (
+              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handleSaveTemplate}>
+                <i className="ti ti-device-floppy" style={{ fontSize: 11, marginRight: 4 }} />Save Current as Template
+              </button>
+            )}
           </div>
           {customTemplates.length === 0 ? (
             <div style={{ textAlign: "center", padding: 24, color: "var(--muted)" }}>
@@ -885,9 +1387,11 @@ Generated by Clinic CRM
                     <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", flex: 1 }} onClick={() => handleApplyTemplate(t)}>
                       Apply
                     </button>
-                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", color: "var(--red)" }} onClick={() => handleDeleteTemplate(t.id)}>
-                      <i className="ti ti-trash" style={{ fontSize: 11 }} />
-                    </button>
+                    {canManageLabTemplates && (
+                      <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", color: "var(--red)" }} onClick={() => handleDeleteTemplate(t.id)}>
+                        <i className="ti ti-trash" style={{ fontSize: 11 }} />
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}
@@ -1035,29 +1539,10 @@ Generated by Clinic CRM
                 </tr>
               </thead>
               <tbody>
-                {(() => {
-                  const filtered = labOrders.filter(o => {
-                    if (orderFilterStatus && o.status !== orderFilterStatus) return false;
-                    if (orderFilterPriority && o.priority !== orderFilterPriority) return false;
-                    if (orderFilterTestType && o.testType !== orderFilterTestType) return false;
-                    if (orderFilterDateFrom && new Date(o.orderDate) < new Date(orderFilterDateFrom)) return false;
-                    if (orderFilterDateTo && new Date(o.orderDate) > new Date(orderFilterDateTo + "T23:59:59")) return false;
-                    if (orderSearch) {
-                      const searchLower = orderSearch.toLowerCase();
-                      if (!o.patientName.toLowerCase().includes(searchLower) &&
-                          !o.orderNumber.toLowerCase().includes(searchLower) &&
-                          !o.testType.toLowerCase().includes(searchLower)) {
-                        return false;
-                      }
-                    }
-                    return true;
-                  });
-                  if (filtered.length === 0) {
-                    return (
-                      <tr><td colSpan={7}><div className="empty-state"><i className="ti ti-test-tube-off empty-state-icon" /><div className="empty-state-sub">No lab orders found with current filters</div></div></td></tr>
-                    );
-                  }
-                  return filtered.map((o) => (
+                {filteredOrders.length === 0 ? (
+                  <tr><td colSpan={7}><div className="empty-state"><i className="ti ti-test-tube-off empty-state-icon" /><div className="empty-state-sub">No lab orders found with current filters</div></div></td></tr>
+                ) : (
+                  filteredOrders.map((o) => (
                     <tr key={o.id} className="tbl-row">
                       <td style={{ fontSize: "var(--font-sm)" }}>{fmtDate(o.orderDate)}</td>
                       <td style={{ fontSize: "var(--font-sm)", fontWeight: 600 }}>{o.orderNumber}</td>
@@ -1080,27 +1565,27 @@ Generated by Clinic CRM
                       <td>
                         <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                           <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleViewOrder(o)}>View</button>
-                          {o.status !== "completed" && o.status !== "cancelled" && userRole !== "receptionist" && (
+                          {o.status !== "completed" && o.status !== "cancelled" && canEditLabOrder && (
                             <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleEditOrderModal(o)}>Edit</button>
                           )}
-                          {o.status === "pending" && userRole !== "receptionist" && (
+                          {o.status === "pending" && canUpdateLabOrderStatus && (
                             <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleUpdateOrderStatus(o.id, "in-progress")}>Start</button>
                           )}
-                          {o.status === "in-progress" && userRole !== "receptionist" && (
+                          {o.status === "in-progress" && canUpdateLabOrderStatus && (
                             <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleUpdateOrderStatus(o.id, "completed")}>Complete</button>
                           )}
-                          {o.status !== "completed" && o.status !== "cancelled" && (
+                          {o.status !== "completed" && o.status !== "cancelled" && canCreateLabResult && (
                             <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleCreateResultFromOrder(o)}>Result</button>
                           )}
                           <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handlePrintOrder(o)}>Print</button>
-                          {userRole !== "receptionist" && (
+                          {canDeleteLabOrder && (
                             <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--red)" }} onClick={() => handleDeleteOrder(o.id)}>Delete</button>
                           )}
                         </div>
                       </td>
                     </tr>
-                  ));
-                })()}
+                  ))
+                )}
               </tbody>
             </table>
           </div>
@@ -1183,28 +1668,10 @@ Generated by Clinic CRM
                 </tr>
               </thead>
               <tbody>
-                {(() => {
-                  const filtered = labResults.filter(r => {
-                    if (resultFilterStatus && r.status !== resultFilterStatus) return false;
-                    if (resultFilterCritical && !r.critical) return false;
-                    if (resultFilterTestType && r.testType !== resultFilterTestType) return false;
-                    if (resultFilterDateFrom && new Date(r.resultDate) < new Date(resultFilterDateFrom)) return false;
-                    if (resultFilterDateTo && new Date(r.resultDate) > new Date(resultFilterDateTo + "T23:59:59")) return false;
-                    if (resultSearch) {
-                      const searchLower = resultSearch.toLowerCase();
-                      if (!r.patientName.toLowerCase().includes(searchLower) &&
-                          !r.testType.toLowerCase().includes(searchLower)) {
-                        return false;
-                      }
-                    }
-                    return true;
-                  });
-                  if (filtered.length === 0) {
-                    return (
-                      <tr><td colSpan={6}><div className="empty-state"><i className="ti ti-file-off empty-state-icon" /><div className="empty-state-sub">No lab results found with current filters</div></div></td></tr>
-                    );
-                  }
-                  return filtered.map((r) => (
+                {filteredResults.length === 0 ? (
+                  <tr><td colSpan={6}><div className="empty-state"><i className="ti ti-file-off empty-state-icon" /><div className="empty-state-sub">No lab results found with current filters</div></div></td></tr>
+                ) : (
+                  filteredResults.map((r) => (
                     <tr key={r.id} className="tbl-row">
                       <td style={{ fontSize: "var(--font-sm)" }}>{fmtDate(r.resultDate)}</td>
                       <td style={{ fontSize: "var(--font-sm)" }}>{r.patientName}</td>
@@ -1222,28 +1689,30 @@ Generated by Clinic CRM
                       <td>
                         <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                           <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => setViewingResult(r)}>View</button>
-                          {userRole !== "receptionist" && (
+                          {canEditLabResult && (
                             <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleEditResultModal(r)}>Edit</button>
                           )}
-                          {r.status !== "approved" && r.status !== "rejected" && userRole !== "receptionist" && (
+                          {r.status !== "approved" && r.status !== "rejected" && canApproveLabResult && (
                             <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--green)" }} onClick={() => handleUpdateResultStatus(r.id, "approved")}>Approve</button>
                           )}
-                          {r.status !== "approved" && r.status !== "rejected" && userRole !== "receptionist" && (
+                          {r.status !== "approved" && r.status !== "rejected" && canRejectLabResult && (
                             <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--red)" }} onClick={() => { setEditingResult(r); setShowRejectModal(true); }}>Reject</button>
                           )}
-                          <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleToggleCritical(r.id)}>
-                            {r.critical ? "Clear Critical" : "Mark Critical"}
-                          </button>
+                          {canToggleCriticalFlag && (
+                            <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleToggleCritical(r.id)}>
+                              {r.critical ? "Clear Critical" : "Mark Critical"}
+                            </button>
+                          )}
                           <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handlePrintResult(r)}>Print</button>
                           <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleExportResultTXT(r)}>Export</button>
-                          {userRole !== "receptionist" && (
+                          {canDeleteLabResult && (
                             <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--red)" }} onClick={() => handleDeleteResult(r.id)}>Delete</button>
                           )}
                         </div>
                       </td>
                     </tr>
-                  ));
-                })()}
+                  ))
+                )}
               </tbody>
             </table>
           </div>
@@ -1258,15 +1727,7 @@ Generated by Clinic CRM
               Lab Summary
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: 12 }}>
-              {[
-                { label: "Total Orders", value: labOrders.length, color: "var(--blue)" },
-                { label: "Pending", value: pendingOrders.length, color: "var(--amber)" },
-                { label: "In Progress", value: inProgressOrders.length, color: "var(--purple)" },
-                { label: "Completed", value: completedOrders.length, color: "var(--green)" },
-                { label: "Critical Results", value: criticalResults.length, color: "var(--red)" },
-                { label: "Pending Review", value: pendingReview.length, color: "var(--amber)" },
-                { label: "Approved Results", value: labResults.filter(r => r.status === "approved").length, color: "var(--green)" },
-              ].map(s => (
+              {reportStats.map(s => (
                 <div key={s.label} style={{ padding: 12, background: "var(--surface2)", borderRadius: "var(--radius)" }}>
                   <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginBottom: 4 }}>{s.label}</div>
                   <div style={{ fontSize: "var(--font-xl)", fontWeight: 800, color: s.color }}>{s.value}</div>
@@ -1298,7 +1759,7 @@ Generated by Clinic CRM
           <div className="card card-padded">
             <div className="section-label" style={{ marginBottom: 12 }}>
               <i className="ti ti-history" style={{ marginRight: 4 }} />
-              Recent Activity ({labActivity.slice(0, 10).length})
+              Recent Activity ({recentActivity.length})
             </div>
             {labActivity.length === 0 ? (
               <div style={{ textAlign: "center", padding: 32, color: "var(--muted)" }}>
@@ -1307,13 +1768,17 @@ Generated by Clinic CRM
               </div>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {labActivity.slice(0, 10).map((a, i) => (
+                {recentActivity.map((a, i) => (
                   <div key={i} style={{ fontSize: "var(--font-xs)", padding: "8px 10px", background: "var(--surface2)", borderRadius: "var(--radius)" }}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
                       <span style={{ fontWeight: 600 }}>{a.action}</span>
                       <span style={{ color: "var(--muted)" }}>{fmtDate(a.timestamp)}</span>
                     </div>
-                    {a.patientName && <div style={{ color: "var(--muted)" }}>Patient: {a.patientName}</div>}
+                    {a.patientId && (
+                    <div style={{ color: "var(--muted)" }}>
+                      Patient: {patients.find(p => p.id === a.patientId)?.name || a.patientId}
+                    </div>
+                  )}
                     {a.details && <div style={{ color: "var(--muted)" }}>{a.details}</div>}
                   </div>
                 ))}
@@ -1456,7 +1921,7 @@ Generated by Clinic CRM
                   style={{ width: "100%", padding: "10px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)", boxSizing: "border-box" as const, minHeight: 44 }}
                 >
                   <option value="">— No linked order —</option>
-                  {labOrders.filter(o => o.status !== "cancelled" && o.status !== "completed").map(o => (
+                  {availableOrders.map(o => (
                     <option key={o.id} value={o.id}>{o.patientName} — {o.testType} ({o.orderNumber})</option>
                   ))}
                 </select>

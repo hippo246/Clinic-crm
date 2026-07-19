@@ -1,8 +1,42 @@
 import React, { useState, useEffect, useCallback } from "react";
 import type { Patient } from "./types";
 import { fmtDate } from "./utils";
+import {
+  validateRequired,
+  validateDate,
+  validateMaxLength,
+  safeString,
+} from "../shared/validation/validators";
+import { validateDocumentData } from "../shared/validation/entityValidation";
+import { MAX_FILE_SIZE_BYTES, ALLOWED_DOCUMENT_MIME_TYPES } from "../shared/constants/validationConstants";
+import { hasRole, normalizeRole } from "../shared/permissions";
+import { logDeniedAction } from "../shared/services/deniedActionLogger";
 
 export default function DocumentsPage({ patients, onUpdatePatient, userRole = "admin" }: { patients: Patient[]; onUpdatePatient?: (updated: Patient, action?: string) => void; userRole?: "receptionist" | "doctor" | "admin" }) {
+  const normalizedRole = normalizeRole(userRole);
+
+  // Local permission guards
+  const canViewDocuments = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist", "readonly"]);
+  const canUploadDocument = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canEditDocument = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canDeleteDocument = hasRole(normalizedRole, ["admin"]);
+  const canDownloadDocument = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist", "readonly"]);
+  const canPrintDocument = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist", "readonly"]);
+  const canExportDocuments = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canExportDocumentActivity = hasRole(normalizedRole, ["admin"]);
+  const canClearDocumentActivity = hasRole(normalizedRole, ["admin"]);
+
+  const handleDeniedAccess = (action: string, resource: string) => {
+    setFeedback({ type: "error", message: `You don't have permission to ${action} ${resource}.` });
+    logDeniedAction({
+      action,
+      resource,
+      role: normalizedRole,
+      reason: "Insufficient permissions",
+      severity: "medium",
+    });
+  };
+
   const [showUploadModal, setShowUploadModal] = useState(false);
   const [selectedPatient, setSelectedPatient] = useState<Patient | null>(null);
   const [activeTab, setActiveTab] = useState<"all" | "consents" | "id" | "insurance">("all");
@@ -16,6 +50,12 @@ export default function DocumentsPage({ patients, onUpdatePatient, userRole = "a
   const [renewDate, setRenewDate] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [signConfirmDoc, setSignConfirmDoc] = useState<any | null>(null);
+  const [feedback, setFeedback] = useState<{ type: "success" | "error" | "info" | "warning"; message: string } | null>(null);
+
+  const showFeedback = useCallback((message: string, type: "success" | "error" | "info" | "warning" = "info") => {
+    setFeedback({ type, message });
+    setTimeout(() => setFeedback(null), 4000);
+  }, []);
 
   const loadDocuments = useCallback(() => {
     return JSON.parse(localStorage.getItem("clinic_crm_documents") || "[]");
@@ -59,18 +99,100 @@ export default function DocumentsPage({ patients, onUpdatePatient, userRole = "a
       )
     : tabDocs;
 
+  function validateDocumentUpload(): { valid: boolean; errors: string[]; warnings: string[] } {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    // Validate patient
+    if (!selectedPatient) {
+      errors.push("Please select a patient.");
+    }
+
+    // Validate document name
+    const docName = uploadDocName || uploadFile?.name || "";
+    const nameError = validateRequired(docName, "Document name");
+    if (nameError) errors.push(nameError);
+
+    // Validate document type
+    const typeError = validateRequired(uploadDocType, "Document type");
+    if (typeError) errors.push(typeError);
+
+    // Validate file if provided
+    if (uploadFile) {
+      // Check file size
+      if (uploadFile.size > MAX_FILE_SIZE_BYTES) {
+        errors.push(`File size exceeds maximum of ${MAX_FILE_SIZE_BYTES / (1024 * 1024)}MB.`);
+      }
+
+      // Check file type (more permissive check)
+      const fileType = uploadFile.type.toLowerCase();
+      const allowedTypes = ALLOWED_DOCUMENT_MIME_TYPES.map(t => t.toLowerCase());
+      if (!allowedTypes.includes(fileType as any)) {
+        errors.push(`File type "${uploadFile.type}" is not allowed. Allowed types: ${ALLOWED_DOCUMENT_MIME_TYPES.join(", ")}`);
+      }
+    }
+
+    // Validate expiry date if provided
+    if (uploadExpiryDate) {
+      if (!validateDate(uploadExpiryDate)) {
+        errors.push("Invalid expiry date format.");
+      }
+    }
+
+    // Validate notes max length
+    if (uploadNotes) {
+      const notesError = validateMaxLength(uploadNotes, 1000, "Clinical notes");
+      if (notesError) errors.push(notesError);
+    }
+
+    // Use shared entity validation as final check
+    if (selectedPatient && docName && uploadDocType) {
+      const documentData = {
+        patient_id: selectedPatient.id,
+        patientId: selectedPatient.id,
+        title: docName,
+        type: uploadDocType,
+        expiryDate: uploadExpiryDate || undefined,
+      };
+      const entityValidation = validateDocumentData(documentData);
+      if (!entityValidation.valid && entityValidation.errors.length > 0) {
+        entityValidation.errors.forEach((err) => {
+          if (!errors.includes(err)) errors.push(err);
+        });
+      }
+    }
+
+    return { valid: errors.length === 0, errors, warnings };
+  }
+
   const handleUpload = () => {
-    if (!selectedPatient) return;
+    if (!canUploadDocument) {
+      handleDeniedAccess("upload", "document");
+      return;
+    }
+    const validation = validateDocumentUpload();
+    
+    // Show errors and block upload
+    if (validation.errors.length > 0) {
+      validation.errors.forEach(error => showFeedback(error, "error"));
+      return;
+    }
+
+    // Show warnings but don't block
+    validation.warnings.forEach(warning => showFeedback(warning, "warning"));
+
+    const docName = uploadDocName || uploadFile?.name || "Untitled";
+    
     const newDoc = {
       id: `doc_${Date.now()}`,
-      patientId: selectedPatient.id,
-      patientName: selectedPatient.name,
+      patientId: selectedPatient!.id,
+      patientName: selectedPatient!.name,
       type: uploadDocType,
-      name: uploadDocName || uploadFile?.name || "Untitled",
+      name: safeString(docName).trim(),
       uploadDate: new Date().toISOString(),
       uploadedBy: "Current User",
       expiryDate: uploadExpiryDate || null,
-      notes: uploadNotes || null,
+      notes: uploadNotes ? safeString(uploadNotes).trim() : null,
       signed: false,
       fileName: uploadFile?.name || null,
     };
@@ -82,19 +204,44 @@ export default function DocumentsPage({ patients, onUpdatePatient, userRole = "a
     setUploadExpiryDate("");
     setUploadFile(null);
     setUploadDocType("consent");
+    showFeedback("Document uploaded successfully.", "success");
   };
 
   const handleDownload = (d: any) => {
-    const blob = new Blob([JSON.stringify(d, null, 2)], { type: "application/json" });
+    if (!canDownloadDocument) {
+      handleDeniedAccess("download", "document");
+      return;
+    }
+    // Phase 8H: Remove patientName and other PHI from downloaded JSON (PHI-safe)
+    const sanitizedMetadata = {
+      id: d.id,
+      patientId: d.patientId,
+      type: d.type,
+      name: d.name,
+      uploadDate: d.uploadDate,
+      expiryDate: d.expiryDate,
+      signed: d.signed,
+      signedDate: d.signedDate,
+      signedBy: d.signedBy,
+      renewedDate: d.renewedDate,
+      renewedBy: d.renewedBy,
+      // Explicitly exclude: patientName, phone, email, dob, address, document content
+    };
+    const blob = new Blob([JSON.stringify(sanitizedMetadata, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
     a.download = `${d.name.replace(/\s+/g, "_")}.json`;
     a.click();
     URL.revokeObjectURL(url);
+    showFeedback("Document metadata downloaded.", "success");
   };
 
   const handleRenewConfirm = () => {
+    if (!canEditDocument) {
+      handleDeniedAccess("renew", "document");
+      return;
+    }
     if (!renewDoc || !renewDate) return;
     const updated = documents.map((doc: any) =>
       doc.id === renewDoc.id
@@ -104,9 +251,14 @@ export default function DocumentsPage({ patients, onUpdatePatient, userRole = "a
     saveDocuments(updated);
     setRenewDoc(null);
     setRenewDate("");
+    showFeedback("Document renewed successfully.", "success");
   };
 
   const handleMarkSigned = (d: any) => {
+    if (!canEditDocument) {
+      handleDeniedAccess("mark as signed", "document");
+      return;
+    }
     const updated = documents.map((doc: any) =>
       doc.id === d.id
         ? { ...doc, signed: true, signedDate: new Date().toISOString(), signedBy: "Current User" }
@@ -114,6 +266,7 @@ export default function DocumentsPage({ patients, onUpdatePatient, userRole = "a
     );
     saveDocuments(updated);
     setSignConfirmDoc(null);
+    showFeedback("Document marked as signed.", "success");
   };
 
   const daysUntilExpiry = (expiryDate: string) => {
@@ -124,6 +277,33 @@ export default function DocumentsPage({ patients, onUpdatePatient, userRole = "a
 
   return (
     <div style={{ padding: "16px clamp(12px, 4vw, 24px)", maxWidth: 1400 }}>
+      {/* Feedback Banner */}
+      {feedback && (
+        <div style={{
+          marginBottom: 16,
+          padding: 12,
+          borderRadius: "var(--radius)",
+          background: feedback.type === "error" ? "var(--red-bg)" : 
+                     feedback.type === "success" ? "var(--green-bg)" : 
+                     feedback.type === "warning" ? "var(--amber-bg)" : "var(--blue-bg)",
+          border: `1px solid ${feedback.type === "error" ? "var(--red-border)" : 
+                              feedback.type === "success" ? "var(--green-border)" : 
+                              feedback.type === "warning" ? "var(--amber-border)" : "var(--blue-border)"}`,
+          color: feedback.type === "error" ? "var(--red)" : 
+                 feedback.type === "success" ? "var(--green)" : 
+                 feedback.type === "warning" ? "var(--amber)" : "var(--blue)",
+          fontSize: "var(--font-sm)",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+        }}>
+          <i className={`ti ${feedback.type === "error" ? "ti-alert-circle" : 
+                              feedback.type === "success" ? "ti-check" : 
+                              feedback.type === "warning" ? "ti-alert-triangle" : "ti-info-circle"}`} />
+          {feedback.message}
+        </div>
+      )}
+
       <div style={{ marginBottom: 24 }}>
         <h1 style={{ fontSize: "var(--font-xl)", fontWeight: 800, margin: 0, marginBottom: 8 }}>
           Documents & Consents
@@ -162,9 +342,11 @@ export default function DocumentsPage({ patients, onUpdatePatient, userRole = "a
                     {d.name} · Expires {fmtDate(d.expiryDate)}
                   </div>
                 </div>
-                <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)" }} onClick={() => { setRenewDoc(d); setRenewDate(d.expiryDate || ""); }}>
-                  Renew
-                </button>
+                {canEditDocument && (
+                  <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)" }} onClick={() => { setRenewDoc(d); setRenewDate(d.expiryDate || ""); }}>
+                    Renew
+                  </button>
+                )}
               </div>
             ))}
           </div>
@@ -210,10 +392,12 @@ export default function DocumentsPage({ patients, onUpdatePatient, userRole = "a
               {filteredDocs.length} record{filteredDocs.length !== 1 ? "s" : ""}
             </div>
             <div style={{ flex: 1 }} />
-            <button className="btn btn-primary" style={{ flexShrink: 0 }} onClick={() => setShowUploadModal(true)}>
-              <i className="ti ti-upload" style={{ fontSize: 13, marginRight: 5 }} />
-              Upload
-            </button>
+            {canUploadDocument && (
+              <button className="btn btn-primary" style={{ flexShrink: 0 }} onClick={() => setShowUploadModal(true)}>
+                <i className="ti ti-upload" style={{ fontSize: 13, marginRight: 5 }} />
+                Upload
+              </button>
+            )}
           </div>
         </div>
 
@@ -233,7 +417,7 @@ export default function DocumentsPage({ patients, onUpdatePatient, userRole = "a
           </thead>
           <tbody>
             {filteredDocs.length === 0 ? (
-              <tr><td colSpan={7}><div className="empty-state"><i className="ti ti-files empty-state-icon" /><div className="empty-state-sub">{searchQuery ? `No documents match "${searchQuery}"` : "No documents yet"}</div>{!searchQuery && <button className="btn btn-primary" style={{ marginTop: 12 }} onClick={() => setShowUploadModal(true)}>Upload first document</button>}</div></td></tr>
+              <tr><td colSpan={7}><div className="empty-state"><i className="ti ti-files empty-state-icon" /><div className="empty-state-sub">{searchQuery ? `No documents match "${searchQuery}"` : "No documents yet"}</div>{!searchQuery && canUploadDocument && <button className="btn btn-primary" style={{ marginTop: 12 }} onClick={() => setShowUploadModal(true)}>Upload first document</button>}</div></td></tr>
             ) : filteredDocs.map((d: any) => {
               const days = d.expiryDate ? daysUntilExpiry(d.expiryDate) : null;
               const isExpired = days !== null && days < 0;
@@ -289,9 +473,15 @@ export default function DocumentsPage({ patients, onUpdatePatient, userRole = "a
                 <td>
                   <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                     <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => setViewDoc(d)}>View</button>
-                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleDownload(d)}>Download</button>
-                    {!d.signed && <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--green)" }} onClick={() => setSignConfirmDoc(d)}>Sign</button>}
-                    {(isExpired || isExpiringSoon) && <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--red)" }} onClick={() => { setRenewDoc(d); setRenewDate(d.expiryDate || ""); }}>Renew</button>}
+                    {canDownloadDocument && (
+                      <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleDownload(d)}>Download</button>
+                    )}
+                    {canEditDocument && !d.signed && (
+                      <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--green)" }} onClick={() => setSignConfirmDoc(d)}>Sign</button>
+                    )}
+                    {canEditDocument && (isExpired || isExpiringSoon) && (
+                      <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--red)" }} onClick={() => { setRenewDoc(d); setRenewDate(d.expiryDate || ""); }}>Renew</button>
+                    )}
                   </div>
                 </td>
               </tr>

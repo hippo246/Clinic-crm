@@ -2,6 +2,21 @@ import React, { useState, useEffect } from "react";
 import type { Patient, UserRole, AlertType } from "./types";
 import { DOCTORS, INSURERS, GENDERS, BLOOD_GROUPS, STATUSES, ALERT_TYPES } from "./constants";
 import { calcAge } from "./utils";
+import {
+  validateEmail,
+  validatePhone,
+  validateDate,
+  validatePastOrTodayDate,
+  validateAgeFromDob,
+  validateBloodGroup,
+  validateRequired,
+  validateMaxLength,
+  safeString,
+} from "../shared/validation/validators";
+import { validatePatientData } from "../shared/validation/entityValidation";
+import { VALID_BLOOD_GROUPS, VALID_GENDERS } from "../shared/constants/validationConstants";
+import { hasRole, normalizeRole } from "../shared/permissions";
+import { logDeniedAction } from "../shared/services/deniedActionLogger";
 
 interface PatientFormProps {
   mode: "create" | "edit";
@@ -38,6 +53,27 @@ const EMPTY: Partial<Patient> = {
 };
 
 export default function PatientForm({ mode, patient, onSave, onClose, role }: PatientFormProps) {
+  const normalizedRole = normalizeRole(role);
+
+  // Local permission guards
+  const canViewPatientForm = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canCreatePatient = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canEditPatient = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canEditClinicalFields = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canSaveDraft = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canLoadDraft = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+
+  const handleDeniedAccess = (action: string, resource: string) => {
+    showFeedback(`You don't have permission to ${action} ${resource}.`, "error");
+    logDeniedAction({
+      action,
+      resource,
+      role: normalizedRole,
+      reason: "Insufficient permissions",
+      severity: "medium",
+    });
+  };
+
   const initial = patient ? {
     ...patient,
   } : EMPTY;
@@ -147,30 +183,36 @@ export default function PatientForm({ mode, patient, onSave, onClose, role }: Pa
   function validateField(field: string, value: any): string | null {
     switch (field) {
       case "firstName":
-        if (!value?.trim()) return "First name is required";
-        if (value.trim().length < 2) return "First name must be at least 2 characters";
+        const firstNameError = validateRequired(value, "First name");
+        if (firstNameError) return firstNameError;
+        if (safeString(value).length < 2) return "First name must be at least 2 characters";
         return null;
       case "lastName":
-        if (value && value.trim().length < 2) return "Last name must be at least 2 characters";
+        if (value && safeString(value).length < 2) return "Last name must be at least 2 characters";
         return null;
       case "phone":
-        if (!value?.trim()) return "Phone number is required";
-        if (!/^[+]?[\d\s-]{10,}$/.test(value)) return "Invalid phone number format";
+        const phoneError = validateRequired(value, "Phone number");
+        if (phoneError) return phoneError;
+        if (!validatePhone(value)) return "Invalid phone number format";
         return null;
       case "email":
-        if (value && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) return "Invalid email format";
+        if (value && !validateEmail(value)) return "Invalid email format";
         return null;
       case "dob": {
-        if (!value) return "Date of birth is required";
-        const dob = new Date(value);
-        if (dob > new Date()) return "Date of birth cannot be in the future";
-        if (dob < new Date("1900-01-01")) return "Invalid date of birth";
-        const age = calcAge(value);
-        if (age > 120) return "Age exceeds 120 years — please verify DOB";
+        const dobError = validateRequired(value, "Date of birth");
+        if (dobError) return dobError;
+        if (!validateDate(value)) return "Invalid date format";
+        if (!validatePastOrTodayDate(value)) return "Date of birth cannot be in the future";
+        const ageResult = validateAgeFromDob(value);
+        if (!ageResult.valid) return ageResult.warning || "Invalid date of birth";
+        if (ageResult.age && ageResult.age > 120) return "Age exceeds 120 years — please verify DOB";
         return null;
       }
       case "emergencyPhone":
-        if (value && !/^[+]?[\d\s-]{10,}$/.test(value)) return "Invalid phone number format";
+        if (value && !validatePhone(value)) return "Invalid phone number format";
+        return null;
+      case "bloodGroup":
+        if (value && !validateBloodGroup(value)) return "Invalid blood group";
         return null;
       case "nextAppointment":
         // warn only, not a blocking error
@@ -204,8 +246,7 @@ export default function PatientForm({ mode, patient, onSave, onClose, role }: Pa
       if (emergencyPhoneError) errs.emergencyPhone = emergencyPhoneError;
     }
     if (form.insuranceExpiry) {
-      const d = new Date(form.insuranceExpiry);
-      if (isNaN(d.getTime())) errs.insuranceExpiry = "Invalid expiry date";
+      if (!validateDate(form.insuranceExpiry)) errs.insuranceExpiry = "Invalid expiry date";
     }
 
     setErrors(errs);
@@ -234,6 +275,25 @@ export default function PatientForm({ mode, patient, onSave, onClose, role }: Pa
       }, 100);
       return false;
     }
+
+    // Use shared entity validation as final check
+    const entityValidation = validatePatientData(form as Record<string, unknown>);
+    if (!entityValidation.valid && entityValidation.errors.length > 0) {
+      // Add entity-level errors to field errors
+      entityValidation.errors.forEach((err) => {
+        // Try to map error messages to field names
+        if (err.toLowerCase().includes("name")) errs.firstName = errs.firstName || err;
+        else if (err.toLowerCase().includes("phone")) errs.phone = errs.phone || err;
+        else if (err.toLowerCase().includes("email")) errs.email = errs.email || err;
+        else if (err.toLowerCase().includes("dob") || err.toLowerCase().includes("birth")) errs.dob = errs.dob || err;
+        else if (err.toLowerCase().includes("gender")) errs.gender = errs.gender || err;
+        else if (err.toLowerCase().includes("blood")) errs.bloodGroup = errs.bloodGroup || err;
+      });
+      setErrors(errs);
+      showFeedback(`Please fix validation errors before saving.`, "error");
+      return false;
+    }
+
     return true;
   }
 
@@ -248,6 +308,14 @@ export default function PatientForm({ mode, patient, onSave, onClose, role }: Pa
   }
 
   function handleSubmit() {
+    if (!canCreatePatient && mode === "create") {
+      handleDeniedAccess("create", "patient");
+      return;
+    }
+    if (!canEditPatient && mode === "edit") {
+      handleDeniedAccess("edit", "patient");
+      return;
+    }
     if (isSaving) return;
     if (!validate()) return;
     // Run dup check before showing review
@@ -981,13 +1049,13 @@ export default function PatientForm({ mode, patient, onSave, onClose, role }: Pa
 
           {section === "medical" && (
             <FormSection>
-              {role === "receptionist" && (
+              {!canEditClinicalFields && (
                 <div style={{ padding: "10px 14px", background: "var(--amber-bg)", color: "var(--amber)", borderRadius: "var(--radius)", fontSize: "var(--font-sm)", marginBottom: 8 }}>
                   <i className="ti ti-lock" style={{ marginRight: 6 }} />
-                  Medical fields are read-only for receptionists. Contact a doctor or admin to edit.
+                  Medical fields are read-only for your role. Contact a doctor or admin to edit.
                 </div>
               )}
-              <fieldset disabled={role === "receptionist"} style={{ border: "none", padding: 0, margin: 0 }}>
+              <fieldset disabled={!canEditClinicalFields} style={{ border: "none", padding: 0, margin: 0 }}>
               <div style={{ borderTop: "1px solid var(--border)", paddingTop: 16, marginBottom: 12 }}>
                 <div className="section-label" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                   Allergies
@@ -1429,10 +1497,17 @@ export default function PatientForm({ mode, patient, onSave, onClose, role }: Pa
               </button>
             )}
             <button className="btn btn-ghost" onClick={() => { if (isDirty) setShowDiscardModal(true); else onClose(); }}>Cancel</button>
-            <button className="btn btn-primary" onClick={handleSubmit} disabled={isSaving} title={isSaving ? "Saving..." : mode === "create" ? "Register patient (Ctrl+S)" : "Save changes (Ctrl+S)"} style={{ opacity: isSaving ? 0.7 : 1 }}>
-              <i className={`ti ${isSaving ? "ti-loader-2" : mode === "create" ? "ti-user-plus" : "ti-device-floppy"}`} style={{ fontSize: 14 }} />
-              {isSaving ? "Saving..." : mode === "create" ? "Register Patient" : "Save Changes"}
-            </button>
+            {(canCreatePatient && mode === "create") || (canEditPatient && mode === "edit") ? (
+              <button className="btn btn-primary" onClick={handleSubmit} disabled={isSaving} title={isSaving ? "Saving..." : mode === "create" ? "Register patient (Ctrl+S)" : "Save changes (Ctrl+S)"} style={{ opacity: isSaving ? 0.7 : 1 }}>
+                <i className={`ti ${isSaving ? "ti-loader-2" : mode === "create" ? "ti-user-plus" : "ti-device-floppy"}`} style={{ fontSize: 14 }} />
+                {isSaving ? "Saving..." : mode === "create" ? "Register Patient" : "Save Changes"}
+              </button>
+            ) : (
+              <button className="btn btn-primary" disabled style={{ opacity: 0.5, cursor: "not-allowed" }}>
+                <i className="ti ti-lock" style={{ fontSize: 14 }} />
+                Insufficient Permissions
+              </button>
+            )}
           </div>
         </div>
       </div>

@@ -1,4 +1,12 @@
-import React, { useState } from 'react';
+import React, { useCallback, useState } from 'react';
+import {
+  validateRequired,
+  validateDate,
+  validateMaxLength,
+  safeString,
+} from '../../shared/validation/validators';
+import { validateAppointmentData } from '../../shared/validation/entityValidation';
+import { Feedback } from '../../shared/components/feedback/Feedback';
 
 interface AppointmentBookingProps {
   patientId: string;
@@ -15,9 +23,90 @@ export function AppointmentBooking({ patientId, patientName, onBookAppointment, 
   const [reason, setReason] = useState('');
   const [notes, setNotes] = useState('');
   const [loading, setLoading] = useState(false);
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [feedback, setFeedback] = useState<{
+    type: 'success' | 'error' | 'info' | 'warning';
+    message: string;
+  } | null>(null);
+
+  const showFeedback = useCallback(
+    (message: string, type: 'success' | 'error' | 'info' | 'warning' = 'info') => {
+      setFeedback({ type, message });
+    },
+    []
+  );
+
+  function validateAppointment(): boolean {
+    const errs: Record<string, string> = {};
+
+    // Validate date
+    const dateError = validateRequired(date, 'Date');
+    if (dateError) {
+      errs.date = dateError;
+    } else if (!validateDate(date)) {
+      errs.date = 'Invalid date format';
+    }
+
+    // Validate time
+    const timeError = validateRequired(time, 'Time');
+    if (timeError) {
+      errs.time = timeError;
+    }
+
+    // Validate reason
+    const reasonError = validateRequired(reason, 'Reason for visit');
+    if (reasonError) {
+      errs.reason = reasonError;
+    } else {
+      const reasonLengthError = validateMaxLength(reason, 500, 'Reason for visit');
+      if (reasonLengthError) errs.reason = reasonLengthError;
+    }
+
+    // Validate notes (optional but has max length)
+    if (notes) {
+      const notesLengthError = validateMaxLength(notes, 1000, 'Additional notes');
+      if (notesLengthError) errs.notes = notesLengthError;
+    }
+
+    setErrors(errs);
+
+    // Use shared entity validation as final check
+    const appointmentData = {
+      patient_id: patientId,
+      date: date,
+      appointmentDate: date,
+      appointment_time: time,
+      appointmentTime: time,
+      duration,
+      appointment_type: type,
+      appointmentType: type,
+      reason,
+      notes,
+      status: 'scheduled'
+    };
+
+    const entityValidation = validateAppointmentData(appointmentData);
+    if (!entityValidation.valid && entityValidation.errors.length > 0) {
+      // Add entity-level errors to field errors
+      entityValidation.errors.forEach((err) => {
+        if (err.toLowerCase().includes('date')) errs.date = errs.date || err;
+        else if (err.toLowerCase().includes('patient')) errs.patient = errs.patient || err;
+        else if (err.toLowerCase().includes('doctor')) errs.doctor = errs.doctor || err;
+      });
+      setErrors(errs);
+      return false;
+    }
+
+    return Object.keys(errs).length === 0;
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    
+    if (!validateAppointment()) {
+      return;
+    }
+
     setLoading(true);
 
     try {
@@ -27,14 +116,19 @@ export function AppointmentBooking({ patientId, patientName, onBookAppointment, 
         appointment_time: time,
         duration,
         appointment_type: type,
-        reason,
-        notes,
+        reason: safeString(reason).trim(),
+        notes: safeString(notes).trim(),
         status: 'scheduled'
       };
 
       await onBookAppointment(appointment);
+      showFeedback('Appointment saved locally.', 'success');
     } catch (error) {
       console.error('Failed to book appointment:', error);
+      showFeedback(
+        'Failed to save appointment. Please check your details and try again.',
+        'error'
+      );
     } finally {
       setLoading(false);
     }
@@ -96,6 +190,36 @@ export function AppointmentBooking({ patientId, patientName, onBookAppointment, 
             <strong>Patient:</strong> {patientName}
           </p>
         </div>
+
+        {Object.keys(errors).length > 0 && (
+          <div style={{
+            background: '#fef2f2',
+            border: '1px solid #fecaca',
+            borderRadius: '8px',
+            padding: '1rem',
+            marginBottom: '1.5rem',
+          }}>
+            <p style={{ margin: 0, fontSize: '0.875rem', color: '#dc2626', fontWeight: '500' }}>
+              Please fix the following errors:
+            </p>
+            <ul style={{ margin: '0.5rem 0 0 1.5rem', fontSize: '0.875rem', color: '#dc2626' }}>
+              {Object.entries(errors).map(([field, error]) => (
+                <li key={field}>{error}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {feedback && (
+          <div style={{ marginBottom: '1.5rem' }}>
+            <Feedback
+              message={feedback.message}
+              type={feedback.type}
+              onClose={() => setFeedback(null)}
+              duration={4000}
+            />
+          </div>
+        )}
 
         <form onSubmit={handleSubmit}>
           <div style={{ marginBottom: '1rem' }}>

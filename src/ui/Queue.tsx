@@ -1,6 +1,14 @@
 import React, { useState, useMemo, useEffect, useCallback } from "react";
 import type { Patient } from "./types";
 import { fmtDate } from "./utils";
+import { hasRole, normalizeRole } from "../shared/permissions/permissions";
+import { logDeniedAction } from "../shared/services/deniedActionLogger";
+// Phase 8B: Import workflow audit helper and state machine
+import { logWorkflowAction } from "../shared/workflow/workflowAudit";
+import { canTransitionStatus, validateWorkflowTransition, type WorkflowEntityType } from "../shared/workflow/workflowStateMachine";
+// Phase 8C: Import patient validation and handoff helpers
+import { validateWorkflowPatientReference } from "../shared/workflow/workflowValidation";
+import { logWorkflowHandoff, logSuccessfulHandoff, logFailedHandoff, logBlockedHandoff } from "../shared/workflow/workflowHandoff";
 
 interface QueuePatient {
   id: string;
@@ -28,6 +36,9 @@ export default function QueuePage({
   onAction?: (actionId: string) => void;
   userRole?: "receptionist" | "doctor" | "admin";
 }) {
+  // Normalize role to ensure it's a valid UserRole
+  const normalizedRole = normalizeRole(userRole) as "admin" | "doctor" | "nurse" | "receptionist" | "billing" | "auditor" | "readonly";
+
   const todayStr = new Date().toISOString().split("T")[0];
   const [selectedDate, setSelectedDate] = useState(todayStr);
   const [selectedDoctor, setSelectedDoctor] = useState("All");
@@ -36,9 +47,34 @@ export default function QueuePage({
   const [lastRefresh, setLastRefresh] = useState(new Date());
   const [tick, setTick] = useState(0);
 
+  // ─── Local Permission Guards (Phase 6H) ─────────────────────────────────────────────
+  const canOpenPatientProfile = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canViewPatientContact = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canCreateInvoice = hasRole(normalizedRole, ["admin", "billing", "receptionist"]);
+  const canStartConsultation = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canManageQueueStatus = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canCancelOrNoShow = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canDeleteQueueRecord = hasRole(normalizedRole, ["admin"]);
+  const canExportQueue = hasRole(normalizedRole, ["admin", "receptionist"]);
+  const canExportQueueActivity = hasRole(normalizedRole, ["admin"]);
+  const canAddPatient = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canBookAppointment = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+
+  // ─── Local Denied Helper (Phase 6H) ───────────────────────────────────────────────
+  const handleDeniedAccess = (action: string, resource: string) => {
+    showFeedback(`You do not have permission to ${action} ${resource}.`, "error");
+    logDeniedAction({
+      role: normalizedRole,
+      action,
+      resource,
+      reason: "Insufficient permissions",
+      severity: "medium",
+    });
+  };
+
   // feedback
-  const [feedback, setFeedback] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
-  const showFeedback = useCallback((message: string, type: "success" | "error" | "info" = "info") => {
+  const [feedback, setFeedback] = useState<{ type: "success" | "error" | "info" | "warning"; message: string } | null>(null);
+  const showFeedback = useCallback((message: string, type: "success" | "error" | "info" | "warning" = "info") => {
     setFeedback({ type, message });
     setTimeout(() => setFeedback(null), 4000);
   }, []);
@@ -64,7 +100,7 @@ export default function QueuePage({
   const [roomsMap, setRoomsMap] = useState<Record<string, string>>(() => {
     try { return JSON.parse(localStorage.getItem(ROOMS_KEY) || "{}"); } catch { return {}; }
   });
-  const [activityLog, setActivityLog] = useState<Array<{ timestamp: string; patientId: string; patientName: string; action: string; details?: string }>>(() => {
+  const [activityLog, setActivityLog] = useState<Array<{ timestamp: string; patientId: string; action: string; details?: string }>>(() => {
     try { return JSON.parse(localStorage.getItem(ACTIVITY_KEY) || "[]"); } catch { return []; }
   });
   const [showActivity, setShowActivity] = useState(false);
@@ -75,8 +111,9 @@ export default function QueuePage({
   const savePriority = (map: Record<string, boolean>) => { setPriorityMap(map); try { localStorage.setItem(PRIORITY_KEY, JSON.stringify(map)); } catch {} };
   const saveNotes    = (map: Record<string, string>)   => { setNotesMap(map);   try { localStorage.setItem(NOTES_KEY,    JSON.stringify(map)); } catch {} };
   const saveRooms    = (map: Record<string, string>)   => { setRoomsMap(map);   try { localStorage.setItem(ROOMS_KEY,    JSON.stringify(map)); } catch {} };
-  const logActivity  = (patientId: string, patientName: string, action: string, details?: string) => {
-    const entry = { timestamp: new Date().toISOString(), patientId, patientName, action, details };
+  // Phase 8B: Remove patientName from activity log (PHI-safe)
+  const logActivity  = (patientId: string, action: string, details?: string) => {
+    const entry = { timestamp: new Date().toISOString(), patientId, action, details };
     const updated = [entry, ...activityLog].slice(0, 50);
     setActivityLog(updated);
     try { localStorage.setItem(ACTIVITY_KEY, JSON.stringify(updated)); } catch {}
@@ -99,7 +136,13 @@ export default function QueuePage({
 
   const queuePatients = useMemo(() => {
     const selectedDateStr = selectedDate;
+    // Phase 8C: Filter out archived/deleted patients from queue for new actions
     const todayAppointments = patients.filter(p => {
+      // Skip archived/inactive/deleted patients
+      if (p.deletedAt) return false;
+      const status = (p.status || "").toLowerCase();
+      if (status === "archived" || status === "inactive") return false;
+      
       if (!p.nextAppointment) return false;
       const appointmentDate = new Date(p.nextAppointment).toISOString().split("T")[0];
       if (selectedDateStr === "week") {
@@ -178,11 +221,70 @@ export default function QueuePage({
   };
 
   const handleStatusChange = (patientId: string, newStatus: QueuePatient["status"], force = false) => {
+    // Permission check for queue status changes
+    if (!canManageQueueStatus) {
+      handleDeniedAccess("change", "queue status");
+      return;
+    }
+    // Additional check for consultation-specific transitions
+    if (newStatus === "with-doctor" && !canStartConsultation) {
+      handleDeniedAccess("start", "consultation");
+      return;
+    }
+    // Additional check for cancel/no-show
+    if ((newStatus === "cancelled" || newStatus === "no-show") && !canCancelOrNoShow) {
+      handleDeniedAccess("cancel/no-show", "queue entry");
+      return;
+    }
+
     const patient = patients.find(p => p.id === patientId);
     if (!patient) return;
 
-    // guard risky backward transitions
+    // Phase 8C: Validate patient reference before status change
+    const patientValidation = validateWorkflowPatientReference(patientId, patients, {
+      requireActive: true,
+      allowDeleted: false,
+      action: "queue status change"
+    });
+    if (!patientValidation.valid) {
+      showFeedback(patientValidation.reason, "error");
+      logBlockedHandoff({
+        fromModule: "queue",
+        toModule: "queue",
+        action: "status_change",
+        patientId,
+        resourceId: patientId,
+        reason: patientValidation.reason,
+        actor: normalizedRole,
+      });
+      return;
+    }
+
+    // Phase 8B: Validate status transition using state machine
     const qp = queuePatients.find(q => q.id === patientId);
+    if (qp && !force) {
+      // Check if transition is allowed
+      const validation = validateWorkflowTransition("queue" as WorkflowEntityType, qp.status, newStatus);
+      if (!validation.valid) {
+        showFeedback(`Invalid status transition: ${validation.reason}`, "error");
+        logWorkflowAction({
+          action: "status_change",
+          module: "queue",
+          resourceType: "queue",
+          resourceId: patientId,
+          patientId,
+          actor: "Current User",
+          role: normalizedRole,
+          statusFrom: qp.status,
+          statusTo: newStatus,
+          success: false,
+          reason: validation.reason,
+        });
+        return;
+      }
+    }
+
+    // guard risky backward transitions
     if (!force && qp && RISKY_TRANSITIONS[qp.status]?.includes(newStatus)) {
       setConfirmPending({ patientId, newStatus, label: `Move ${patient.name} from "${qp.status}" → "${newStatus}"?` });
       return;
@@ -200,13 +302,48 @@ export default function QueuePage({
     };
 
     const patch: Partial<Patient> = {
-      status: statusMap[newStatus],
+      status: statusMap[newStatus] as Patient["status"],
       updatedAt: new Date().toISOString(),
     };
     if (newStatus === "completed") patch.lastVisit = new Date().toISOString();
 
     onUpdatePatient?.({ ...patient, ...patch } as Patient, `moved to ${statusMap[newStatus]}`);
-    logActivity(patientId, patient.name, `Status changed to ${statusMap[newStatus]}`, `From: ${qp?.status || "unknown"}`);
+    // Phase 8B: Remove patientName from activity log (PHI-safe)
+    logActivity(patientId, `Status changed to ${statusMap[newStatus]}`, `From: ${qp?.status || "unknown"}`);
+    // Phase 8B: Add PHI-safe workflow audit logging
+    logWorkflowAction({
+      action: "status_change",
+      module: "queue",
+      resourceType: "queue",
+      resourceId: patientId,
+      patientId,
+      actor: "Current User",
+      role: normalizedRole,
+      statusFrom: qp?.status || "unknown",
+      statusTo: newStatus,
+      success: true,
+    });
+    // Phase 8C: Log handoff for status transitions that trigger cross-module actions
+    // Phase 8E: Queue handoff validation - patient validation already done above
+    if (newStatus === "with-doctor") {
+      logSuccessfulHandoff({
+        fromModule: "queue",
+        toModule: "consultations",
+        action: "start_consultation",
+        patientId,
+        resourceId: patientId,
+        actor: normalizedRole,
+      });
+    } else if (newStatus === "billing-pending") {
+      logSuccessfulHandoff({
+        fromModule: "queue",
+        toModule: "billing",
+        action: "create_invoice",
+        patientId,
+        resourceId: patientId,
+        actor: normalizedRole,
+      });
+    }
     showFeedback(`${patient.name} → ${statusMap[newStatus]}`, "success");
     // refresh detail modal if open for same patient
     if (detailPatient?.id === patientId) setDetailPatient(prev => prev ? { ...prev, status: newStatus } : null);
@@ -254,8 +391,8 @@ export default function QueuePage({
       `}</style>
       {/* Feedback banner */}
       {feedback && (
-        <div className="qp-feedback" style={{ background: feedback.type === "error" ? "var(--red-bg)" : feedback.type === "success" ? "var(--green-bg,#f0fdf4)" : "var(--accent-soft)", color: feedback.type === "error" ? "var(--red)" : feedback.type === "success" ? "var(--green,#16a34a)" : "var(--accent)", border: `1px solid ${feedback.type === "error" ? "var(--red-border)" : feedback.type === "success" ? "var(--green-border,#86efac)" : "var(--accent-border,var(--border))"}` }}>
-          <i className={`ti ${feedback.type === "error" ? "ti-alert-circle" : feedback.type === "success" ? "ti-circle-check" : "ti-info-circle"}`} />
+        <div className="qp-feedback" style={{ background: feedback.type === "error" ? "var(--red-bg)" : feedback.type === "success" ? "var(--green-bg,#f0fdf4)" : feedback.type === "warning" ? "var(--amber-bg,#fffbeb)" : "var(--accent-soft)", color: feedback.type === "error" ? "var(--red)" : feedback.type === "success" ? "var(--green,#16a34a)" : feedback.type === "warning" ? "var(--amber,#b45309)" : "var(--accent)", border: `1px solid ${feedback.type === "error" ? "var(--red-border)" : feedback.type === "success" ? "var(--green-border,#86efac)" : feedback.type === "warning" ? "var(--amber-border,#fcd34d)" : "var(--accent-border,var(--border))"}` }}>
+          <i className={`ti ${feedback.type === "error" ? "ti-alert-circle" : feedback.type === "success" ? "ti-circle-check" : feedback.type === "warning" ? "ti-alert-triangle" : "ti-info-circle"}`} />
           {feedback.message}
         </div>
       )}
@@ -388,21 +525,25 @@ export default function QueuePage({
                 </td>
                 <td>
                   <div style={{ display: "flex", gap: 4, flexDirection: "column", alignItems: "flex-start" }}>
-                    <QueueActions status={q.status} onAction={(newStatus) => handleStatusChange(q.id, newStatus)} userRole={userRole} />
+                    {canManageQueueStatus && (
+                      <QueueActions status={q.status} onAction={(newStatus) => handleStatusChange(q.id, newStatus)} userRole={userRole} canManageQueueStatus={canManageQueueStatus} canStartConsultation={canStartConsultation} canCancelOrNoShow={canCancelOrNoShow} />
+                    )}
                     <div style={{ display: "flex", gap: 3, flexWrap: "wrap", marginTop: 2 }}>
                       <button className="btn btn-ghost" style={{ fontSize: 10, padding: "2px 6px", minHeight: 26 }} aria-label="View details for ${q.patient.name}" title="Details" onClick={() => setDetailPatient(q)}>
                         <i className="ti ti-info-circle" style={{ fontSize: 10 }} />
                       </button>
-                      <button className="btn btn-ghost" style={{ fontSize: 10, padding: "2px 6px", minHeight: 26 }} aria-label="View patient profile for ${q.patient.name}" title="View patient" onClick={() => { if (onAction) onAction(`view-patient:${q.patient.id}`); else showFeedback(`Patient: ${q.patient.name} · ${q.patient.id}`, "info"); }}>
-                        <i className="ti ti-user" style={{ fontSize: 10 }} />
-                      </button>
-                      {q.patient.phone
+                      {canOpenPatientProfile && (
+                        <button className="btn btn-ghost" style={{ fontSize: 10, padding: "2px 6px", minHeight: 26 }} aria-label="View patient profile for ${q.patient.name}" title="View patient" onClick={() => { if (onAction) onAction(`view-patient:${q.patient.id}`); else showFeedback(`Patient: ${q.patient.name} · ${q.patient.id}`, "info"); }}>
+                          <i className="ti ti-user" style={{ fontSize: 10 }} />
+                        </button>
+                      )}
+                      {canViewPatientContact && q.patient.phone
                         ? <a href={`tel:${q.patient.phone}`} className="btn btn-ghost" style={{ fontSize: 10, padding: "2px 6px", minHeight: 26, textDecoration: "none", display: "inline-flex", alignItems: "center" }} aria-label={`Call ${q.patient.name}`} title="Call"><i className="ti ti-phone" style={{ fontSize: 10 }} /></a>
-                        : <button className="btn btn-ghost" style={{ fontSize: 10, padding: "2px 6px", minHeight: 26 }} aria-label="Call not available - no phone on file" title="Call — no phone on file" onClick={() => showFeedback(`${q.patient.name} has no phone number on file.`, "error")}><i className="ti ti-phone-off" style={{ fontSize: 10 }} /></button>
+                        : canViewPatientContact && <button className="btn btn-ghost" style={{ fontSize: 10, padding: "2px 6px", minHeight: 26 }} aria-label="Call not available - no phone on file" title="Call — no phone on file" onClick={() => showFeedback(`${q.patient.name} has no phone number on file.`, "error")}><i className="ti ti-phone-off" style={{ fontSize: 10 }} /></button>
                       }
-                      {(q.patient.phone || (q.patient as any).email)
+                      {canViewPatientContact && (q.patient.phone || (q.patient as any).email)
                         ? <a href={q.patient.phone ? `sms:${q.patient.phone}` : `mailto:${(q.patient as any).email}`} className="btn btn-ghost" style={{ fontSize: 10, padding: "2px 6px", minHeight: 26, textDecoration: "none", display: "inline-flex", alignItems: "center" }} aria-label={`Message ${q.patient.name}`} title="Message"><i className="ti ti-message" style={{ fontSize: 10 }} /></a>
-                        : <button className="btn btn-ghost" style={{ fontSize: 10, padding: "2px 6px", minHeight: 26 }} aria-label="Message not available - no contact info" title="Message — no contact info" onClick={() => showFeedback(`${q.patient.name} has no contact info.`, "error")}><i className="ti ti-message-off" style={{ fontSize: 10 }} /></button>
+                        : canViewPatientContact && <button className="btn btn-ghost" style={{ fontSize: 10, padding: "2px 6px", minHeight: 26 }} aria-label="Message not available - no contact info" title="Message — no contact info" onClick={() => showFeedback(`${q.patient.name} has no contact info.`, "error")}><i className="ti ti-message-off" style={{ fontSize: 10 }} /></button>
                       }
                       <button className="btn btn-ghost" style={{ fontSize: 10, padding: "2px 6px", minHeight: 26, color: q.priority ? "var(--amber)" : undefined }} aria-label={q.priority ? `Remove priority for ${q.patient.name}` : `Mark ${q.patient.name} as priority`} title={q.priority ? "Remove priority" : "Mark priority"} onClick={() => {
                         const next = { ...priorityMap, [q.id]: !q.priority };
@@ -456,18 +597,22 @@ export default function QueuePage({
             </div>
             {q.note && <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", fontStyle: "italic", marginBottom: 6 }}>"{q.note}"</div>}
             <div className="qp-mobile-card-actions">
-              <QueueActions status={q.status} onAction={(newStatus) => handleStatusChange(q.id, newStatus)} userRole={userRole} />
+              {canManageQueueStatus && (
+                <QueueActions status={q.status} onAction={(newStatus) => handleStatusChange(q.id, newStatus)} userRole={userRole} canManageQueueStatus={canManageQueueStatus} canStartConsultation={canStartConsultation} canCancelOrNoShow={canCancelOrNoShow} />
+              )}
             </div>
             <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
               <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "5px 10px", minHeight: 36, flex: 1 }} onClick={() => setDetailPatient(q)}>
                 <i className="ti ti-info-circle" style={{ fontSize: 11, marginRight: 3 }} />Details
               </button>
-              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "5px 10px", minHeight: 36, flex: 1 }} onClick={() => { if (onAction) onAction(`view-patient:${q.patient.id}`); else showFeedback(`${q.patient.name} · ${q.patient.id}`, "info"); }}>
-                <i className="ti ti-user" style={{ fontSize: 11, marginRight: 3 }} />Profile
-              </button>
-              {q.patient.phone
+              {canOpenPatientProfile && (
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "5px 10px", minHeight: 36, flex: 1 }} onClick={() => { if (onAction) onAction(`view-patient:${q.patient.id}`); else showFeedback(`${q.patient.name} · ${q.patient.id}`, "info"); }}>
+                  <i className="ti ti-user" style={{ fontSize: 11, marginRight: 3 }} />Profile
+                </button>
+              )}
+              {canViewPatientContact && q.patient.phone
                 ? <a href={`tel:${q.patient.phone}`} className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "5px 10px", minHeight: 36, flex: 1, textDecoration: "none", display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 4 }}><i className="ti ti-phone" style={{ fontSize: 11 }} />Call</a>
-                : <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "5px 10px", minHeight: 36, flex: 1 }} onClick={() => showFeedback(`${q.patient.name} has no phone number on file.`, "error")}><i className="ti ti-phone-off" style={{ fontSize: 11, marginRight: 3 }} />Call</button>
+                : canViewPatientContact && <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "5px 10px", minHeight: 36, flex: 1 }} onClick={() => showFeedback(`${q.patient.name} has no phone number on file.`, "error")}><i className="ti ti-phone-off" style={{ fontSize: 11, marginRight: 3 }} />Call</button>
               }
             </div>
           </div>
@@ -479,11 +624,25 @@ export default function QueuePage({
       <div className="card card-padded" style={{ marginTop: 24 }}>
         <div className="section-label" style={{ marginBottom: 12 }}>Quick Actions</div>
         <div className="qp-quick-actions">
-          <button className="btn btn-primary" style={{ fontSize: "var(--font-sm)", minHeight: 40 }} onClick={() => onAction?.("add-patient")}>
+          <button className="btn btn-primary" style={{ fontSize: "var(--font-sm)", minHeight: 40 }} onClick={() => {
+            if (!canAddPatient) {
+              handleDeniedAccess("add", "patient");
+              return;
+            }
+            if (onAction) onAction("add-patient");
+            else showFeedback("Walk-in check-in requires the front-desk panel to be open.", "info");
+          }}>
             <i className="ti ti-user-plus" style={{ fontSize: 12, marginRight: 4 }} />
             Walk-in Check-in
           </button>
-          <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)", minHeight: 40 }} onClick={() => onAction?.("book-appointment")}>
+          <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)", minHeight: 40 }} onClick={() => {
+            if (!canBookAppointment) {
+              handleDeniedAccess("book", "appointment");
+              return;
+            }
+            if (onAction) onAction("book-appointment");
+            else showFeedback("Scheduling an appointment requires the booking panel to be open.", "info");
+          }}>
             <i className="ti ti-calendar-plus" style={{ fontSize: 12, marginRight: 4 }} />
             Schedule Appointment
           </button>
@@ -500,15 +659,27 @@ export default function QueuePage({
             <i className="ti ti-phone-call" style={{ fontSize: 12, marginRight: 4 }} />
             Call Next Patient
           </button>
-          <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)", minHeight: 40 }} onClick={() => onAction?.("create-invoice")}>
+          <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)", minHeight: 40 }} onClick={() => {
+            if (!canCreateInvoice) {
+              handleDeniedAccess("create", "invoice");
+              return;
+            }
+            if (onAction) onAction("create-invoice");
+            else showFeedback("Creating an invoice requires the billing panel to be open.", "info");
+          }}>
             <i className="ti ti-receipt" style={{ fontSize: 12, marginRight: 4 }} />
             Create Invoice
           </button>
           <button className="btn btn-ghost" style={{ fontSize: "var(--font-sm)", minHeight: 40 }} onClick={() => {
+            if (!canExportQueue) {
+              handleDeniedAccess("export", "queue CSV");
+              return;
+            }
             if (filteredQueue.length === 0) { showFeedback("No queue patients to export.", "error"); return; }
+            // Phase 8J: Remove patientName from Queue CSV export (PHI-safe)
             const rows = [
-              ["Token","Patient ID","Patient Name","Doctor","Appt Time","Status","Wait (min)","Priority","Room","Note"],
-              ...filteredQueue.map(q => [q.tokenNo, q.patient.id, q.patient.name, q.doctor, q.appointmentTime, q.status, q.waitingTime, q.priority ? "Yes" : "No", q.room || "", q.note || ""]),
+              ["Token","Patient ID","Doctor","Appt Time","Status","Wait (min)","Priority","Room","Note"],
+              ...filteredQueue.map(q => [q.tokenNo, q.patient.id, q.doctor, q.appointmentTime, q.status, q.waitingTime, q.priority ? "Yes" : "No", q.room || "", q.note || ""]),
             ];
             const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g,"''")}"`).join(",")).join("\n");
             const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" })); a.download = `queue-${selectedDate}.csv`; a.click();
@@ -530,10 +701,15 @@ export default function QueuePage({
               {showActivity ? "Hide" : "Show"}
             </button>
             <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px" }} onClick={() => {
+              if (!canExportQueueActivity) {
+                handleDeniedAccess("export", "queue activity");
+                return;
+              }
               if (activityLog.length === 0) { showFeedback("No activity to export.", "error"); return; }
+              // Phase 8E: Remove patientName from CSV export (PHI-safe)
               const rows = [
-                ["Timestamp","Patient ID","Patient Name","Action","Details"],
-                ...activityLog.map(a => [a.timestamp, a.patientId, a.patientName, a.action, a.details || ""]),
+                ["Timestamp","Patient ID","Action","Details"],
+                ...activityLog.map(a => [a.timestamp, a.patientId, a.action, a.details || ""]),
               ];
               const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g,"''")}"`).join(",")).join("\n");
               const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" })); a.download = `queue-activity-${new Date().toISOString().split("T")[0]}.csv`; a.click();
@@ -543,6 +719,10 @@ export default function QueuePage({
               Export
             </button>
             <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", color: "var(--red)" }} onClick={() => {
+              if (!canDeleteQueueRecord) {
+                handleDeniedAccess("clear", "queue activity");
+                return;
+              }
               if (activityLog.length === 0) { showFeedback("No activity to clear.", "error"); return; }
               setClearActivityPending(true);
             }}>
@@ -560,7 +740,7 @@ export default function QueuePage({
                 <thead>
                   <tr>
                     <th style={{ fontSize: "var(--font-xs)" }}>Time</th>
-                    <th style={{ fontSize: "var(--font-xs)" }}>Patient</th>
+                    <th style={{ fontSize: "var(--font-xs)" }}>Patient ID</th>
                     <th style={{ fontSize: "var(--font-xs)" }}>Action</th>
                     <th style={{ fontSize: "var(--font-xs)" }}>Details</th>
                   </tr>
@@ -569,7 +749,7 @@ export default function QueuePage({
                   {activityLog.map((a, idx) => (
                     <tr key={idx}>
                       <td style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{new Date(a.timestamp).toLocaleTimeString()}</td>
-                      <td style={{ fontSize: "var(--font-xs)" }}>{a.patientName}</td>
+                      <td style={{ fontSize: "var(--font-xs)" }}>{a.patientId}</td>
                       <td style={{ fontSize: "var(--font-xs)" }}>{a.action}</td>
                       <td style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{a.details || "—"}</td>
                     </tr>
@@ -602,8 +782,8 @@ export default function QueuePage({
                   ["Appt Time",  q.appointmentTime],
                   ["Status",     q.status.replace(/-/g," ")],
                   ["Wait",       waitLabel],
-                  ["Phone",      q.patient.phone || "—"],
-                  ["Email",      (q.patient as any).email || "—"],
+                  ["Phone",      canViewPatientContact ? (q.patient.phone || "—") : "—"],
+                  ["Email",      canViewPatientContact ? ((q.patient as any).email || "—") : "—"],
                   ["Insurance",  q.patient.insuranceStatus || "—"],
                   ["Consent",    (q.patient as any).consentStatus || "—"],
                   ["Room",       q.room || "—"],
@@ -643,7 +823,22 @@ export default function QueuePage({
                       <button key={r} className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "3px 8px", background: editingRoom.text === r ? "var(--accent-soft)" : undefined, color: editingRoom.text === r ? "var(--accent)" : undefined }} onClick={() => setEditingRoom({ id: q.id, text: r })}>{r}</button>
                     ))}
                     <input value={editingRoom.text} onChange={e => setEditingRoom({ id: q.id, text: e.target.value })} placeholder="Custom…" style={{ fontSize: "var(--font-xs)", padding: "3px 6px", borderRadius: "var(--radius)", border: "1px solid var(--border)", width: 80 }} />
-                    <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)", padding: "4px 8px" }} onClick={() => { saveRooms({ ...roomsMap, [q.id]: editingRoom.text }); setEditingRoom(null); showFeedback(`Room set to ${editingRoom.text}.`, "success"); }}>Assign</button>
+                    <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)", padding: "4px 8px" }} onClick={() => {
+                      // Phase 8E: Validate room assignment
+                      if (!editingRoom.text.trim()) {
+                        showFeedback("Room cannot be empty.", "error");
+                        return;
+                      }
+                      const validRooms = ["Room 1", "Room 2", "Room 3", "Room 4"];
+                      const isValidRoom = validRooms.includes(editingRoom.text) || editingRoom.text.trim().length > 0;
+                      if (!isValidRoom) {
+                        showFeedback("Invalid room assignment.", "error");
+                        return;
+                      }
+                      saveRooms({ ...roomsMap, [q.id]: editingRoom.text });
+                      setEditingRoom(null);
+                      showFeedback(`Room set to ${editingRoom.text}.`, "success");
+                    }}>Assign</button>
                     {q.room && <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", color: "var(--red)" }} onClick={() => { const m = { ...roomsMap }; delete m[q.id]; saveRooms(m); setEditingRoom(null); showFeedback("Room cleared.", "info"); }}>Clear</button>}
                     <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px" }} onClick={() => setEditingRoom(null)}>✕</button>
                   </div>
@@ -657,11 +852,15 @@ export default function QueuePage({
               <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12 }}>
                 <div style={{ fontSize: "var(--font-xs)", fontWeight: 700, marginBottom: 8 }}>Workflow</div>
                 <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                  <QueueActions status={q.status} onAction={newStatus => { handleStatusChange(q.id, newStatus); setDetailPatient(prev => prev ? { ...prev, status: newStatus } : null); }} userRole={userRole} />
-                  {q.patient.phone && <a href={`tel:${q.patient.phone}`} className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "5px 10px", minHeight: 32, textDecoration: "none", display: "inline-flex", alignItems: "center", gap: 4 }}><i className="ti ti-phone" style={{ fontSize: 11 }} />Call</a>}
-                  <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "5px 10px", minHeight: 32 }} onClick={() => { if (onAction) onAction(`view-patient:${q.patient.id}`); else showFeedback(`${q.patient.name} · ${q.patient.id}`, "info"); setDetailPatient(null); }}>
-                    <i className="ti ti-user" style={{ fontSize: 11, marginRight: 3 }} />View Profile
-                  </button>
+                  {canManageQueueStatus && (
+                    <QueueActions status={q.status} onAction={newStatus => { handleStatusChange(q.id, newStatus); setDetailPatient(prev => prev ? { ...prev, status: newStatus } : null); }} userRole={userRole} canManageQueueStatus={canManageQueueStatus} canStartConsultation={canStartConsultation} canCancelOrNoShow={canCancelOrNoShow} />
+                  )}
+                  {canViewPatientContact && q.patient.phone && <a href={`tel:${q.patient.phone}`} className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "5px 10px", minHeight: 32, textDecoration: "none", display: "inline-flex", alignItems: "center", gap: 4 }}><i className="ti ti-phone" style={{ fontSize: 11 }} />Call</a>}
+                  {canOpenPatientProfile && (
+                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "5px 10px", minHeight: 32 }} onClick={() => { if (onAction) onAction(`view-patient:${q.patient.id}`); else showFeedback(`${q.patient.name} · ${q.patient.id}`, "info"); setDetailPatient(null); }}>
+                      <i className="ti ti-user" style={{ fontSize: 11, marginRight: 3 }} />View Profile
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
@@ -746,15 +945,15 @@ function StatusBadge({ status }: { status: QueuePatient["status"] }) {
   );
 }
 
-function QueueActions({ status, onAction, userRole = "admin" }: { status: QueuePatient["status"]; onAction: (newStatus: QueuePatient["status"]) => void; userRole?: "receptionist" | "doctor" | "admin" }) {
-  const canSendToDoctor = userRole === "admin" || userRole === "doctor";
-  const canComplete = userRole === "admin" || userRole === "doctor";
-  const canCheckIn = userRole === "admin" || userRole === "receptionist";
-  const canMarkWaiting = userRole === "admin" || userRole === "receptionist";
-  const canBilling = userRole === "admin" || userRole === "receptionist";
-  const canNoShow = userRole === "admin" || userRole === "receptionist";
-  const canCancel = userRole === "admin" || userRole === "receptionist";
-  const canReopen = userRole === "admin";
+function QueueActions({ status, onAction, userRole = "admin", canManageQueueStatus = true, canStartConsultation = true, canCancelOrNoShow = true }: { status: QueuePatient["status"]; onAction: (newStatus: QueuePatient["status"]) => void; userRole?: "receptionist" | "doctor" | "admin"; canManageQueueStatus?: boolean; canStartConsultation?: boolean; canCancelOrNoShow?: boolean }) {
+  const canSendToDoctor = canStartConsultation;
+  const canComplete = canStartConsultation;
+  const canCheckIn = canManageQueueStatus;
+  const canMarkWaiting = canManageQueueStatus;
+  const canBilling = canManageQueueStatus;
+  const canNoShow = canCancelOrNoShow;
+  const canCancel = canCancelOrNoShow;
+  const canReopen = canManageQueueStatus && userRole === "admin";
 
   const actions: Record<QueuePatient["status"], any> = {
     "scheduled": (

@@ -1,6 +1,14 @@
 import React, { useState, useRef, useEffect } from "react";
 import type { Patient, TimelineEvent, PatientNote, Prescription } from "./types";
 import { fmtDate } from "./utils";
+import { hasRole, normalizeRole } from "../shared/permissions";
+import { logDeniedAction } from "../shared/services/deniedActionLogger";
+// Phase 8B: Import workflow audit helper and state machine
+import { logWorkflowAction } from "../shared/workflow/workflowAudit";
+import { validateWorkflowTransition, type WorkflowEntityType } from "../shared/workflow/workflowStateMachine";
+// Phase 8C: Import patient validation and handoff helpers
+import { validateWorkflowPatientReference } from "../shared/workflow/workflowValidation";
+import { logSuccessfulHandoff, logFailedHandoff, logBlockedHandoff } from "../shared/workflow/workflowHandoff";
 
 // ─── Styles ───────────────────────────────────────────────────────────────────
 const css = `
@@ -129,7 +137,6 @@ interface ActivityEntry {
   timestamp: string;
   action: string;
   patientId?: string;
-  patientName?: string;
   details?: string;
 }
 
@@ -169,6 +176,31 @@ interface ConsultationsPageProps {
 
 // ─── Main Component ───────────────────────────────────────────────────────────
 export default function ConsultationsPage({ patients, onUpdatePatient, userRole = "admin" }: ConsultationsPageProps) {
+  const normalizedRole = normalizeRole(userRole);
+
+  // Local permission guards
+  const canViewConsultations = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canCreateConsultation = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canEditConsultation = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canDeleteConsultation = hasRole(normalizedRole, ["admin"]);
+  const canCompleteConsultation = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canPrintConsultation = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canExportConsultations = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canExportConsultationActivity = hasRole(normalizedRole, ["admin"]);
+  const canApplyConsultationTemplate = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canManageConsultationTemplates = hasRole(normalizedRole, ["admin", "doctor"]);
+
+  const handleDeniedAccess = (action: string, resource: string) => {
+    setFeedback({ type: "error", message: `You don't have permission to ${action} ${resource}.` });
+    logDeniedAction({
+      action,
+      resource,
+      role: normalizedRole,
+      reason: "Insufficient permissions",
+      severity: "medium",
+    });
+  };
+
   const [allConsults, setAllConsults] = useState<ConsultRecord[]>(loadConsults);
   const [selectedPatient, setSelectedPatient] = useState<Patient | null>(null);
   const [activeConsult, setActiveConsult] = useState<ConsultRecord | null>(null);
@@ -273,12 +305,12 @@ export default function ConsultationsPage({ patients, onUpdatePatient, userRole 
     setTimeout(() => setFeedback(null), 4000);
   };
 
-  const logActivity = (action: string, patientId?: string, patientName?: string, details?: string) => {
+  // Phase 8B: Remove patientName from activity log (PHI-safe)
+  const logActivity = (action: string, patientId?: string, details?: string) => {
     const entry: ActivityEntry = {
       timestamp: new Date().toISOString(),
       action,
       patientId,
-      patientName,
       details,
     };
     const updated = [entry, ...activity].slice(0, 50);
@@ -364,11 +396,49 @@ export default function ConsultationsPage({ patients, onUpdatePatient, userRole 
     // Auto-upsert into allConsults
     const others = allConsults.filter(c => c.id !== updated.id);
     persist([...others, updated]);
+
+    // Phase 8B: Log workflow action for consultation edit
+    if (activeConsult.status !== "in-progress") {
+      logWorkflowAction({
+        action: "edit",
+        entityType: "consultation",
+        entityId: updated.id,
+        patientId: selectedPatient?.id,
+        metadata: {
+          field: key,
+          performedBy: normalizedRole,
+        },
+      });
+    }
   };
 
   const handleSave = () => {
+    if (!canEditConsultation) {
+      handleDeniedAccess("save", "consultation");
+      return;
+    }
     if (!activeConsult || !selectedPatient) {
       showFeedback("Please select a patient first.", "error");
+      return;
+    }
+
+    // Phase 8C: Validate patient reference before saving consultation
+    const patientValidation = validateWorkflowPatientReference(selectedPatient.id, patients, {
+      requireActive: true,
+      allowDeleted: false,
+      action: "save consultation"
+    });
+    if (!patientValidation.valid) {
+      showFeedback(patientValidation.reason, "error");
+      logBlockedHandoff({
+        fromModule: "consultations",
+        toModule: "consultations",
+        action: "save_consultation",
+        patientId: selectedPatient.id,
+        resourceId: activeConsult.id,
+        reason: patientValidation.reason,
+        actor: normalizedRole,
+      });
       return;
     }
 
@@ -400,10 +470,45 @@ export default function ConsultationsPage({ patients, onUpdatePatient, userRole 
       return;
     }
 
+    // Phase 8B: Validate status transition using state machine
+    const transitionResult = validateWorkflowTransition(
+      "consultation" as WorkflowEntityType,
+      activeConsult.status,
+      "completed"
+    );
+    if (!transitionResult.valid) {
+      showFeedback(`Invalid status transition: ${transitionResult.reason}`, "error");
+      return;
+    }
+
     const saved: ConsultRecord = { ...activeConsult, status: "completed" };
     const others = allConsults.filter(c => c.id !== saved.id);
     persist([...others, saved]);
     setActiveConsult(saved);
+
+    // Phase 8B: Log workflow action for status change
+    logWorkflowAction({
+      action: "status_change",
+      entityType: "consultation",
+      entityId: saved.id,
+      patientId: selectedPatient.id,
+      metadata: {
+        fromStatus: activeConsult.status,
+        toStatus: "completed",
+        performedBy: normalizedRole,
+      },
+    });
+
+    // Phase 8C: Log handoff for consultation completion
+    logSuccessfulHandoff({
+      fromModule: "consultations",
+      toModule: "patient_profile",
+      action: "consultation_completed",
+      patientId: selectedPatient.id,
+      resourceId: saved.id,
+      resourceType: "consultation",
+      actor: normalizedRole,
+    });
 
     // Remove draft if exists
     const updatedDrafts = drafts.filter(d => d.patientId !== selectedPatient.id);
@@ -478,7 +583,7 @@ export default function ConsultationsPage({ patients, onUpdatePatient, userRole 
 
     onUpdatePatient(updatedPatient, "consultation saved");
 
-    logActivity("consultation completed", selectedPatient.id, selectedPatient.name, `Diagnosis: ${saved.diagnosis || saved.complaint}`);
+    logActivity("consultation completed", selectedPatient.id, `Diagnosis: ${saved.diagnosis || saved.complaint}`);
 
     originalRef.current = null;
     setSaveFlash(true);
@@ -487,6 +592,10 @@ export default function ConsultationsPage({ patients, onUpdatePatient, userRole 
   };
 
   const handleSaveDraft = () => {
+    if (!canEditConsultation) {
+      handleDeniedAccess("save draft", "consultation");
+      return;
+    }
     if (!activeConsult || !selectedPatient) {
       showFeedback("Please select a patient first.", "error");
       return;
@@ -516,7 +625,7 @@ export default function ConsultationsPage({ patients, onUpdatePatient, userRole 
     setDrafts([draft, ...updatedDrafts]);
     saveDrafts([draft, ...updatedDrafts]);
 
-    logActivity("draft saved", selectedPatient.id, selectedPatient.name);
+    logActivity("draft saved", selectedPatient.id);
     showFeedback("Draft saved successfully.", "success");
   };
 
@@ -527,11 +636,15 @@ export default function ConsultationsPage({ patients, onUpdatePatient, userRole 
     }
     setActiveConsult(draft.consult);
     setViewingHistory(null);
-    logActivity("draft loaded", selectedPatient.id, selectedPatient.name);
+    logActivity("draft loaded", selectedPatient.id);
     showFeedback("Draft loaded.", "info");
   };
 
   const handleDeleteDraft = (draftId: string) => {
+    if (!canEditConsultation) {
+      handleDeniedAccess("delete draft", "consultation");
+      return;
+    }
     setConfirmModal({
       message: "Are you sure you want to delete this draft?",
       onConfirm: () => {
@@ -546,6 +659,10 @@ export default function ConsultationsPage({ patients, onUpdatePatient, userRole 
   };
 
   const handleApplyTemplate = (template: Template) => {
+    if (!canApplyConsultationTemplate) {
+      handleDeniedAccess("apply template", "consultation");
+      return;
+    }
     if (!activeConsult) {
       showFeedback("Start a consultation first to apply a template.", "warning");
       return;
@@ -562,11 +679,15 @@ export default function ConsultationsPage({ patients, onUpdatePatient, userRole 
     setActiveConsult(updated);
     const others = allConsults.filter(c => c.id !== updated.id);
     persist([...others, updated]);
-    logActivity("template applied", selectedPatient?.id, selectedPatient?.name, `Template: ${template.name}`);
+    logActivity("template applied", selectedPatient?.id, `Template: ${template.name}`);
     showFeedback(`Template "${template.name}" applied.`, "success");
   };
 
   const handleSaveTemplate = (template: Omit<Template, "id">) => {
+    if (!canManageConsultationTemplates) {
+      handleDeniedAccess("save template", "consultation");
+      return;
+    }
     const newTemplate: Template = {
       ...template,
       id: `tpl-${Date.now()}`,
@@ -589,6 +710,10 @@ export default function ConsultationsPage({ patients, onUpdatePatient, userRole 
   };
 
   const handleDeleteTemplate = (templateId: string) => {
+    if (!canManageConsultationTemplates) {
+      handleDeniedAccess("delete template", "consultation");
+      return;
+    }
     setConfirmModal({
       message: "Are you sure you want to delete this template?",
       onConfirm: () => {
@@ -603,6 +728,10 @@ export default function ConsultationsPage({ patients, onUpdatePatient, userRole 
   };
 
   const handleExportConsultationTXT = () => {
+    if (!canExportConsultations) {
+      handleDeniedAccess("export", "consultation");
+      return;
+    }
     if (!viewingHistory && !activeConsult) {
       showFeedback("No consultation to export.", "warning");
       return;
@@ -654,11 +783,15 @@ Generated by Clinic CRM
     a.click();
     URL.revokeObjectURL(url);
 
-    logActivity("consultation exported as TXT", consult.patientId, patient.name);
+    logActivity("consultation exported as TXT", consult.patientId);
     showFeedback("Consultation exported as TXT.", "success");
   };
 
   const handleExportHistoryCSV = () => {
+    if (!canExportConsultations) {
+      handleDeniedAccess("export", "consultation history");
+      return;
+    }
     const filteredHistory = allConsults.filter(c => {
       if (filterStatus && c.status !== filterStatus) return false;
       if (filterDoctor && c.doctor !== filterDoctor) return false;
@@ -718,6 +851,10 @@ Generated by Clinic CRM
   };
 
   const handlePrintConsultation = () => {
+    if (!canPrintConsultation) {
+      handleDeniedAccess("print", "consultation");
+      return;
+    }
     if (!viewingHistory && !activeConsult) {
       showFeedback("No consultation to print.", "warning");
       return;
@@ -813,7 +950,7 @@ Generated by Clinic CRM
       printWindow.document.write(printContent);
       printWindow.document.close();
       printWindow.print();
-      logActivity("consultation printed", consult.patientId, patient.name);
+      logActivity("consultation printed", consult.patientId);
       showFeedback("Print dialog opened.", "success");
     } else {
       showFeedback("Popup blocked. Please allow popups for this site.", "error");
@@ -821,6 +958,10 @@ Generated by Clinic CRM
   };
 
   const handleDeleteConsultation = (consultId: string) => {
+    if (!canDeleteConsultation) {
+      handleDeniedAccess("delete", "consultation");
+      return;
+    }
     setConfirmModal({
       message: "Are you sure you want to delete this consultation? This cannot be undone.",
       onConfirm: () => {
@@ -839,8 +980,23 @@ Generated by Clinic CRM
   };
 
   const handleMarkCompleted = (consultId: string) => {
+    if (!canCompleteConsultation) {
+      handleDeniedAccess("complete", "consultation");
+      return;
+    }
     const consult = allConsults.find(c => c.id === consultId);
     if (!consult) return;
+
+    // Phase 8B: Validate status transition using state machine
+    const transitionResult = validateWorkflowTransition(
+      "consultation" as WorkflowEntityType,
+      consult.status,
+      "completed"
+    );
+    if (!transitionResult.valid) {
+      showFeedback(`Invalid status transition: ${transitionResult.reason}`, "error");
+      return;
+    }
 
     const updated = { ...consult, status: "completed" as ConsultStatus };
     const others = allConsults.filter(c => c.id !== updated.id);
@@ -848,11 +1004,28 @@ Generated by Clinic CRM
 
     if (viewingHistory?.id === consultId) setViewingHistory({ ...viewingHistory, status: "completed" });
 
+    // Phase 8B: Log workflow action for status change
+    logWorkflowAction({
+      action: "status_change",
+      entityType: "consultation",
+      entityId: consultId,
+      patientId: consult.patientId,
+      metadata: {
+        fromStatus: consult.status,
+        toStatus: "completed",
+        performedBy: normalizedRole,
+      },
+    });
+
     logActivity("consultation marked completed", consult.patientId, undefined, `Consultation ID: ${consultId}`);
     showFeedback("Consultation marked as completed.", "success");
   };
 
   const handleClearActivity = () => {
+    if (!canExportConsultationActivity) {
+      handleDeniedAccess("clear", "consultation activity");
+      return;
+    }
     setConfirmModal({
       message: "Are you sure you want to clear all activity logs?",
       onConfirm: () => {
@@ -865,17 +1038,20 @@ Generated by Clinic CRM
   };
 
   const handleExportActivityCSV = () => {
+    if (!canExportConsultationActivity) {
+      handleDeniedAccess("export", "consultation activity");
+      return;
+    }
     if (activity.length === 0) {
       showFeedback("No activity to export.", "info");
       return;
     }
 
-    const header = "Timestamp,Action,Patient ID,Patient Name,Details\n";
+    const header = "Timestamp,Action,Patient ID,Details\n";
     const rows = activity.map(a => [
       `"${new Date(a.timestamp).toLocaleString()}"`,
       `"${a.action}"`,
       `"${a.patientId || ""}"`,
-      `"${(a.patientName || "").replace(/"/g, '""')}"`,
       `"${(a.details || "").replace(/"/g, '""')}"`,
     ].join(",")).join("\n");
 
@@ -1029,16 +1205,21 @@ Generated by Clinic CRM
               {drafts.map(d => (
                 <div key={d.id} style={{ padding: "10px 14px", background: "var(--surface2)", borderRadius: "var(--radius)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                   <div>
-                    <div style={{ fontSize: "var(--font-sm)", fontWeight: 600 }}>{d.patientName}</div>
+                    {/* Phase 8B: Derive patient name from current patient data at display time */}
+                    <div style={{ fontSize: "var(--font-sm)", fontWeight: 600 }}>
+                      {patients.find(p => p.id === d.patientId)?.name || d.patientId}
+                    </div>
                     <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>Saved {new Date(d.savedAt).toLocaleString()}</div>
                   </div>
                   <div style={{ display: "flex", gap: 4 }}>
                     <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px" }} onClick={() => handleLoadDraft(d)}>
                       <i className="ti ti-upload" style={{ fontSize: 11 }} />
                     </button>
-                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", color: "var(--red)" }} onClick={() => handleDeleteDraft(d.id)}>
-                      <i className="ti ti-trash" style={{ fontSize: 11 }} />
-                    </button>
+                    {canEditConsultation && (
+                      <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", color: "var(--red)" }} onClick={() => handleDeleteDraft(d.id)}>
+                        <i className="ti ti-trash" style={{ fontSize: 11 }} />
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}
@@ -1053,9 +1234,11 @@ Generated by Clinic CRM
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
             <div className="cs-section-title" style={{ margin: 0 }}>Clinical Note Templates</div>
             <div style={{ display: "flex", gap: 4 }}>
-              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={() => setTemplateModal({ mode: "create" })}>
-                <i className="ti ti-plus" style={{ fontSize: 11, marginRight: 4 }} />New
-              </button>
+              {canManageConsultationTemplates && (
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={() => setTemplateModal({ mode: "create" })}>
+                  <i className="ti ti-plus" style={{ fontSize: 11, marginRight: 4 }} />New
+                </button>
+              )}
               <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={() => setShowTemplates(false)}>
                 <i className="ti ti-x" style={{ fontSize: 11 }} />
               </button>
@@ -1072,15 +1255,21 @@ Generated by Clinic CRM
                   <div style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4 }}>{t.name}</div>
                   <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginBottom: 8 }}>{t.category}</div>
                   <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                    <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", flex: 1 }} onClick={() => handleApplyTemplate(t)}>
-                      Apply
-                    </button>
-                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px" }} onClick={() => setTemplateModal({ mode: "edit", template: t })}>
-                      <i className="ti ti-pencil" style={{ fontSize: 11 }} />
-                    </button>
-                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", color: "var(--red)" }} onClick={() => handleDeleteTemplate(t.id)}>
-                      <i className="ti ti-trash" style={{ fontSize: 11 }} />
-                    </button>
+                    {canApplyConsultationTemplate && (
+                      <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", flex: 1 }} onClick={() => handleApplyTemplate(t)}>
+                        Apply
+                      </button>
+                    )}
+                    {canManageConsultationTemplates && (
+                      <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px" }} onClick={() => setTemplateModal({ mode: "edit", template: t })}>
+                        <i className="ti ti-pencil" style={{ fontSize: 11 }} />
+                      </button>
+                    )}
+                    {canManageConsultationTemplates && (
+                      <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", color: "var(--red)" }} onClick={() => handleDeleteTemplate(t.id)}>
+                        <i className="ti ti-trash" style={{ fontSize: 11 }} />
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}
@@ -1095,12 +1284,16 @@ Generated by Clinic CRM
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
             <div className="cs-section-title" style={{ margin: 0 }}>Activity Log ({activity.length})</div>
             <div style={{ display: "flex", gap: 4 }}>
-              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 90px" }} onClick={handleExportActivityCSV}>
-                <i className="ti ti-download" style={{ fontSize: 11, marginRight: 4 }} />Export CSV
-              </button>
-              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px", color: "var(--red)" }} onClick={handleClearActivity}>
-                <i className="ti ti-trash" style={{ fontSize: 11, marginRight: 4 }} />Clear
-              </button>
+              {canExportConsultationActivity && (
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 90px" }} onClick={handleExportActivityCSV}>
+                  <i className="ti ti-download" style={{ fontSize: 11, marginRight: 4 }} />Export CSV
+                </button>
+              )}
+              {canExportConsultationActivity && (
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px", color: "var(--red)" }} onClick={handleClearActivity}>
+                  <i className="ti ti-trash" style={{ fontSize: 11, marginRight: 4 }} />Clear
+                </button>
+              )}
               <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={() => setShowActivity(false)}>
                 <i className="ti ti-x" style={{ fontSize: 11 }} />
               </button>
@@ -1118,7 +1311,11 @@ Generated by Clinic CRM
                     <span style={{ fontWeight: 600 }}>{a.action}</span>
                     <span style={{ color: "var(--muted)" }}>{new Date(a.timestamp).toLocaleString()}</span>
                   </div>
-                  {a.patientName && <div style={{ color: "var(--muted)" }}>Patient: {a.patientName}</div>}
+                  {a.patientId && (
+                    <div style={{ color: "var(--muted)" }}>
+                      Patient: {patients.find(p => p.id === a.patientId)?.name || a.patientId}
+                    </div>
+                  )}
                   {a.details && <div style={{ color: "var(--muted)", fontStyle: "italic" }}>{a.details}</div>}
                 </div>
               ))}
@@ -1269,7 +1466,7 @@ Generated by Clinic CRM
               <HistoryView
                 record={viewingHistory}
                 onClose={() => setViewingHistory(null)}
-                onEdit={() => {
+                onEdit={canEditConsultation ? () => {
                   // Snapshot the completed record before unlocking so Discard can restore it
                   originalRef.current = viewingHistory;
                   const unlocked = { ...viewingHistory, status: "in-progress" as ConsultStatus };
@@ -1277,11 +1474,11 @@ Generated by Clinic CRM
                   persist([...others, unlocked]);
                   setActiveConsult(unlocked);
                   setViewingHistory(null);
-                }}
-                onExport={handleExportConsultationTXT}
-                onPrint={handlePrintConsultation}
-                onDelete={() => handleDeleteConsultation(viewingHistory.id)}
-                onMarkCompleted={() => handleMarkCompleted(viewingHistory.id)}
+                } : undefined}
+                onExport={canExportConsultations ? handleExportConsultationTXT : undefined}
+                onPrint={canPrintConsultation ? handlePrintConsultation : undefined}
+                onDelete={canDeleteConsultation ? () => handleDeleteConsultation(viewingHistory.id) : undefined}
+                onMarkCompleted={canCompleteConsultation ? () => handleMarkCompleted(viewingHistory.id) : undefined}
               />
             ) : activeConsult ? (
               <>
@@ -1362,34 +1559,46 @@ Generated by Clinic CRM
                 <div className="cs-actions" style={{ display:"flex", gap:8, justifyContent:"flex-end", flexWrap:"wrap" }}>
                   {isCompleted ? (
                     <>
-                      <button className="btn btn-ghost" onClick={handleExportConsultationTXT}>
-                        <i className="ti ti-download" style={{ marginRight:5, fontSize:12 }} />Export TXT
-                      </button>
-                      <button className="btn btn-ghost" onClick={handlePrintConsultation}>
-                        <i className="ti ti-printer" style={{ marginRight:5, fontSize:12 }} />Print
-                      </button>
-                      <button className="btn btn-ghost" onClick={() => {
-                        originalRef.current = activeConsult;
-                        const unlocked = { ...activeConsult, status: "in-progress" as ConsultStatus };
-                        setActiveConsult(unlocked);
-                        const others = allConsults.filter(c => c.id !== unlocked.id);
-                        persist([...others, unlocked]);
-                      }}>
-                        <i className="ti ti-pencil" style={{ marginRight:5, fontSize:12 }} />Edit
-                      </button>
+                      {canExportConsultations && (
+                        <button className="btn btn-ghost" onClick={handleExportConsultationTXT}>
+                          <i className="ti ti-download" style={{ marginRight:5, fontSize:12 }} />Export TXT
+                        </button>
+                      )}
+                      {canPrintConsultation && (
+                        <button className="btn btn-ghost" onClick={handlePrintConsultation}>
+                          <i className="ti ti-printer" style={{ marginRight:5, fontSize:12 }} />Print
+                        </button>
+                      )}
+                      {canEditConsultation && (
+                        <button className="btn btn-ghost" onClick={() => {
+                          originalRef.current = activeConsult;
+                          const unlocked = { ...activeConsult, status: "in-progress" as ConsultStatus };
+                          setActiveConsult(unlocked);
+                          const others = allConsults.filter(c => c.id !== unlocked.id);
+                          persist([...others, unlocked]);
+                        }}>
+                          <i className="ti ti-pencil" style={{ marginRight:5, fontSize:12 }} />Edit
+                        </button>
+                      )}
                     </>
                   ) : (
                     <>
-                      <button className="btn btn-ghost" onClick={handleSaveDraft}>
-                        <i className="ti ti-device-floppy" style={{ marginRight:5, fontSize:12 }} />Save Draft
-                      </button>
-                      <button className="btn btn-ghost" onClick={handleDiscard}>Discard</button>
-                      <button className="btn btn-primary" onClick={handleSave} disabled={!hasContent}>
-                        {saveFlash
-                          ? <><i className="ti ti-check" style={{ marginRight:5, fontSize:12 }} />Saved to Patient Record</>
-                          : <><i className="ti ti-device-floppy" style={{ marginRight:5, fontSize:12 }} />Save &amp; Update Patient</>
-                        }
-                      </button>
+                      {canEditConsultation && (
+                        <button className="btn btn-ghost" onClick={handleSaveDraft}>
+                          <i className="ti ti-device-floppy" style={{ marginRight:5, fontSize:12 }} />Save Draft
+                        </button>
+                      )}
+                      {canEditConsultation && (
+                        <button className="btn btn-ghost" onClick={handleDiscard}>Discard</button>
+                      )}
+                      {canEditConsultation && (
+                        <button className="btn btn-primary" onClick={handleSave} disabled={!hasContent}>
+                          {saveFlash
+                            ? <><i className="ti ti-check" style={{ marginRight:5, fontSize:12 }} />Saved to Patient Record</>
+                            : <><i className="ti ti-device-floppy" style={{ marginRight:5, fontSize:12 }} />Save &amp; Update Patient</>
+                          }
+                        </button>
+                      )}
                     </>
                   )}
                 </div>

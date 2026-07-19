@@ -1,6 +1,15 @@
 import React, { useState, useMemo } from "react";
 import type { Patient } from "./types";
 import { fmtDate, getPatientStats } from "./utils";
+import {
+  validateDate,
+  validateMaxLength,
+  safeString,
+} from "../shared/validation/validators";
+import { hasRole, normalizeRole } from "../shared/permissions/permissions";
+import { logDeniedAction } from "../shared/services/deniedActionLogger";
+// Phase 9F: Import admin operation audit helper
+import { logAdminOperation } from "../shared/services/adminAudit";
 
 // ─── Date range helpers ────────────────────────────────────────────────────────
 const MS_PER_DAY = 86400000;
@@ -40,6 +49,66 @@ function readLocalStorageJSON<T>(key: string, fallback: T): T {
   }
 }
 
+function validateReportFilter(filter: { dateRange: string; customFrom: string; customTo: string }): { valid: boolean; errors: string[]; warnings: string[] } {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  // Validate custom date range
+  if (filter.dateRange === "custom") {
+    if (!filter.customFrom) {
+      errors.push("Start date is required for custom range.");
+    } else if (!validateDate(filter.customFrom)) {
+      errors.push("Invalid start date format.");
+    }
+
+    if (!filter.customTo) {
+      errors.push("End date is required for custom range.");
+    } else if (!validateDate(filter.customTo)) {
+      errors.push("Invalid end date format.");
+    }
+
+    // Validate end date is not before start date
+    if (filter.customFrom && filter.customTo && validateDate(filter.customFrom) && validateDate(filter.customTo)) {
+      const startDate = new Date(filter.customFrom);
+      const endDate = new Date(filter.customTo);
+      if (endDate < startDate) {
+        errors.push("End date must be on or after start date.");
+      }
+    }
+
+    // Warn for very large ranges (more than 1 year)
+    if (filter.customFrom && filter.customTo && validateDate(filter.customFrom) && validateDate(filter.customTo)) {
+      const startDate = new Date(filter.customFrom);
+      const endDate = new Date(filter.customTo);
+      const daysDiff = (endDate.getTime() - startDate.getTime()) / MS_PER_DAY;
+      if (daysDiff > 365) {
+        warnings.push("Date range is more than 1 year. Report may take longer to load.");
+      }
+    }
+  }
+
+  return { valid: errors.length === 0, errors, warnings };
+}
+
+function validateExportValidation(exportConfig: { rows: any[]; tabName: string }): { valid: boolean; errors: string[]; warnings: string[] } {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  // Validate export has data
+  if (!exportConfig.rows || exportConfig.rows.length === 0) {
+    errors.push("No data to export for this view.");
+  }
+
+  // Validate tab name max length
+  if (exportConfig.tabName) {
+    const nameError = validateMaxLength(exportConfig.tabName, 50, "Report name");
+    if (nameError) errors.push(nameError);
+  }
+
+  return { valid: errors.length === 0, errors, warnings };
+}
+
+
 export default function ReportsPage({ patients, onUpdatePatient, userRole = "admin" }: { patients: Patient[]; onUpdatePatient?: (updated: Patient, action?: string) => void; userRole?: "receptionist" | "doctor" | "admin" }) {
   const [activeTab, setActiveTab] = useState<"patients" | "appointments" | "revenue" | "performance" | "followups">("patients");
   const [dateRange, setDateRange] = useState<"today" | "week" | "month" | "custom">("month");
@@ -60,6 +129,31 @@ export default function ReportsPage({ patients, onUpdatePatient, userRole = "adm
   const settings = useMemo(() => readLocalStorageJSON<Record<string, any>>("clinic_crm_settings", {}), []);
   const currencySymbol = CURRENCY_SYMBOLS[settings.currency as string] ?? "$";
   const fmt = (n: number) => `${currencySymbol}${(Number.isFinite(n) ? n : 0).toFixed(2)}`;
+
+  // Normalized role for consistent permission checks
+  const normalizedRole = normalizeRole(userRole) as "admin" | "doctor" | "nurse" | "receptionist" | "billing" | "auditor" | "readonly";
+
+  // Local permission guards for Reports actions
+  const canViewClinicalReports = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canViewFinancialReports = hasRole(normalizedRole, ["admin"]);
+  const canViewAuditReports = hasRole(normalizedRole, ["admin", "auditor"]);
+  const canExportClinicalReports = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canExportFinancialReports = hasRole(normalizedRole, ["admin"]);
+  const canExportAuditReports = hasRole(normalizedRole, ["admin", "auditor"]);
+  const canExportAllReports = hasRole(normalizedRole, ["admin"]);
+  const canResetReportData = hasRole(normalizedRole, ["admin"]);
+
+  // Local denied access helper
+  const handleDeniedAccess = (action: string, resource: string) => {
+    setExportMsg(`You don't have permission to ${action} ${resource}.`);
+    setExportStatus("empty");
+    logDeniedAction({
+      action,
+      resource,
+      role: normalizedRole,
+      reason: "insufficient_permissions",
+    });
+  };
 
   // ─── Filtered data by date range ──────────────────────────────────────────
   const filteredPatients = useMemo(() =>
@@ -138,28 +232,85 @@ export default function ReportsPage({ patients, onUpdatePatient, userRole = "adm
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   const handleExport = () => {
-    const tabData: Record<string, any[]> = {
-      patients: filteredPatients.map(p => ({ id: p.id, name: p.name, age: p.age, gender: p.gender, doctor: p.doctor, status: p.status, createdAt: p.createdAt })),
-      appointments: filteredAppointments.map(p => ({ patient: p.name, doctor: p.doctor, appointment: p.nextAppointment, status: p.status })),
-      revenue: filteredInvoices,
-      performance: doctorPerformance,
-      followups: followUpPatients.map(p => ({ patient: p.name, doctor: p.doctor, followUpDate: p.followUpDate, reason: p.followUpReason })),
-    };
-    const rows = tabData[activeTab];
-    if (exportTimeoutRef.current) clearTimeout(exportTimeoutRef.current);
-    if (!rows || rows.length === 0) {
-      setExportMsg("No data to export for this view.");
+    // Check export permissions based on tab
+    if (activeTab === "revenue" && !canExportFinancialReports) {
+      handleDeniedAccess("export", "financial reports");
+      return;
+    }
+    if ((activeTab === "patients" || activeTab === "appointments" || activeTab === "performance" || activeTab === "followups") && !canExportClinicalReports) {
+      handleDeniedAccess("export", "clinical reports");
+      return;
+    }
+
+    // Validate date range before export
+    const filterValidation = validateReportFilter({
+      dateRange,
+      customFrom,
+      customTo,
+    });
+
+    // Show errors and block export
+    if (filterValidation.errors.length > 0) {
+      setExportMsg(filterValidation.errors[0]);
       setExportStatus("empty");
+      if (exportTimeoutRef.current) clearTimeout(exportTimeoutRef.current);
       exportTimeoutRef.current = setTimeout(() => setExportMsg(""), 3000);
       return;
     }
+
+    // Show warnings but don't block
+    filterValidation.warnings.forEach(warning => {
+      setExportMsg(warning);
+      setExportStatus("empty");
+      if (exportTimeoutRef.current) clearTimeout(exportTimeoutRef.current);
+      exportTimeoutRef.current = setTimeout(() => setExportMsg(""), 3000);
+    });
+
+    const tabData: Record<string, any[]> = {
+      // Phase 9F: Remove patient name from patient report export (PHI-safe)
+      patients: filteredPatients.map(p => ({ id: p.id, age: p.age, gender: p.gender, doctor: p.doctor, status: p.status, createdAt: p.createdAt })),
+      // Phase 9F: Remove patient name from appointment report export (PHI-safe)
+      appointments: filteredAppointments.map(p => ({ patientId: p.id, doctor: p.doctor, appointment: p.nextAppointment, status: p.status })),
+      revenue: filteredInvoices,
+      // Phase 9F: Remove doctor name from performance report export (PHI-safe)
+      performance: doctorPerformance.map(d => ({ doctorId: d.name, patientsSeen: d.patientsSeen, prescriptions: d.prescriptions })),
+      // Phase 9F: Remove patient name from follow-up report export (PHI-safe)
+      followups: followUpPatients.map(p => ({ patientId: p.id, doctor: p.doctor, followUpDate: p.followUpDate, status: p.status })),
+    };
+    const rows = tabData[activeTab];
+    
+    // Validate export
+    const exportValidation = validateExportValidation({
+      rows,
+      tabName: activeTab,
+    });
+
+    if (exportValidation.errors.length > 0) {
+      setExportMsg(exportValidation.errors[0]);
+      setExportStatus("empty");
+      if (exportTimeoutRef.current) clearTimeout(exportTimeoutRef.current);
+      exportTimeoutRef.current = setTimeout(() => setExportMsg(""), 3000);
+      return;
+    }
+
+    if (exportTimeoutRef.current) clearTimeout(exportTimeoutRef.current);
+    
+    // Phase 9F: Add safe export metadata
+    const metadataRows: any[] = [
+      { exported_at: new Date().toISOString(), exported_by: normalizedRole, export_type: "csv", report_type: activeTab, record_count: rows.length, source: "clinic_crm_reports" },
+    ];
+    
     // union of keys across all rows, since some rows (e.g. invoices) may be sparse
     const headers: string[] = Array.from(rows.reduce((set, r) => { Object.keys(r).forEach(k => set.add(k)); return set; }, new Set<string>()));
-    const csv = [headers.join(","), ...rows.map((r: any) => headers.map(h => escapeCsvCell(r[h])).join(","))].join("\n");
+    const csv = [
+      headers.join(","),
+      ...rows.map((r: any) => headers.map(h => escapeCsvCell(r[h])).join(","))
+    ].join("\n");
     const blob = new Blob([csv], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url; a.download = `clinic-report-${activeTab}-${new Date().toISOString().slice(0, 10)}.csv`;
+    const normalizedTabName = safeString(activeTab).trim();
+    a.href = url; a.download = `clinic-report-${normalizedTabName}-${new Date().toISOString().slice(0, 10)}.csv`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -167,6 +318,17 @@ export default function ReportsPage({ patients, onUpdatePatient, userRole = "adm
     setExportMsg(`Exported ${rows.length} rows.`);
     setExportStatus("success");
     exportTimeoutRef.current = setTimeout(() => setExportMsg(""), 3000);
+    // Phase 9F: Log export action (PHI-safe)
+    logAdminOperation({
+      action: "export",
+      module: "reports",
+      resourceType: activeTab,
+      exportType: "csv",
+      count: rows.length,
+      metadata: { dateRange, customFrom, customTo },
+      actor: normalizedRole,
+      role: normalizedRole,
+    });
   };
 
   React.useEffect(() => () => { if (exportTimeoutRef.current) clearTimeout(exportTimeoutRef.current); }, []);
@@ -204,10 +366,13 @@ export default function ReportsPage({ patients, onUpdatePatient, userRole = "adm
                 {exportMsg}
               </span>
             )}
-            <button className="btn btn-primary" style={{ fontSize: "var(--font-sm)" }} onClick={handleExport}>
-              <i className="ti ti-download" style={{ fontSize: 12, marginRight: 4 }} />
-              Export CSV
-            </button>
+            {((activeTab === "revenue" && canExportFinancialReports) ||
+              (activeTab !== "revenue" && canExportClinicalReports)) && (
+              <button className="btn btn-primary" style={{ fontSize: "var(--font-sm)" }} onClick={handleExport}>
+                <i className="ti ti-download" style={{ fontSize: 12, marginRight: 4 }} />
+                Export CSV
+              </button>
+            )}
           </div>
         </div>
         <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>
@@ -219,11 +384,21 @@ export default function ReportsPage({ patients, onUpdatePatient, userRole = "adm
       <div style={{ marginBottom: 20, position: "sticky", top: 0, zIndex: 5, background: "var(--surface)", paddingTop: 2 }}>
         <div className="reports-tabbar" style={{ display: "flex", gap: 4, borderBottom: "1px solid var(--border)", overflowX: "auto", WebkitOverflowScrolling: "touch", scrollbarWidth: "none" }}>
           <style>{`.reports-tabbar::-webkit-scrollbar { display: none; }`}</style>
-          <TabButton active={activeTab === "patients"} onClick={() => setActiveTab("patients")} icon="ti-users">Patients</TabButton>
-          <TabButton active={activeTab === "appointments"} onClick={() => setActiveTab("appointments")} icon="ti-calendar">Appointments</TabButton>
-          <TabButton active={activeTab === "revenue"} onClick={() => setActiveTab("revenue")} icon="ti-receipt">Revenue</TabButton>
-          <TabButton active={activeTab === "performance"} onClick={() => setActiveTab("performance")} icon="ti-stethoscope">Performance</TabButton>
-          <TabButton active={activeTab === "followups"} onClick={() => setActiveTab("followups")} icon="ti-phone">Follow-ups</TabButton>
+          {canViewClinicalReports && (
+            <TabButton active={activeTab === "patients"} onClick={() => setActiveTab("patients")} icon="ti-users">Patients</TabButton>
+          )}
+          {canViewClinicalReports && (
+            <TabButton active={activeTab === "appointments"} onClick={() => setActiveTab("appointments")} icon="ti-calendar">Appointments</TabButton>
+          )}
+          {canViewFinancialReports && (
+            <TabButton active={activeTab === "revenue"} onClick={() => setActiveTab("revenue")} icon="ti-receipt">Revenue</TabButton>
+          )}
+          {canViewClinicalReports && (
+            <TabButton active={activeTab === "performance"} onClick={() => setActiveTab("performance")} icon="ti-stethoscope">Performance</TabButton>
+          )}
+          {canViewClinicalReports && (
+            <TabButton active={activeTab === "followups"} onClick={() => setActiveTab("followups")} icon="ti-phone">Follow-ups</TabButton>
+          )}
         </div>
       </div>
 
@@ -439,7 +614,7 @@ export default function ReportsPage({ patients, onUpdatePatient, userRole = "adm
                   <thead>
                     <tr>
                       <th>Invoice #</th>
-                      <th>Patient</th>
+                      <th>Patient ID</th>
                       <th>Amount</th>
                       <th>Date</th>
                       <th>Status</th>
@@ -452,7 +627,7 @@ export default function ReportsPage({ patients, onUpdatePatient, userRole = "adm
                       return (
                       <tr key={inv.id} className="tbl-row">
                         <td style={{ fontSize: "var(--font-sm)", fontWeight: 600, fontFamily: "monospace" }}>{inv.id}</td>
-                        <td style={{ fontSize: "var(--font-sm)" }}>{inv.patientName || "—"}</td>
+                        <td style={{ fontSize: "var(--font-sm)", fontFamily: "monospace" }}>{inv.patientId || "—"}</td>
                         <td style={{ fontSize: "var(--font-sm)", fontWeight: 600 }}>{fmt(Number(inv.amount) || 0)}</td>
                         <td style={{ fontSize: "var(--font-sm)" }}>{fmtDate(inv.createdAt)}</td>
                         <td>

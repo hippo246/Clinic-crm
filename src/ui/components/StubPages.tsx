@@ -596,6 +596,13 @@ export function BillingPage({ patients, onSelectPatient }: { patients: Patient[]
     { id: "pp-2", patientId: "P003", patientName: "Robert Johnson", totalAmount: 25000, paidAmount: 25000, remainingAmount: 0, installments: 2, paidInstallments: 2, nextDueDate: undefined, status: "Completed", startDate: "2024-01-01" },
   ]);
   const [remindedIds, setRemindedIds] = useState<Set<string>>(new Set());
+
+  // ── local feedback (replaces all alert() calls in BillingPage) ─────────────
+  const [billingFeedback, setBillingFeedback] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
+  const showBillingFeedback = (message: string, type: "success" | "error" | "info" = "info") => {
+    setBillingFeedback({ type, message });
+    setTimeout(() => setBillingFeedback(null), 5000);
+  };
   
   const expired  = patients.filter((p) => p.insuranceStatus === "Expired");
   const expiring = patients.filter((p) => p.insuranceStatus === "Expiring");
@@ -663,6 +670,27 @@ END OF REPORT
 
   return (
     <div style={{ padding: "16px 12px", maxWidth: 1200 }}>
+      {/* Billing feedback banner */}
+      {billingFeedback && (
+        <div
+          role="status"
+          style={{
+            display: "flex", alignItems: "flex-start", gap: 8,
+            background: billingFeedback.type === "error" ? "var(--red-bg)" : billingFeedback.type === "success" ? "var(--green-bg)" : "var(--accent-soft)",
+            border: `1px solid ${billingFeedback.type === "error" ? "var(--red-border)" : billingFeedback.type === "success" ? "var(--green-border)" : "var(--accent-border,var(--border))"}`,
+            borderRadius: "var(--radius)",
+            padding: "10px 14px",
+            marginBottom: 16,
+            fontSize: "var(--font-sm)",
+            color: billingFeedback.type === "error" ? "var(--red)" : billingFeedback.type === "success" ? "var(--green)" : "var(--accent)",
+          }}
+        >
+          <i className={`ti ${billingFeedback.type === "error" ? "ti-alert-circle" : billingFeedback.type === "success" ? "ti-circle-check" : "ti-info-circle"}`} style={{ fontSize: 15, flexShrink: 0, marginTop: 1 }} />
+          <span style={{ flex: 1, lineHeight: 1.5, whiteSpace: "pre-line" }}>{billingFeedback.message}</span>
+          <button type="button" aria-label="Dismiss" onClick={() => setBillingFeedback(null)}
+            style={{ background: "none", border: "none", cursor: "pointer", color: "inherit", padding: "0 2px", fontSize: 14, lineHeight: 1, flexShrink: 0 }}>×</button>
+        </div>
+      )}
       <div style={{ marginBottom: 20 }}>
         <h2 style={{ fontSize: "var(--font-xl)", fontWeight: 800, margin: "0 0 12px 0" }}>Billing & Insurance</h2>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -831,8 +859,10 @@ END OF REPORT
                     </td>
                     <td>
                       <div style={{ display: "flex", gap: 4 }}>
-                        <button className="btn-icon" style={{ padding: 4 }} title="View Details" onClick={() => alert(`Claim: ${claim.claimNumber}\nPatient: ${claim.patientName}\nService: ${claim.serviceType}\nDate: ${claim.serviceDate}\nAmount: ₹${claim.amount.toLocaleString()}\nInsurer: ${claim.insurer}\nPolicy: ${claim.policyNumber}\nStatus: ${claim.status}${claim.notes ? "\nNotes: " + claim.notes : ""}`)}>
-                          <i className="ti ti-eye" style={{ fontSize: 12 }} />
+                        <button className="btn-icon" style={{ padding: 4 }} title="View Details" onClick={() => showBillingFeedback(
+                          `Claim: ${claim.claimNumber}\nPatient: ${claim.patientName}\nService: ${claim.serviceType}\nDate: ${claim.serviceDate}\nAmount: ₹${claim.amount.toLocaleString()}\nInsurer: ${claim.insurer}\nPolicy: ${claim.policyNumber}\nStatus: ${claim.status}${claim.notes ? "\nNotes: " + claim.notes : ""}\n\nClaim details shown from local records.`,
+                          "info"
+                        )}>                          <i className="ti ti-eye" style={{ fontSize: 12 }} />
                         </button>
                         <button className="btn-icon" style={{ padding: 4 }} onClick={() => setInsuranceClaims(insuranceClaims.filter((c) => c.id !== claim.id))} title="Delete">
                           <i className="ti ti-trash" style={{ fontSize: 12, color: "var(--red)" }} />
@@ -879,8 +909,10 @@ END OF REPORT
                     <td style={{ fontSize: "var(--font-sm)", fontWeight: 600 }}>{preAuth.approvedAmount ? `₹${preAuth.approvedAmount.toLocaleString()}` : "—"}</td>
                     <td>
                       <div style={{ display: "flex", gap: 4 }}>
-                        <button className="btn-icon" style={{ padding: 4 }} title="View Details" onClick={() => alert(`Patient: ${preAuth.patientName}\nProcedure: ${preAuth.procedure}\nICD: ${preAuth.icdCode}\nCPT: ${preAuth.cptCode}\nRequested: ${preAuth.requestedDate}\nStatus: ${preAuth.status}${preAuth.approvedAmount ? "\nApproved Amount: ₹" + preAuth.approvedAmount.toLocaleString() : ""}${preAuth.notes ? "\nNotes: " + preAuth.notes : ""}`)}>
-                          <i className="ti ti-eye" style={{ fontSize: 12 }} />
+                        <button className="btn-icon" style={{ padding: 4 }} title="View Details" onClick={() => showBillingFeedback(
+                          `Patient: ${preAuth.patientName}\nProcedure: ${preAuth.procedure}\nICD: ${preAuth.icdCode}\nCPT: ${preAuth.cptCode}\nRequested: ${preAuth.requestedDate}\nStatus: ${preAuth.status}${preAuth.approvedAmount ? "\nApproved Amount: ₹" + preAuth.approvedAmount.toLocaleString() : ""}${preAuth.notes ? "\nNotes: " + preAuth.notes : ""}\n\nPre-authorization details shown from local records.`,
+                          "info"
+                        )}>                          <i className="ti ti-eye" style={{ fontSize: 12 }} />
                         </button>
                         <button className="btn-icon" style={{ padding: 4 }} onClick={() => setPreAuthorizations(preAuthorizations.filter((p) => p.id !== preAuth.id))} title="Delete">
                           <i className="ti ti-trash" style={{ fontSize: 12, color: "var(--red)" }} />
@@ -967,8 +999,10 @@ END OF REPORT
                     </td>
                     <td>
                       <div style={{ display: "flex", gap: 4 }}>
-                        <button className="btn-icon" style={{ padding: 4 }} title="View Details" onClick={() => alert(`Patient: ${plan.patientName}\nTotal: ₹${plan.totalAmount.toLocaleString()}\nPaid: ₹${plan.paidAmount.toLocaleString()}\nRemaining: ₹${plan.remainingAmount.toLocaleString()}\nInstallments: ${plan.paidInstallments}/${plan.installments}\nNext Due: ${plan.nextDueDate || "N/A"}\nStatus: ${plan.status}`)}>
-                          <i className="ti ti-eye" style={{ fontSize: 12 }} />
+                        <button className="btn-icon" style={{ padding: 4 }} title="View Details" onClick={() => showBillingFeedback(
+                          `Patient: ${plan.patientName}\nTotal: ₹${plan.totalAmount.toLocaleString()}\nPaid: ₹${plan.paidAmount.toLocaleString()}\nRemaining: ₹${plan.remainingAmount.toLocaleString()}\nInstallments: ${plan.paidInstallments}/${plan.installments}\nNext Due: ${plan.nextDueDate || "N/A"}\nStatus: ${plan.status}\n\nPayment plan details shown from local records.`,
+                          "info"
+                        )}>                          <i className="ti ti-eye" style={{ fontSize: 12 }} />
                         </button>
                         <button className="btn-icon" style={{ padding: 4 }} onClick={() => setPaymentPlans(paymentPlans.filter((p) => p.id !== plan.id))} title="Delete">
                           <i className="ti ti-trash" style={{ fontSize: 12, color: "var(--red)" }} />

@@ -1,6 +1,22 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import type { Patient } from "./types";
 import { fmtDate } from "./utils";
+import {
+  validateRequired,
+  validateEmail,
+  validatePhone,
+  validateDate,
+  validateMaxLength,
+  safeString,
+} from "../shared/validation/validators";
+import { validateCommunicationData } from "../shared/validation/entityValidation";
+import { hasRole, normalizeRole } from "../shared/permissions/permissions";
+import { logDeniedAction } from "../shared/services/deniedActionLogger";
+import { logAdminOperation } from "../shared/services/adminAudit";
+import { isCommunicationAllowed, type CommunicationChannel } from "../shared/privacy/optOutManager";
+// Phase 8C: Import patient validation and handoff helpers
+import { validateWorkflowPatientReference } from "../shared/workflow/workflowValidation";
+import { logSuccessfulHandoff, logBlockedHandoff } from "../shared/workflow/workflowHandoff";
 
 interface Feedback {
   type: "success" | "error" | "info" | "warning";
@@ -11,7 +27,6 @@ interface CommunicationActivity {
   timestamp: string;
   action: string;
   patientId?: string;
-  patientName?: string;
   details?: string;
 }
 
@@ -120,6 +135,9 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
   const [historySearch, setHistorySearch] = useState("");
   const [historyDateFrom, setHistoryDateFrom] = useState("");
   const [historyDateTo, setHistoryDateTo] = useState("");
+  // Phase 9D: Add typed confirmation state for dangerous actions
+  const [typedConfirm, setTypedConfirm] = useState<{ requiredText: string; onConfirm: () => void } | null>(null);
+  const [typedValue, setTypedValue] = useState("");
 
   // Auto-clear feedback after 4 seconds
   useEffect(() => {
@@ -150,18 +168,223 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
     setFeedback({ type, message });
   }
 
-  function logActivity(action: string, patientId?: string, patientName?: string, details?: string) {
+  // Phase 8B: Remove patientName from activity log (PHI-safe)
+  function logActivity(action: string, patientId?: string, details?: string) {
     const entry: CommunicationActivity = {
       timestamp: new Date().toISOString(),
       action,
       patientId,
-      patientName,
       details,
     };
     const next = [entry, ...activity].slice(0, 50);
     setActivity(next);
     writeJSON(ACTIVITY_KEY, next);
   }
+
+  // Normalized role for consistent permission checks
+  const normalizedRole = normalizeRole(userRole) as "admin" | "doctor" | "nurse" | "receptionist" | "billing" | "auditor" | "readonly";
+
+  // Local permission guards for Communications actions
+  const canSendCommunication = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canOpenContactAction = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canViewCommunicationHistory = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canExportCommunicationHistory = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canDeleteCommunication = hasRole(normalizedRole, ["admin"]);
+  const canMarkFollowedUp = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canScheduleCommunication = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canSendScheduledCommunication = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canDeleteScheduledCommunication = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canExportScheduledCommunication = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canLogCall = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canExportCallLogs = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canApplyTemplate = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canManageTemplates = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canExportCommunicationActivity = hasRole(normalizedRole, ["admin"]);
+  const canClearCommunicationActivity = hasRole(normalizedRole, ["admin"]);
+
+  // Local denied access helper
+  const handleDeniedAccess = (action: string, resource: string) => {
+    showFeedback(`You don't have permission to ${action} ${resource}.`, "error");
+    logDeniedAction({
+      action,
+      resource,
+      role: normalizedRole,
+      reason: "insufficient_permissions",
+    });
+  };
+
+  function validateMessage(messageForm: { patient: Patient | null; type: string; message: string; subject: string }): { valid: boolean; errors: string[]; warnings: string[] } {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    // Validate patient
+    if (!messageForm.patient) {
+      errors.push("Please select a patient.");
+    }
+
+    // Validate message type
+    const typeError = validateRequired(messageForm.type, "Message type");
+    if (typeError) errors.push(typeError);
+
+    // Validate message body
+    const messageError = validateRequired(messageForm.message, "Message");
+    if (messageError) errors.push(messageError);
+
+    // Validate message max length
+    if (messageForm.message) {
+      const maxLengthError = validateMaxLength(messageForm.message, 10000, "Message");
+      if (maxLengthError) errors.push(maxLengthError);
+    }
+
+    // Validate subject for email
+    if (messageForm.type === "email" && !messageForm.subject.trim()) {
+      errors.push("Subject is required for email.");
+    }
+
+    // Validate subject max length
+    if (messageForm.subject) {
+      const subjectError = validateMaxLength(messageForm.subject, 500, "Subject");
+      if (subjectError) errors.push(subjectError);
+    }
+
+    // Validate patient contact info based on type
+    if (messageForm.patient) {
+      const phone = (messageForm.patient as any).phone || "";
+      const email = (messageForm.patient as any).email || "";
+
+      if (messageForm.type === "sms" || messageForm.type === "whatsapp") {
+        if (!phone) {
+          errors.push("Patient has no phone number on file.");
+        } else if (!validatePhone(phone)) {
+          errors.push("Patient phone number is invalid.");
+        }
+      }
+
+      if (messageForm.type === "email") {
+        if (!email) {
+          errors.push("Patient has no email on file.");
+        } else if (!validateEmail(email)) {
+          errors.push("Patient email is invalid.");
+        }
+      }
+    }
+
+    // Privacy warning for sensitive content
+    const sensitiveKeywords = ["diagnosis", "lab result", "insurance", "medical", "test result", "condition", "hiv", "pregnancy", "payment"];
+    const hasSensitive = sensitiveKeywords.some(kw => messageForm.message.toLowerCase().includes(kw));
+    if (hasSensitive) {
+      warnings.push("Avoid sending sensitive medical details over unsecured channels.");
+    }
+
+    // Use shared entity validation as final check
+    if (messageForm.patient && messageForm.message) {
+      const communicationData = {
+        patient_id: messageForm.patient.id,
+        patientId: messageForm.patient.id,
+        type: messageForm.type,
+        message: messageForm.message,
+      };
+      const entityValidation = validateCommunicationData(communicationData);
+      if (!entityValidation.valid && entityValidation.errors.length > 0) {
+        entityValidation.errors.forEach((err) => {
+          if (!errors.includes(err)) errors.push(err);
+        });
+      }
+    }
+
+    return { valid: errors.length === 0, errors, warnings };
+  }
+
+  function validateSchedule(scheduleForm: { patient: Patient | null; type: string; message: string; subject: string; scheduledDate: string }): { valid: boolean; errors: string[]; warnings: string[] } {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    // Validate patient
+    if (!scheduleForm.patient) {
+      errors.push("Please select a patient.");
+    }
+
+    // Validate message type
+    const typeError = validateRequired(scheduleForm.type, "Message type");
+    if (typeError) errors.push(typeError);
+
+    // Validate message body
+    const messageError = validateRequired(scheduleForm.message, "Message");
+    if (messageError) errors.push(messageError);
+
+    // Validate scheduled date
+    const dateError = validateRequired(scheduleForm.scheduledDate, "Scheduled date/time");
+    if (dateError) errors.push(dateError);
+
+    // Validate scheduled date format
+    if (scheduleForm.scheduledDate && !validateDate(scheduleForm.scheduledDate)) {
+      errors.push("Invalid scheduled date/time format.");
+    }
+
+    // Validate scheduled date is in future
+    if (scheduleForm.scheduledDate) {
+      const scheduledDateObj = new Date(scheduleForm.scheduledDate);
+      if (scheduledDateObj <= new Date()) {
+        errors.push("Scheduled date must be in the future.");
+      }
+    }
+
+    // Validate subject for email
+    if (scheduleForm.type === "email" && !scheduleForm.subject.trim()) {
+      errors.push("Subject is required for email.");
+    }
+
+    // Validate message max length
+    if (scheduleForm.message) {
+      const maxLengthError = validateMaxLength(scheduleForm.message, 10000, "Message");
+      if (maxLengthError) errors.push(maxLengthError);
+    }
+
+    // Validate subject max length
+    if (scheduleForm.subject) {
+      const subjectError = validateMaxLength(scheduleForm.subject, 500, "Subject");
+      if (subjectError) errors.push(subjectError);
+    }
+
+    return { valid: errors.length === 0, errors, warnings };
+  }
+
+  function validateCallLog(callForm: { patient: Patient | null; direction: string; outcome: string; notes: string; followUpNeeded: boolean; followUpDate: string }): { valid: boolean; errors: string[]; warnings: string[] } {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    // Validate patient
+    if (!callForm.patient) {
+      errors.push("Please select a patient.");
+    }
+
+    // Validate direction
+    const directionError = validateRequired(callForm.direction, "Call direction");
+    if (directionError) errors.push(directionError);
+
+    // Validate outcome
+    const outcomeError = validateRequired(callForm.outcome, "Call outcome");
+    if (outcomeError) errors.push(outcomeError);
+
+    // Validate follow-up date if follow-up is needed
+    if (callForm.followUpNeeded && !callForm.followUpDate) {
+      errors.push("Follow-up date is required when follow-up is needed.");
+    }
+
+    // Validate follow-up date format
+    if (callForm.followUpDate && !validateDate(callForm.followUpDate)) {
+      errors.push("Invalid follow-up date format.");
+    }
+
+    // Validate notes max length
+    if (callForm.notes) {
+      const notesError = validateMaxLength(callForm.notes, 2000, "Call notes");
+      if (notesError) errors.push(notesError);
+    }
+
+    return { valid: errors.length === 0, errors, warnings };
+  }
+
 
   function handleSaveDraft() {
     if (!selectedPatient) {
@@ -173,19 +396,23 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
       return;
     }
 
+    // Normalize data before save
+    const normalizedMessage = messageText ? safeString(messageText).trim() : "";
+    const normalizedSubject = subject ? safeString(subject).trim() : "";
+
     const entry: Communication = {
       id: `draft-${Date.now()}`,
       patientId: selectedPatient.id,
       patientName: selectedPatient.name,
       type: "draft",
       status: "draft",
-      message: messageText.trim(),
-      subject: subject.trim(),
+      message: normalizedMessage,
+      subject: normalizedSubject,
       date: new Date().toISOString(),
     };
 
     saveCommunication(entry);
-    logActivity("draft saved", selectedPatient.id, selectedPatient.name);
+    logActivity("draft saved", selectedPatient.id);
     setDraftStatus("saved");
     showFeedback("Draft saved.", "success");
   }
@@ -209,41 +436,82 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
   }
 
   function handleSendMessage() {
+    if (!canSendCommunication) {
+      handleDeniedAccess("send", "communication");
+      return;
+    }
+
+    // Phase 8C: Validate patient reference before sending communication
     if (!selectedPatient) {
-      showFeedback("Please select a patient.", "error");
+      showFeedback("Please select a patient first.", "error");
       return;
     }
-    if (!messageText.trim()) {
-      showFeedback("Please enter a message.", "error");
+    const patientValidation = validateWorkflowPatientReference(selectedPatient.id, patients, {
+      requireActive: true,
+      allowDeleted: false,
+      action: "send communication"
+    });
+    if (!patientValidation.valid) {
+      showFeedback(patientValidation.reason, "error");
+      logBlockedHandoff({
+        fromModule: "communications",
+        toModule: "communications",
+        action: "send_message",
+        patientId: selectedPatient.id,
+        reason: patientValidation.reason,
+        actor: normalizedRole,
+      });
       return;
     }
+
+    // Phase 10D: Check opt-out preferences
+    const channelMap: Record<typeof messageType, CommunicationChannel> = {
+      sms: "sms",
+      email: "email",
+      whatsapp: "whatsapp"
+    };
+    const channel = channelMap[messageType];
+    const isAllowed = isCommunicationAllowed(selectedPatient.id, channel, false); // false = not clinical critical
+    
+    if (!isAllowed) {
+      showFeedback(`Patient has opted out of ${messageType} communications. Cannot send.`, "warning");
+      logAdminOperation({
+        action: "communication_blocked_opt_out",
+        module: "communications",
+        resourceType: messageType,
+        resourceId: selectedPatient.id,
+        metadata: { channel, reason: "opt_out" },
+        actor: normalizedRole,
+        role: normalizedRole,
+      });
+      return;
+    }
+
+    const validation = validateMessage({
+      patient: selectedPatient,
+      type: messageType,
+      message: messageText,
+      subject: subject,
+    });
+
+    // Show errors and block send
+    if (validation.errors.length > 0) {
+      validation.errors.forEach(error => showFeedback(error, "error"));
+      return;
+    }
+
+    // Show warnings but don't block
+    validation.warnings.forEach(warning => showFeedback(warning, "warning"));
 
     const phone = (selectedPatient as any).phone || "";
     const email = (selectedPatient as any).email || "";
 
-    // Validation
-    if (messageType === "sms" || messageType === "whatsapp") {
-      if (!phone) {
-        showFeedback("Patient has no phone number on file.", "error");
-        return;
-      }
-    }
-    if (messageType === "email") {
-      if (!email) {
-        showFeedback("Patient has no email on file.", "error");
-        return;
-      }
-    }
+    // Normalize data before save
+    const normalizedMessage = safeString(messageText).trim();
+    const normalizedSubject = subject ? safeString(subject).trim() : "";
 
-    // Privacy warning for sensitive content
-    const sensitiveKeywords = ["diagnosis", "lab result", "insurance", "medical", "test result", "condition"];
-    const hasSensitive = sensitiveKeywords.some(kw => messageText.toLowerCase().includes(kw));
-    if (hasSensitive) {
-      showFeedback("Avoid sending sensitive medical details over unsecured channels.", "warning");
-    }
-
-    const encodedMessage = encodeURIComponent(messageText);
-    const encodedSubject = encodeURIComponent(subject);
+    const encodedMessage = encodeURIComponent(normalizedMessage);
+    const encodedSubject = encodeURIComponent(normalizedSubject);
 
     let status: Communication["status"] = "failed_locally";
     let openedWindow: Window | null = null;
@@ -270,17 +538,17 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
 
     const entry: Communication = {
       id: `comm-${Date.now()}`,
-      patientId: selectedPatient.id,
-      patientName: selectedPatient.name,
+      patientId: selectedPatient!.id,
+      patientName: selectedPatient!.name,
       type: messageType,
       status,
-      message: messageText.trim(),
-      subject: messageType === "email" ? subject : undefined,
+      message: normalizedMessage,
+      subject: messageType === "email" ? normalizedSubject : undefined,
       date: new Date().toISOString(),
     };
 
     saveCommunication(entry);
-    logActivity("message opened", selectedPatient.id, selectedPatient.name, `${messageType}: ${status}`);
+    logActivity("message opened", selectedPatient.id, `${messageType}: ${status}`);
     showFeedback(`Opened ${messageType} app. Delivery not guaranteed.`, "info");
 
     // Clear compose
@@ -292,39 +560,69 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
   }
 
   function handleScheduleMessage() {
-    if (!selectedPatient) {
-      showFeedback("Please select a patient.", "error");
-      return;
-    }
-    if (!messageText.trim()) {
-      showFeedback("Please enter a message.", "error");
-      return;
-    }
-    if (!scheduledDate) {
-      showFeedback("Please select a scheduled date/time.", "error");
+    if (!canScheduleCommunication) {
+      handleDeniedAccess("schedule", "communication");
       return;
     }
 
-    const scheduledDateObj = new Date(scheduledDate);
-    if (scheduledDateObj <= new Date()) {
-      showFeedback("Scheduled date must be in the future.", "error");
+    const validation = validateSchedule({
+      patient: selectedPatient,
+      type: messageType,
+      message: messageText,
+      subject: subject,
+      scheduledDate: scheduledDate,
+    });
+
+    // Show errors and block schedule
+    if (validation.errors.length > 0) {
+      validation.errors.forEach(error => showFeedback(error, "error"));
       return;
     }
+
+    // Show warnings but don't block
+    validation.warnings.forEach(warning => showFeedback(warning, "warning"));
+
+    // Phase 10D: Check opt-out preferences
+    const channelMap: Record<typeof messageType, CommunicationChannel> = {
+      sms: "sms",
+      email: "email",
+      whatsapp: "whatsapp"
+    };
+    const channel = channelMap[messageType];
+    const isAllowed = isCommunicationAllowed(selectedPatient.id, channel, false); // false = not clinical critical
+    
+    if (!isAllowed) {
+      showFeedback(`Patient has opted out of ${messageType} communications. Cannot schedule.`, "warning");
+      logAdminOperation({
+        action: "communication_blocked_opt_out",
+        module: "communications",
+        resourceType: messageType,
+        resourceId: selectedPatient.id,
+        metadata: { channel, reason: "opt_out" },
+        actor: normalizedRole,
+        role: normalizedRole,
+      });
+      return;
+    }
+
+    // Normalize data before save
+    const normalizedMessage = safeString(messageText).trim();
+    const normalizedSubject = subject ? safeString(subject).trim() : "";
 
     const entry: ScheduledCommunication = {
       id: `sched-${Date.now()}`,
-      patientId: selectedPatient.id,
-      patientName: selectedPatient.name,
+      patientId: selectedPatient!.id,
+      patientName: selectedPatient!.name,
       type: messageType,
-      message: messageText.trim(),
-      subject: messageType === "email" ? subject : undefined,
+      message: normalizedMessage,
+      subject: messageType === "email" ? normalizedSubject : undefined,
       scheduledDate: scheduledDate,
       status: "scheduled",
       createdAt: new Date().toISOString(),
     };
 
     saveScheduled(entry);
-    logActivity("message scheduled", selectedPatient.id, selectedPatient.name, `Due: ${fmtDate(scheduledDate)}`);
+    logActivity("message scheduled", selectedPatient.id, `Due: ${fmtDate(scheduledDate)}`);
     showFeedback("Message scheduled locally.", "success");
 
     setMessageText("");
@@ -360,6 +658,10 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
   }
 
   function handleSendScheduled(id: string) {
+    if (!canSendScheduledCommunication) {
+      handleDeniedAccess("send", "scheduled communication");
+      return;
+    }
     const sched = scheduled.find(s => s.id === id);
     if (!sched) return;
 
@@ -379,37 +681,53 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
     const next = scheduled.filter(s => s.id !== id);
     writeJSON(SCHEDULED_KEY, next);
     setScheduled(next);
-    logActivity("scheduled message moved to compose", sched.patientId, sched.patientName);
+    logActivity("scheduled message moved to compose", sched.patientId);
     showFeedback("Scheduled message loaded. Send when ready.", "info");
   }
 
   function handleCancelScheduled(id: string) {
+    if (!canDeleteScheduledCommunication) {
+      handleDeniedAccess("cancel", "scheduled communication");
+      return;
+    }
+    const sched = scheduled.find(s => s.id === id);
     setConfirmModal({
       message: "Cancel this scheduled message?",
       onConfirm: () => {
         const next = scheduled.filter(s => s.id !== id);
         writeJSON(SCHEDULED_KEY, next);
         setScheduled(next);
-        logActivity("scheduled message cancelled");
+        // Phase 9D: Log ID and patientId only (PHI-safe)
+        logActivity("scheduled message cancelled", sched?.patientId, id);
         showFeedback("Scheduled message cancelled.", "success");
       },
     });
   }
 
   function handleDeleteScheduled(id: string) {
+    if (!canDeleteScheduledCommunication) {
+      handleDeniedAccess("delete", "scheduled communication");
+      return;
+    }
+    const sched = scheduled.find(s => s.id === id);
     setConfirmModal({
       message: "Delete this scheduled message?",
       onConfirm: () => {
         const next = scheduled.filter(s => s.id !== id);
         writeJSON(SCHEDULED_KEY, next);
         setScheduled(next);
-        logActivity("scheduled message deleted");
+        // Phase 9D: Log ID and patientId only (PHI-safe)
+        logActivity("scheduled message deleted", sched?.patientId, id);
         showFeedback("Scheduled message deleted.", "success");
       },
     });
   }
 
   function handleAddTemplate(name: string, category: string, body: string) {
+    if (!canManageTemplates) {
+      handleDeniedAccess("add", "template");
+      return;
+    }
     const entry: Template = {
       id: `tpl-${Date.now()}`,
       name,
@@ -417,38 +735,53 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
       body,
     };
     saveTemplate(entry);
-    logActivity("template added", undefined, undefined, name);
+    logActivity("template added", undefined, name);
     showFeedback("Template added.", "success");
   }
 
   function handleEditTemplate(id: string, name: string, category: string, body: string) {
+    if (!canManageTemplates) {
+      handleDeniedAccess("edit", "template");
+      return;
+    }
     const next = templates.map(t => t.id === id ? { ...t, name, category, body } : t);
     writeJSON(TEMPLATES_KEY, next);
     setTemplates(next);
-    logActivity("template edited", undefined, undefined, name);
+    logActivity("template edited", undefined, name);
     showFeedback("Template updated.", "success");
   }
 
   function handleDeleteTemplate(id: string) {
+    if (!canManageTemplates) {
+      handleDeniedAccess("delete", "template");
+      return;
+    }
+    const template = templates.find(t => t.id === id);
     setConfirmModal({
       message: "Delete this template?",
       onConfirm: () => {
         const next = templates.filter(t => t.id !== id);
         writeJSON(TEMPLATES_KEY, next);
         setTemplates(next);
-        logActivity("template deleted");
+        // Phase 9D: Log templateId only, not full template body (PHI-safe)
+        logActivity("template deleted", undefined, id);
         showFeedback("Template deleted.", "success");
       },
     });
   }
 
   function handleResetTemplates() {
+    if (!canManageTemplates) {
+      handleDeniedAccess("reset", "templates");
+      return;
+    }
     setConfirmModal({
       message: "Reset to default templates? Custom templates will be lost.",
       onConfirm: () => {
         writeJSON(TEMPLATES_KEY, []);
         setTemplates([]);
-        logActivity("templates reset");
+        // Phase 9D: Log count only (PHI-safe)
+        logActivity("templates reset", undefined, `${templates.length} templates cleared`);
         showFeedback("Templates reset to defaults.", "success");
       },
     });
@@ -501,13 +834,18 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
   }
 
   function handleDeleteCommunication(id: string) {
+    if (!canDeleteCommunication) {
+      handleDeniedAccess("delete", "communication record");
+      return;
+    }
     setConfirmModal({
       message: "Delete this communication record?",
       onConfirm: () => {
         const next = communications.filter(c => c.id !== id);
         writeJSON(COMMUNICATIONS_KEY, next);
         setCommunications(next);
-        logActivity("communication deleted");
+        // Phase 9D: Log ID only (PHI-safe)
+        logActivity("communication deleted", undefined, id);
         showFeedback("Communication deleted.", "success");
       },
     });
@@ -527,6 +865,10 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
   }
 
   function handleMarkFollowedUp(id: string) {
+    if (!canMarkFollowedUp) {
+      handleDeniedAccess("mark", "communication as followed up");
+      return;
+    }
     const next = communications.map(c => c.id === id ? { ...c, followUpNeeded: false } : c);
     writeJSON(COMMUNICATIONS_KEY, next);
     setCommunications(next);
@@ -535,18 +877,39 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
   }
 
   function handleLogCall() {
-    if (!callPatient) {
-      showFeedback("Please select a patient.", "error");
+    if (!canLogCall) {
+      handleDeniedAccess("log", "call");
       return;
     }
 
+    const validation = validateCallLog({
+      patient: callPatient,
+      direction: callDirection,
+      outcome: callOutcome,
+      notes: callNotes,
+      followUpNeeded: callFollowUpNeeded,
+      followUpDate: callFollowUpDate,
+    });
+
+    // Show errors and block log
+    if (validation.errors.length > 0) {
+      validation.errors.forEach(error => showFeedback(error, "error"));
+      return;
+    }
+
+    // Show warnings but don't block
+    validation.warnings.forEach(warning => showFeedback(warning, "warning"));
+
+    // Normalize data before save
+    const normalizedNotes = callNotes ? safeString(callNotes).trim() : undefined;
+
     const entry: Communication = {
       id: `call-${Date.now()}`,
-      patientId: callPatient.id,
-      patientName: callPatient.name,
+      patientId: callPatient!.id,
+      patientName: callPatient!.name,
       type: "call",
       status: "logged",
-      notes: callNotes.trim() || undefined,
+      notes: normalizedNotes,
       callDirection,
       callOutcome,
       followUpNeeded: callFollowUpNeeded,
@@ -555,7 +918,7 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
     };
 
     saveCommunication(entry);
-    logActivity("call logged", callPatient.id, callPatient.name, `${callDirection} - ${callOutcome}`);
+    logActivity("call logged", callPatient.id, `${callDirection} - ${callOutcome}`);
     showFeedback("Call logged.", "success");
 
     // Reset modal
@@ -569,6 +932,10 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
   }
 
   function handleCallNow(patient: Patient) {
+    if (!canOpenContactAction) {
+      handleDeniedAccess("open", "phone dialer");
+      return;
+    }
     const phone = (patient as any).phone;
     if (!phone) {
       showFeedback("Patient has no phone number.", "error");
@@ -576,7 +943,7 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
     }
     const opened = window.open(`tel:${phone}`, "_blank");
     if (opened) {
-      logActivity("opened_phone_dialer", patient.id, patient.name);
+      logActivity("opened_phone_dialer", patient.id);
       showFeedback("Opened phone dialer.", "info");
     } else {
       showFeedback("Please allow pop-ups to dial.", "error");
@@ -592,6 +959,10 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
   }
 
   function handleSaveTemplate() {
+    if (!canManageTemplates) {
+      handleDeniedAccess("save", "template");
+      return;
+    }
     if (!templateName.trim() || !templateBody.trim()) {
       showFeedback("Name and body are required.", "error");
       return;
@@ -602,7 +973,7 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
       const next = templates.map(t => t.id === editingTemplate.id ? { ...t, name: templateName.trim(), category: templateCategory.trim(), body: templateBody.trim() } : t);
       setTemplates(next);
       saveTemplate(next.find(t => t.id === editingTemplate.id)!);
-      logActivity("template updated", undefined, undefined, templateName.trim());
+      logActivity("template updated", undefined, templateName.trim());
       showFeedback("Template updated.", "success");
     } else {
       // Create new
@@ -615,7 +986,7 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
       const next = [...templates, newTemplate];
       setTemplates(next);
       saveTemplate(newTemplate);
-      logActivity("template created", undefined, undefined, templateName.trim());
+      logActivity("template created", undefined, templateName.trim());
       showFeedback("Template created.", "success");
     }
 
@@ -637,27 +1008,31 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
     const next = [...templates, newTemplate];
     setTemplates(next);
     saveTemplate(newTemplate);
-    logActivity("template duplicated", undefined, undefined, newTemplate.name);
+    logActivity("template duplicated", undefined, newTemplate.name);
     showFeedback("Template duplicated.", "success");
   }
 
   function handleExportHistoryCSV() {
-    const filtered = getFilteredHistory();
+    if (!canExportCommunicationHistory) {
+      handleDeniedAccess("export", "communication history");
+      return;
+    }
+    const filtered = filteredHistory;
     if (filtered.length === 0) {
       showFeedback("No communications to export.", "info");
       return;
     }
-    const headers = ["ID", "Patient", "Patient ID", "Type", "Status", "Date", "Scheduled Date", "Message", "Notes"];
+    // Phase 9D: Remove PHI from communication history export (PHI-safe)
+    const headers = ["ID", "Patient ID", "Type", "Status", "Date", "Scheduled Date", "Follow-up Needed", "Follow-up Date"];
     const rows = filtered.map((c: Communication) => [
       c.id,
-      c.patientName,
       c.patientId,
       c.type,
       c.status,
       fmtDate(c.date),
       c.scheduledDate ? fmtDate(c.scheduledDate) : "",
-      c.message || "",
-      c.notes || "",
+      c.followUpNeeded ? "Yes" : "No",
+      c.followUpDate ? fmtDate(c.followUpDate) : "",
     ]);
     const csv = [headers, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
     const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
@@ -667,25 +1042,29 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
     a.download = `communications_${new Date().toISOString().split("T")[0]}.csv`;
     a.click();
     URL.revokeObjectURL(url);
-    logActivity("communications exported");
+    // Phase 9D: Log count/type only (PHI-safe)
+    logActivity(`communications exported (${filtered.length} records)`);
     showFeedback(`Exported ${filtered.length} communication(s).`, "success");
   }
 
   function handleExportScheduledCSV() {
+    if (!canExportScheduledCommunication) {
+      handleDeniedAccess("export", "scheduled communications");
+      return;
+    }
     if (scheduled.length === 0) {
       showFeedback("No scheduled messages to export.", "info");
       return;
     }
-    const headers = ["ID", "Patient", "Patient ID", "Type", "Scheduled Date", "Status", "Created At", "Message"];
+    // Phase 9D: Remove PHI from scheduled communications export (PHI-safe)
+    const headers = ["ID", "Patient ID", "Type", "Scheduled Date", "Status", "Created At"];
     const rows = scheduled.map((s: ScheduledCommunication) => [
       s.id,
-      s.patientName,
       s.patientId,
       s.type,
       fmtDate(s.scheduledDate),
       s.status,
       fmtDate(s.createdAt),
-      s.message,
     ]);
     const csv = [headers, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
     const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
@@ -695,25 +1074,29 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
     a.download = `scheduled_${new Date().toISOString().split("T")[0]}.csv`;
     a.click();
     URL.revokeObjectURL(url);
-    logActivity("scheduled messages exported");
+    // Phase 9D: Log count/type only (PHI-safe)
+    logActivity(`scheduled messages exported (${scheduled.length} records)`);
     showFeedback(`Exported ${scheduled.length} scheduled message(s).`, "success");
   }
 
   function handleExportCallsCSV() {
-    const calls = communications.filter((c: Communication) => c.type === "call");
+    if (!canExportCallLogs) {
+      handleDeniedAccess("export", "call logs");
+      return;
+    }
+    const calls = callLogs;
     if (calls.length === 0) {
       showFeedback("No call logs to export.", "info");
       return;
     }
-    const headers = ["ID", "Patient", "Patient ID", "Direction", "Outcome", "Date", "Notes", "Follow-up Needed", "Follow-up Date"];
+    // Phase 9D: Remove PHI from call logs export (PHI-safe)
+    const headers = ["ID", "Patient ID", "Direction", "Outcome", "Date", "Follow-up Needed", "Follow-up Date"];
     const rows = calls.map((c: Communication) => [
       c.id,
-      c.patientName,
       c.patientId,
       c.callDirection || "",
       c.callOutcome || "",
       fmtDate(c.date),
-      c.notes || "",
       c.followUpNeeded ? "Yes" : "No",
       c.followUpDate ? fmtDate(c.followUpDate) : "",
     ]);
@@ -725,22 +1108,26 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
     a.download = `calls_${new Date().toISOString().split("T")[0]}.csv`;
     a.click();
     URL.revokeObjectURL(url);
-    logActivity("call logs exported");
+    // Phase 9D: Log count/type only (PHI-safe)
+    logActivity(`call logs exported (${calls.length} records)`);
     showFeedback(`Exported ${calls.length} call log(s).`, "success");
   }
 
   function handleExportActivityCSV() {
+    if (!canExportCommunicationActivity) {
+      handleDeniedAccess("export", "communication activity");
+      return;
+    }
     if (activity.length === 0) {
       showFeedback("No activity to export.", "info");
       return;
     }
-    const headers = ["Timestamp", "Action", "Patient ID", "Patient Name", "Details"];
+    // Phase 9D: Remove PHI from communication activity export (PHI-safe)
+    const headers = ["Timestamp", "Action", "Patient ID"];
     const rows = activity.map((a: CommunicationActivity) => [
       fmtDate(a.timestamp),
       a.action,
       a.patientId || "",
-      a.patientName || "",
-      a.details || "",
     ]);
     const csv = [headers, ...rows].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
     const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
@@ -750,11 +1137,13 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
     a.download = `activity_${new Date().toISOString().split("T")[0]}.csv`;
     a.click();
     URL.revokeObjectURL(url);
+    // Phase 9D: Log count/type only (PHI-safe)
+    logActivity(`communication activity exported (${activity.length} records)`);
     showFeedback(`Exported ${activity.length} activity entries.`, "success");
   }
 
   function handlePrintHistory() {
-    const filtered = getFilteredHistory();
+    const filtered = filteredHistory;
     if (filtered.length === 0) {
       showFeedback("No communications to print.", "info");
       return;
@@ -796,41 +1185,88 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
   }
 
   function handleClearActivity() {
-    setConfirmModal({
-      message: "Clear all activity logs?",
+    if (!canClearCommunicationActivity) {
+      handleDeniedAccess("clear", "communication activity");
+      return;
+    }
+    // Phase 9D: Require typed confirmation for clearing communication activity
+    setTypedConfirm({
+      requiredText: "CLEAR COMMUNICATION ACTIVITY",
       onConfirm: () => {
+        const count = activity.length;
         setActivity([]);
         writeJSON(ACTIVITY_KEY, []);
+        // Phase 9D: Log count only (PHI-safe)
+        logActivity("communication activity cleared", undefined, `${count} entries cleared`);
         showFeedback("Activity cleared.", "success");
+        setTypedConfirm(null);
+        setTypedValue("");
       },
     });
   }
 
-  function getFilteredHistory(): Communication[] {
-    return communications.filter((c: Communication) => {
-      if (historyFilterType && c.type !== historyFilterType) return false;
-      if (historyFilterStatus && c.status !== historyFilterStatus) return false;
-      if (historyDateFrom && new Date(c.date) < new Date(historyDateFrom)) return false;
-      if (historyDateTo && new Date(c.date) > new Date(historyDateTo + "T23:59:59")) return false;
-      if (historySearch) {
-        const searchLower = historySearch.toLowerCase();
-        if (!c.patientName.toLowerCase().includes(searchLower) &&
-            !c.message?.toLowerCase().includes(searchLower) &&
-            !c.notes?.toLowerCase().includes(searchLower)) {
-          return false;
-        }
+  const filteredHistory = useMemo(() => communications.filter((c: Communication) => {
+    if (historyFilterType && c.type !== historyFilterType) return false;
+    if (historyFilterStatus && c.status !== historyFilterStatus) return false;
+    if (historyDateFrom && new Date(c.date) < new Date(historyDateFrom)) return false;
+    if (historyDateTo && new Date(c.date) > new Date(historyDateTo + "T23:59:59")) return false;
+    if (historySearch) {
+      const searchLower = historySearch.toLowerCase();
+      if (!c.patientName.toLowerCase().includes(searchLower) &&
+          !c.message?.toLowerCase().includes(searchLower) &&
+          !c.notes?.toLowerCase().includes(searchLower)) {
+        return false;
       }
-      return true;
-    });
-  }
+    }
+    return true;
+  }), [communications, historyFilterType, historyFilterStatus, historyDateFrom, historyDateTo, historySearch]);
 
-  const smsLogs = communications.filter((c: Communication) => c.type === "sms" || c.status === "opened_sms_app");
-  const emailLogs = communications.filter((c: Communication) => c.type === "email" || c.status === "opened_email_app");
-  const whatsappLogs = communications.filter((c: Communication) => c.type === "whatsapp" || c.status === "opened_whatsapp");
-  const callLogs = communications.filter((c: Communication) => c.type === "call");
-  const scheduledMessages = scheduled.filter(s => s.status === "scheduled" && new Date(s.scheduledDate) > new Date());
-  const dueNow = scheduled.filter(s => s.status === "scheduled" && new Date(s.scheduledDate) <= new Date());
-  const visibleHistory = historyExpanded ? getFilteredHistory() : getFilteredHistory().slice(0, 10);
+  const commStats = useMemo(() => ({
+    smsLogs: communications.filter((c: Communication) => c.type === "sms" || c.status === "opened_sms_app"),
+    emailLogs: communications.filter((c: Communication) => c.type === "email" || c.status === "opened_email_app"),
+    whatsappLogs: communications.filter((c: Communication) => c.type === "whatsapp" || c.status === "opened_whatsapp"),
+    callLogs: communications.filter((c: Communication) => c.type === "call"),
+    scheduledMessages: scheduled.filter(s => s.status === "scheduled" && new Date(s.scheduledDate) > new Date()),
+    dueNow: scheduled.filter(s => s.status === "scheduled" && new Date(s.scheduledDate) <= new Date()),
+  }), [communications, scheduled]);
+
+  const smsLogs = commStats.smsLogs;
+  const emailLogs = commStats.emailLogs;
+  const whatsappLogs = commStats.whatsappLogs;
+  const callLogs = commStats.callLogs;
+  const scheduledMessages = commStats.scheduledMessages;
+  const dueNow = commStats.dueNow;
+
+  const visibleHistory = useMemo(() => historyExpanded ? filteredHistory : filteredHistory.slice(0, 10), [filteredHistory, historyExpanded]);
+
+  const drafts = useMemo(() => communications.filter((c: Communication) => c.type === "draft"), [communications]);
+
+  const followUpSuggestions = useMemo(() => patients.filter((p: Patient) => {
+    const suggestionId = `${p.id}_followup`;
+    if (dismissedSuggestions.has(suggestionId)) return false;
+    const followUpDate = (p as any).followUpDate;
+    return followUpDate && new Date(followUpDate) <= new Date();
+  }), [patients, dismissedSuggestions]);
+
+  const insuranceSuggestions = useMemo(() => patients.filter((p: Patient) => {
+    const suggestionId = `${p.id}_insurance`;
+    if (dismissedSuggestions.has(suggestionId)) return false;
+    const insuranceExpiry = (p as any).insuranceExpiry;
+    return insuranceExpiry && new Date(insuranceExpiry) <= new Date();
+  }), [patients, dismissedSuggestions]);
+
+  const consentSuggestions = useMemo(() => patients.filter((p: Patient) => {
+    const suggestionId = `${p.id}_consent`;
+    if (dismissedSuggestions.has(suggestionId)) return false;
+    return (p as any).consentSigned === false;
+  }), [patients, dismissedSuggestions]);
+
+  const appointmentSuggestions = useMemo(() => patients.filter((p: Patient) => {
+    const suggestionId = `${p.id}_appointment`;
+    if (dismissedSuggestions.has(suggestionId)) return false;
+    const nextAppointment = (p as any).nextAppointment;
+    return nextAppointment && new Date(nextAppointment) <= new Date(Date.now() + 24 * 60 * 60 * 1000);
+  }), [patients, dismissedSuggestions]);
 
   return (
     <div style={{ padding: "clamp(12px, 4vw, 24px)", maxWidth: 1400 }}>
@@ -886,12 +1322,16 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
             <div className="section-label" style={{ margin: 0 }}>Activity Log ({activity.length})</div>
             <div style={{ display: "flex", gap: 4 }}>
-              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handleExportActivityCSV}>
-                <i className="ti ti-download" style={{ fontSize: 11, marginRight: 4 }} />Export CSV
-              </button>
-              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px", color: "var(--red)" }} onClick={handleClearActivity}>
-                <i className="ti ti-trash" style={{ fontSize: 11, marginRight: 4 }} />Clear
-              </button>
+              {canExportCommunicationActivity && (
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handleExportActivityCSV}>
+                  <i className="ti ti-download" style={{ fontSize: 11, marginRight: 4 }} />Export CSV
+                </button>
+              )}
+              {canClearCommunicationActivity && (
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px", color: "var(--red)" }} onClick={handleClearActivity}>
+                  <i className="ti ti-trash" style={{ fontSize: 11, marginRight: 4 }} />Clear
+                </button>
+              )}
             </div>
           </div>
           {activity.length === 0 ? (
@@ -904,7 +1344,11 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
                     <span style={{ fontWeight: 600 }}>{a.action}</span>
                     <span style={{ color: "var(--muted)" }}>{fmtDate(a.timestamp)}</span>
                   </div>
-                  {a.patientName && <div style={{ color: "var(--muted)" }}>Patient: {a.patientName}</div>}
+                  {a.patientId && (
+                    <div style={{ color: "var(--muted)" }}>
+                      Patient: {patients.find(p => p.id === a.patientId)?.name || a.patientId}
+                    </div>
+                  )}
                   {a.details && <div style={{ color: "var(--muted)" }}>{a.details}</div>}
                 </div>
               ))}
@@ -924,6 +1368,80 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
                 <button className="btn btn-ghost" onClick={() => setConfirmModal(null)}>Cancel</button>
                 <button className="btn btn-danger" style={{ background: "var(--red)", color: "#fff" }} onClick={() => { confirmModal.onConfirm(); setConfirmModal(null); }}>Confirm</button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Phase 9D: Typed confirmation modal for dangerous actions */}
+      {typedConfirm && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0, 0, 0, 0.5)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+            zIndex: 9999,
+          }}
+          onClick={(e) => { if (e.target === e.currentTarget) { setTypedConfirm(null); setTypedValue(""); } }}
+        >
+          <div
+            style={{
+              background: "var(--surface)",
+              borderRadius: "var(--radius)",
+              padding: 24,
+              maxWidth: 480,
+              width: "100%",
+              boxShadow: "0 8px 32px rgba(0, 0, 0, 0.2)",
+            }}
+          >
+            <div style={{ fontSize: "var(--font-lg)", fontWeight: 700, marginBottom: 12 }}>
+              Confirm Dangerous Action
+            </div>
+            <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)", marginBottom: 16 }}>
+              This action is irreversible. Type <strong>"{typedConfirm.requiredText}"</strong> to confirm.
+            </div>
+            <input
+              type="text"
+              value={typedValue}
+              onChange={(e) => setTypedValue(e.target.value)}
+              placeholder={`Type "${typedConfirm.requiredText}"`}
+              style={{
+                width: "100%",
+                padding: "10px 12px",
+                borderRadius: "var(--radius)",
+                border: "1px solid var(--border)",
+                fontSize: "var(--font-sm)",
+                fontFamily: "monospace",
+                marginBottom: 16,
+                outline: "none",
+              }}
+            />
+            <div style={{ display: "flex", gap: 12, justifyContent: "flex-end" }}>
+              <button
+                className="btn btn-ghost"
+                onClick={() => { setTypedConfirm(null); setTypedValue(""); }}
+                style={{ fontSize: "var(--font-sm)" }}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn btn-danger"
+                onClick={() => {
+                  if (typedValue === typedConfirm.requiredText) {
+                    typedConfirm.onConfirm();
+                  } else {
+                    showFeedback("Confirmation text does not match.", "error");
+                  }
+                }}
+                disabled={typedValue !== typedConfirm.requiredText}
+                style={{ fontSize: "var(--font-sm)", opacity: typedValue === typedConfirm.requiredText ? 1 : 0.5 }}
+              >
+                Confirm
+              </button>
             </div>
           </div>
         </div>
@@ -1106,7 +1624,7 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
                     <i className="ti ti-send" style={{ fontSize: 12, marginRight: 4 }} />Send Again
                   </button>
                 )}
-                {userRole !== "doctor" && (
+                {canDeleteCommunication && (
                   <button className="btn btn-ghost" style={{ color: "var(--red)" }} onClick={() => { handleDeleteCommunication(selectedCommunication.id); setShowDetailModal(false); }}>
                     <i className="ti ti-trash" style={{ fontSize: 12, marginRight: 4 }} />Delete
                   </button>
@@ -1358,11 +1876,11 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
             <i className="ti ti-file-draft" style={{ marginRight: 4 }} />
             Drafts
           </div>
-          {communications.filter((c: Communication) => c.type === "draft").length === 0 ? (
+          {drafts.length === 0 ? (
             <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>No drafts saved.</div>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {communications.filter((c: Communication) => c.type === "draft").map((d: Communication) => (
+              {drafts.map((d: Communication) => (
                 <div key={d.id} style={{
                   display: "flex", alignItems: "center", gap: 8,
                   padding: 8, background: "var(--surface2)", borderRadius: "var(--radius)"
@@ -1376,7 +1894,7 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
                   <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px" }} onClick={() => handleLoadDraft(d)} title="Load">
                     <i className="ti ti-pencil" style={{ fontSize: 12 }} />
                   </button>
-                  {userRole !== "doctor" && (
+                  {canDeleteCommunication && (
                   <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px", color: "var(--red)" }} onClick={() => handleDeleteDraft(d.id)} title="Delete">
                     <i className="ti ti-trash" style={{ fontSize: 12 }} />
                   </button>
@@ -1414,13 +1932,17 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
                       {s.type.toUpperCase()} · Due: {fmtDate(s.scheduledDate)}
                     </div>
                   </div>
-                  <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px" }} onClick={() => handleSendScheduled(s.id)} title="Send now">
-                    <i className="ti ti-send" style={{ fontSize: 12 }} />
-                  </button>
-                  <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px", color: "var(--amber)" }} onClick={() => handleCancelScheduled(s.id)} title="Cancel">
-                    <i className="ti ti-x" style={{ fontSize: 12 }} />
-                  </button>
-                  {userRole !== "doctor" && (
+                  {canSendScheduledCommunication && (
+                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px" }} onClick={() => handleSendScheduled(s.id)} title="Send now">
+                      <i className="ti ti-send" style={{ fontSize: 12 }} />
+                    </button>
+                  )}
+                  {canDeleteScheduledCommunication && (
+                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px", color: "var(--amber)" }} onClick={() => handleCancelScheduled(s.id)} title="Cancel">
+                      <i className="ti ti-x" style={{ fontSize: 12 }} />
+                    </button>
+                  )}
+                  {canDeleteScheduledCommunication && (
                     <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px", color: "var(--red)" }} onClick={() => handleDeleteScheduled(s.id)} title="Delete">
                       <i className="ti ti-trash" style={{ fontSize: 12 }} />
                     </button>
@@ -1452,12 +1974,12 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
               Message Templates
             </div>
             <div style={{ display: "flex", gap: 4 }}>
-              {userRole !== "doctor" && (
+              {canManageTemplates && (
                 <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handleResetTemplates}>
                   <i className="ti ti-refresh" style={{ fontSize: 11, marginRight: 4 }} />Reset Defaults
                 </button>
               )}
-              {userRole !== "doctor" && (
+              {canManageTemplates && (
                 <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={() => { setEditingTemplate(null); setTemplateName(""); setTemplateCategory(""); setTemplateBody(""); setShowTemplateModal(true); }}>
                   <i className="ti ti-plus" style={{ fontSize: 11, marginRight: 4 }} />Add Template
                 </button>
@@ -1491,17 +2013,17 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
                   <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px" }} onClick={(e) => handleUseTemplate(t, e.shiftKey)} title="Use template">
                     <i className="ti ti-send" style={{ fontSize: 12 }} />
                   </button>
-                  {userRole !== "doctor" && (
+                  {canManageTemplates && (
                     <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px" }} onClick={() => handleEditTemplate(t)} title="Edit">
                       <i className="ti ti-pencil" style={{ fontSize: 12 }} />
                     </button>
                   )}
-                  {userRole !== "doctor" && (
+                  {canManageTemplates && (
                     <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px" }} onClick={() => handleDuplicateTemplate(t)} title="Duplicate">
                       <i className="ti ti-copy" style={{ fontSize: 12 }} />
                     </button>
                   )}
-                  {userRole !== "doctor" && (
+                  {canManageTemplates && (
                     <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px", color: "var(--red)" }} onClick={() => handleDeleteTemplate(t.id)} title="Delete">
                       <i className="ti ti-trash" style={{ fontSize: 12 }} />
                     </button>
@@ -1549,12 +2071,16 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
               Communication History
             </div>
             <div style={{ display: "flex", gap: 4 }}>
-              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handlePrintHistory}>
-                <i className="ti ti-print" style={{ fontSize: 11, marginRight: 4 }} />Print
-              </button>
-              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handleExportHistoryCSV}>
-                <i className="ti ti-download" style={{ fontSize: 11, marginRight: 4 }} />Export CSV
-              </button>
+              {canExportCommunicationHistory && (
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handlePrintHistory}>
+                  <i className="ti ti-print" style={{ fontSize: 11, marginRight: 4 }} />Print
+                </button>
+              )}
+              {canExportCommunicationHistory && (
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handleExportHistoryCSV}>
+                  <i className="ti ti-download" style={{ fontSize: 11, marginRight: 4 }} />Export CSV
+                </button>
+              )}
             </div>
           </div>
           <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
@@ -1609,7 +2135,7 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
               </button>
             )}
           </div>
-        {getFilteredHistory().length === 0 ? (
+        {filteredHistory.length === 0 ? (
           <div style={{ textAlign: "center", padding: 32, color: "var(--muted)" }}>
             <i className="ti ti-message-off" style={{ fontSize: 32, marginBottom: 8 }} />
             <div>No communication history found</div>
@@ -1672,7 +2198,7 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
                       <i className="ti ti-check" style={{ fontSize: 12 }} />
                     </button>
                   )}
-                  {userRole !== "doctor" && (
+                  {canDeleteCommunication && (
                     <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px", color: "var(--red)" }} onClick={() => handleDeleteCommunication(c.id)} title="Delete">
                       <i className="ti ti-trash" style={{ fontSize: 12 }} />
                     </button>
@@ -1680,12 +2206,12 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
                 </div>
               </div>
             ))}
-            {getFilteredHistory().length > 10 && (
+            {filteredHistory.length > 10 && (
               <button
                 onClick={() => setHistoryExpanded(e => !e)}
                 style={{ width: "100%", padding: "10px 0", background: "none", border: "1px dashed var(--border)", borderRadius: "var(--radius)", cursor: "pointer", fontSize: "var(--font-xs)", color: "var(--muted)" }}
               >
-                {historyExpanded ? "Show less" : `Show ${getFilteredHistory().length - 10} more`}
+                {historyExpanded ? "Show less" : `Show ${filteredHistory.length - 10} more`}
               </button>
             )}
           </div>
@@ -1709,12 +2235,7 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
             </div>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {patients.filter((p: Patient) => {
-                const suggestionId = `${p.id}_followup`;
-                if (dismissedSuggestions.has(suggestionId)) return false;
-                const followUpDate = (p as any).followUpDate;
-                return followUpDate && new Date(followUpDate) <= new Date();
-              }).map((p: Patient) => (
+              {followUpSuggestions.map((p: Patient) => (
                 <div key={p.id} style={{
                   display: "flex", alignItems: "center", gap: 12,
                   padding: 12, background: "var(--amber-bg)", borderRadius: "var(--radius)",
@@ -1744,12 +2265,7 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
                   </button>
                 </div>
               ))}
-              {patients.filter((p: Patient) => {
-                const suggestionId = `${p.id}_insurance`;
-                if (dismissedSuggestions.has(suggestionId)) return false;
-                const insuranceExpiry = (p as any).insuranceExpiry;
-                return insuranceExpiry && new Date(insuranceExpiry) <= new Date();
-              }).map((p: Patient) => (
+              {insuranceSuggestions.map((p: Patient) => (
                 <div key={p.id} style={{
                   display: "flex", alignItems: "center", gap: 12,
                   padding: 12, background: "var(--red-bg)", borderRadius: "var(--radius)",
@@ -1779,11 +2295,7 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
                   </button>
                 </div>
               ))}
-              {patients.filter((p: Patient) => {
-                const suggestionId = `${p.id}_consent`;
-                if (dismissedSuggestions.has(suggestionId)) return false;
-                return (p as any).consentSigned === false;
-              }).map((p: Patient) => (
+              {consentSuggestions.map((p: Patient) => (
                 <div key={p.id} style={{
                   display: "flex", alignItems: "center", gap: 12,
                   padding: 12, background: "var(--surface2)", borderRadius: "var(--radius)",
@@ -1813,12 +2325,7 @@ export default function CommunicationsPage({ patients, onUpdatePatient, userRole
                   </button>
                 </div>
               ))}
-              {patients.filter((p: Patient) => {
-                const suggestionId = `${p.id}_appointment`;
-                if (dismissedSuggestions.has(suggestionId)) return false;
-                const nextAppointment = (p as any).nextAppointment;
-                return nextAppointment && new Date(nextAppointment) <= new Date(Date.now() + 24 * 60 * 60 * 1000);
-              }).map((p: Patient) => (
+              {appointmentSuggestions.map((p: Patient) => (
                 <div key={p.id} style={{
                   display: "flex", alignItems: "center", gap: 12,
                   padding: 12, background: "var(--blue-bg)", borderRadius: "var(--radius)",

@@ -18,6 +18,22 @@ export function FileUpload({ patientId, patientName, consultationId, onUploadFil
   const [previewUrls, setPreviewUrls] = useState<Record<number, string>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // ── local feedback (replaces all alert() calls) ───────────────────────────
+  const [feedback, setFeedback] = useState<{
+    type: 'success' | 'error' | 'info' | 'warning';
+    message: string;
+  } | null>(null);
+  const feedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showFeedback = useCallback(
+    (message: string, type: 'success' | 'error' | 'info' | 'warning' = 'info') => {
+      if (feedbackTimer.current) clearTimeout(feedbackTimer.current);
+      setFeedback({ type, message });
+      feedbackTimer.current = setTimeout(() => setFeedback(null), 4000);
+    },
+    []
+  );
+
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFiles = Array.from(e.target.files || []);
     processFiles(selectedFiles);
@@ -37,7 +53,10 @@ export function FileUpload({ patientId, patientName, consultationId, onUploadFil
     });
 
     if (validFiles.length !== selectedFiles.length) {
-      alert('Some files were excluded. Only PDF, images, and documents up to 10MB are allowed.');
+      showFeedback(
+        'Some files were excluded. Only PDF, images, and documents up to 10MB are allowed.',
+        'warning'
+      );
     }
 
     // Generate previews for images
@@ -87,7 +106,7 @@ export function FileUpload({ patientId, patientName, consultationId, onUploadFil
 
   const handleUpload = async () => {
     if (files.length === 0) {
-      alert('Please select at least one file to upload');
+      showFeedback('Please select at least one file to upload.', 'error');
       return;
     }
 
@@ -97,9 +116,10 @@ export function FileUpload({ patientId, patientName, consultationId, onUploadFil
     try {
       await onUploadFiles(files);
       setUploadProgress(100);
+      showFeedback('Files uploaded successfully.', 'success');
     } catch (error) {
       console.error('Upload failed:', error);
-      alert('Failed to upload files');
+      showFeedback('Failed to upload files. Please try again.', 'error');
     } finally {
       setUploading(false);
     }
@@ -165,6 +185,42 @@ export function FileUpload({ patientId, patientName, consultationId, onUploadFil
         </div>
 
         <div style={{ padding: "20px" }}>
+          {/* Feedback banner */}
+          {feedback && (() => {
+            const styles = {
+              success: { bg: 'var(--green-bg,#f0fdf4)', border: 'var(--green-border,#86efac)', color: 'var(--green,#16a34a)', icon: 'ti-circle-check' },
+              error:   { bg: 'var(--red-bg,#fef2f2)',   border: 'var(--red-border,#fecaca)',   color: 'var(--red,#dc2626)',     icon: 'ti-alert-circle' },
+              warning: { bg: 'var(--amber-bg,#fffbeb)', border: 'var(--amber-border,#fcd34d)', color: 'var(--amber,#b45309)',   icon: 'ti-alert-triangle' },
+              info:    { bg: 'var(--accent-soft)',       border: 'var(--accent-border,var(--border))', color: 'var(--accent)',  icon: 'ti-info-circle' },
+            }[feedback.type];
+            return (
+              <div
+                role="alert"
+                style={{
+                  display: 'flex', alignItems: 'flex-start', gap: 8,
+                  background: styles.bg,
+                  border: `1px solid ${styles.border}`,
+                  borderRadius: 'var(--radius)',
+                  padding: '10px 12px',
+                  marginBottom: 16,
+                  fontSize: 'var(--font-sm)',
+                  color: styles.color,
+                }}
+              >
+                <i className={`ti ${styles.icon}`} style={{ fontSize: 15, flexShrink: 0, marginTop: 1 }} />
+                <span style={{ flex: 1, lineHeight: 1.4 }}>{feedback.message}</span>
+                <button
+                  type="button"
+                  aria-label="Dismiss"
+                  onClick={() => setFeedback(null)}
+                  style={{ background: 'none', border: 'none', cursor: 'pointer', color: styles.color, padding: '0 2px', lineHeight: 1, fontSize: 14, flexShrink: 0 }}
+                >
+                  ×
+                </button>
+              </div>
+            );
+          })()}
+
           <div style={{ marginBottom: 16 }}>
             <label className="field-label">Document Type *</label>
             <select

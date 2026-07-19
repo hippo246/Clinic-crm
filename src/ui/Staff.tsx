@@ -1,5 +1,15 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { fmtDate } from "./utils";
+import {
+  validateRequired,
+  validateEmail,
+  validatePhone,
+  validateDate,
+  validateMaxLength,
+  safeString,
+} from "../shared/validation/validators";
+import { hasRole, normalizeRole } from "../shared/permissions/permissions";
+import { logDeniedAction } from "../shared/services/deniedActionLogger";
 
 // ─── localStorage helpers ─────────────────────────────────────────────────────
 function readJSON<T>(key: string, fallback: T): T {
@@ -82,10 +92,40 @@ interface PerformanceMetrics {
   completedTasks: number;
 }
 
-export default function StaffPage() {
+export default function StaffPage({ userRole = "admin" }: { userRole?: "receptionist" | "doctor" | "admin" | "nurse" | "billing" | "auditor" | "readonly" }) {
   const [activeTab, setActiveTab] = useState<"staff" | "schedule" | "performance" | "permissions">("staff");
   const [showAddStaff, setShowAddStaff] = useState(false);
   const [selectedStaff, setSelectedStaff] = useState<StaffMember | null>(null);
+  const [confirmModal, setConfirmModal] = useState<{ title: string; message: string; onConfirm: () => void; isDanger: boolean } | null>(null);
+  // Phase 9C: Add typed confirmation state for dangerous actions
+  const [typedConfirm, setTypedConfirm] = useState<{ requiredText: string; onConfirm: () => void } | null>(null);
+  const [typedValue, setTypedValue] = useState("");
+
+  // Normalized role for consistent permission checks
+  const normalizedRole = normalizeRole(userRole) as "admin" | "doctor" | "nurse" | "receptionist" | "billing" | "auditor" | "readonly";
+
+  // Local permission guards for Staff actions
+  const canViewStaff = hasRole(normalizedRole, ["admin"]);
+  const canCreateStaff = hasRole(normalizedRole, ["admin"]);
+  const canEditStaff = hasRole(normalizedRole, ["admin"]);
+  const canDeleteStaff = hasRole(normalizedRole, ["admin"]);
+  const canDeactivateStaff = hasRole(normalizedRole, ["admin"]);
+  const canManageStaffSchedule = hasRole(normalizedRole, ["admin"]);
+  const canChangeStaffRole = hasRole(normalizedRole, ["admin"]);
+  const canExportStaff = hasRole(normalizedRole, ["admin"]);
+  const canClearStaffActivity = hasRole(normalizedRole, ["admin"]);
+  const canResetDemoStaff = hasRole(normalizedRole, ["admin"]);
+
+  // Local denied access helper
+  const handleDeniedAccess = (action: string, resource: string) => {
+    showFeedback(`You don't have permission to ${action} ${resource}.`, "error");
+    logDeniedAction({
+      action,
+      resource,
+      role: normalizedRole,
+      reason: "insufficient_permissions",
+    });
+  };
 
   // ── persistent state ────────────────────────────────────────────────────────
   const [staff, setStaff] = useState<StaffMember[]>(() => readJSON<StaffMember[]>("clinic_crm_staff", DEFAULT_STAFF));
@@ -106,6 +146,69 @@ export default function StaffPage() {
       return next;
     });
   }, []);
+
+  function validateStaffProfile(staffForm: { name: string; role: string; email: string; phone: string; department: string; status: string }): { valid: boolean; errors: string[]; warnings: string[] } {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    // Validate name
+    const nameError = validateRequired(staffForm.name, "Name");
+    if (nameError) errors.push(nameError);
+
+    // Validate role
+    const roleError = validateRequired(staffForm.role, "Role");
+    if (roleError) errors.push(roleError);
+
+    // Validate email
+    const emailError = validateRequired(staffForm.email, "Email");
+    if (emailError) errors.push(emailError);
+    else if (!validateEmail(staffForm.email)) {
+      errors.push("Valid email is required.");
+    }
+
+    // Validate phone if provided
+    if (staffForm.phone && !validatePhone(staffForm.phone)) {
+      errors.push("Invalid phone number format.");
+    }
+
+    // Validate department
+    const deptError = validateRequired(staffForm.department, "Department");
+    if (deptError) errors.push(deptError);
+
+    return { valid: errors.length === 0, errors, warnings };
+  }
+
+  function validateSchedule(scheduleForm: { staffId: string; date: string; startTime: string; endTime: string; type: string }): { valid: boolean; errors: string[]; warnings: string[] } {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    // Validate staff
+    const staffError = validateRequired(scheduleForm.staffId, "Staff member");
+    if (staffError) errors.push(staffError);
+
+    // Validate date
+    const dateError = validateRequired(scheduleForm.date, "Date");
+    if (dateError) errors.push(dateError);
+    else if (!validateDate(scheduleForm.date)) {
+      errors.push("Invalid date format.");
+    }
+
+    // Validate start time
+    const startError = validateRequired(scheduleForm.startTime, "Start time");
+    if (startError) errors.push(startError);
+
+    // Validate end time
+    const endError = validateRequired(scheduleForm.endTime, "End time");
+    if (endError) errors.push(endError);
+
+    // Validate end time after start time
+    if (scheduleForm.startTime && scheduleForm.endTime && scheduleForm.endTime <= scheduleForm.startTime) {
+      errors.push("End time must be after start time.");
+    }
+
+    return { valid: errors.length === 0, errors, warnings };
+  }
+
 
   // ── feedback ─────────────────────────────────────────────────────────────────
   const [feedback, setFeedback] = useState<{ type: "success" | "error" | "info"; message: string } | null>(null);
@@ -144,6 +247,7 @@ export default function StaffPage() {
 
   // ── import state ──────────────────────────────────────────────────────────
   const importInputRef = React.useRef<HTMLInputElement>(null);
+  const [showAllActivity, setShowAllActivity] = useState(false);
 
   const filteredStaff = React.useMemo(() => {
     let list = staff.filter(s => {
@@ -208,6 +312,7 @@ export default function StaffPage() {
   const [formPhone, setFormPhone] = useState("");
   const [formDept, setFormDept] = useState("");
   const [formStatus, setFormStatus] = useState<"active" | "inactive">("active");
+  const [formJoinDate, setFormJoinDate] = useState(new Date().toISOString().split("T")[0]);
   const [formPerms, setFormPerms] = useState<string[]>([]);
   const [formError, setFormError] = useState("");
   const [presetApplied, setPresetApplied] = useState(false);
@@ -220,21 +325,45 @@ export default function StaffPage() {
 
   const openAddModal = () => {
     setEditMode("add"); setFormName(""); setFormRole("doctor"); setFormEmail("");
-    setFormPhone(""); setFormDept(""); setFormStatus("active"); setFormPerms([]); setFormError(""); setPresetApplied(false);
+    setFormPhone(""); setFormDept(""); setFormStatus("active"); setFormJoinDate(new Date().toISOString().split("T")[0]); setFormPerms([]); setFormError(""); setPresetApplied(false);
     setShowAddStaff(true);
   };
   const openEditModal = (s: StaffMember) => {
     setEditMode("edit"); setFormName(s.name); setFormRole(s.role); setFormEmail(s.email);
-    setFormPhone(s.phone); setFormDept(s.department); setFormStatus(s.status); setFormPerms([...s.permissions]); setFormError(""); setPresetApplied(false);
+    setFormPhone(s.phone); setFormDept(s.department); setFormStatus(s.status); setFormJoinDate(s.joinDate); setFormPerms([...s.permissions]); setFormError(""); setPresetApplied(false);
     setSelectedStaff(s); setShowAddStaff(true);
   };
   const closeStaffModal = () => { setShowAddStaff(false); setSelectedStaff(null); };
 
   const handleSaveStaff = () => {
+    if (editMode === "add" && !canCreateStaff) {
+      handleDeniedAccess("create", "staff member");
+      return;
+    }
+    if (editMode === "edit" && !canEditStaff) {
+      handleDeniedAccess("edit", "staff member");
+      return;
+    }
     setFormError("");
-    if (!formName.trim()) { setFormError("Name is required."); return; }
-    if (!formEmail.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(formEmail)) { setFormError("Valid email is required."); return; }
-    if (!formRole) { setFormError("Role is required."); return; }
+
+    const validation = validateStaffProfile({
+      name: formName,
+      role: formRole,
+      email: formEmail,
+      phone: formPhone,
+      department: formDept,
+      status: formStatus,
+    });
+
+    // Show errors and block save
+    if (validation.errors.length > 0) {
+      setFormError(validation.errors[0]);
+      return;
+    }
+
+    // Show warnings but don't block
+    validation.warnings.forEach(warning => showFeedback(warning, "info"));
+
     // Last-admin guard
     if (editMode === "edit" && selectedStaff) {
       const wouldDeactivate = formStatus === "inactive" && selectedStaff.status === "active";
@@ -244,34 +373,87 @@ export default function StaffPage() {
         return;
       }
     }
+
+    // Duplicate email guard
+    const emailLower = formEmail.trim().toLowerCase();
+    const duplicate = staff.find(m => m.email.toLowerCase() === emailLower && (editMode === "add" || m.id !== selectedStaff?.id));
+    if (duplicate) {
+      setFormError(`Email already in use by ${duplicate.name}.`);
+      return;
+    }
+
+    // Normalize data before save
+    const normalizedName = safeString(formName).trim();
+    const normalizedEmail = safeString(formEmail).trim().toLowerCase();
+    const normalizedPhone = formPhone ? safeString(formPhone).trim() : "";
+    const normalizedDept = safeString(formDept).trim();
+
     if (editMode === "add") {
       const newMember: StaffMember = {
-        id: `STF-${Date.now()}`, name: formName.trim(), role: formRole, email: formEmail.trim(),
-        phone: formPhone.trim(), department: formDept.trim(), status: formStatus,
-        joinDate: new Date().toISOString().split("T")[0], permissions: formPerms,
+        id: `STF-${Date.now()}`, name: normalizedName, role: formRole, email: normalizedEmail,
+        phone: normalizedPhone, department: normalizedDept, status: formStatus,
+        joinDate: formJoinDate || new Date().toISOString().split("T")[0], permissions: formPerms,
       };
       persistStaff([...staff, newMember]);
-      pushActivity("System", `Added new staff member: ${newMember.name} (${newMember.role})`);
+      // Phase 9C: Log staffId and role only (PII-safe)
+      pushActivity("System", `Added new staff ${newMember.id} with role ${newMember.role}`);
       showFeedback(`${newMember.name} added successfully.`);
     } else if (selectedStaff) {
-      const updated: StaffMember = { ...selectedStaff, name: formName.trim(), role: formRole, email: formEmail.trim(), phone: formPhone.trim(), department: formDept.trim(), status: formStatus, permissions: formPerms };
+      const oldRole = selectedStaff.role;
+      const newRole = formRole;
+      const updated: StaffMember = { ...selectedStaff, name: normalizedName, role: formRole, email: normalizedEmail, phone: normalizedPhone, department: normalizedDept, status: formStatus, joinDate: formJoinDate || selectedStaff.joinDate, permissions: formPerms };
       persistStaff(staff.map(s => s.id === selectedStaff.id ? updated : s));
-      pushActivity("System", `Updated staff member: ${updated.name}`);
+      // Phase 9C: Log staffId and role change if applicable (PII-safe)
+      if (oldRole !== newRole) {
+        pushActivity("System", `Changed staff ${updated.id} role from ${oldRole} to ${newRole}`);
+      } else {
+        pushActivity("System", `Updated staff ${updated.id}`);
+      }
       showFeedback(`${updated.name} updated.`);
     }
     closeStaffModal();
   };
 
   const handleToggleStatus = (s: StaffMember) => {
+    if (!canDeactivateStaff) {
+      handleDeniedAccess("deactivate/reactivate", "staff member");
+      return;
+    }
     if (s.status === "active" && isLastActiveAdmin(s)) {
       showFeedback("At least one active admin is required.", "error");
       return;
     }
     const next = s.status === "active" ? "inactive" : "active";
     persistStaff(staff.map(m => m.id === s.id ? { ...m, status: next } : m));
-    pushActivity("System", `${next === "inactive" ? "Deactivated" : "Reactivated"} ${s.name}`);
+    // Phase 9C: Log staffId only (PII-safe)
+    pushActivity("System", `${next === "inactive" ? "Deactivated" : "Reactivated"} staff ${s.id}`);
     showFeedback(`${s.name} ${next === "inactive" ? "deactivated" : "reactivated"}.`);
     if (viewStaff?.id === s.id) setViewStaff({ ...viewStaff, status: next });
+  };
+
+  const handleDeleteStaff = (s: StaffMember) => {
+    if (!canDeleteStaff) {
+      handleDeniedAccess("delete", "staff member");
+      return;
+    }
+    if (isLastActiveAdmin(s)) {
+      showFeedback("Cannot delete the last active admin.", "error");
+      return;
+    }
+    setConfirmModal({
+      title: "Delete Staff Member?",
+      message: `Permanently delete ${s.name}? This cannot be undone.`,
+      onConfirm: () => {
+        persistStaff(staff.filter(m => m.id !== s.id));
+        persistSchedules(schedules.filter(sc => sc.staffId !== s.id));
+        // Phase 9C: Log staffId only (PII-safe)
+        pushActivity("System", `Deleted staff ${s.id}`);
+        showFeedback(`${s.name} deleted.`, "info");
+        if (viewStaff?.id === s.id) setViewStaff(null);
+        setConfirmModal(null);
+      },
+      isDanger: true,
+    });
   };
 
   // ── schedule modal ─────────────────────────────────────────────────────────
@@ -296,73 +478,140 @@ export default function StaffPage() {
   const closeScheduleModal = () => { setShowScheduleModal(false); setEditSchedule(null); };
 
   const handleSaveSchedule = () => {
+    if (!canManageStaffSchedule) {
+      handleDeniedAccess("add/edit", "staff schedule");
+      return;
+    }
     setSchError("");
-    if (!schStaffId) { setSchError("Please select a staff member."); return; }
-    if (!schDate) { setSchError("Please select a date."); return; }
-    if (!schStart) { setSchError("Please set a start time."); return; }
-    if (!schEnd) { setSchError("Please set an end time."); return; }
-    if (schEnd <= schStart) { setSchError("End time must be after start time."); return; }
+
+    const validation = validateSchedule({
+      staffId: schStaffId,
+      date: schDate,
+      startTime: schStart,
+      endTime: schEnd,
+      type: schType,
+    });
+
+    // Show errors and block save
+    if (validation.errors.length > 0) {
+      setSchError(validation.errors[0]);
+      return;
+    }
+
+    // Show warnings but don't block
+    validation.warnings.forEach(warning => showFeedback(warning, "info"));
+
     // Conflict detection
     if (hasConflict(schStaffId, schDate, schStart, schEnd, editSchedule?.id)) {
       setSchError("Schedule conflict: staff member already has a shift at this time.");
       return;
     }
+
     const member = staff.find(s => s.id === schStaffId);
     const memberName = member?.name || schStaffId;
+    
     if (editSchedule) {
       const updated: Schedule = { ...editSchedule, staffId: schStaffId, staffName: memberName, date: schDate, startTime: schStart, endTime: schEnd, type: schType };
       persistSchedules(schedules.map(sc => sc.id === editSchedule.id ? updated : sc));
-      pushActivity("System", `Updated schedule for ${memberName} on ${schDate}`);
+      // Phase 9C: Log staffId only (PII-safe)
+      pushActivity("System", `Updated schedule for staff ${schStaffId} on ${schDate}`);
       showFeedback(`Schedule updated for ${memberName}.`);
     } else {
       const newSch: Schedule = { id: `SCH-${Date.now()}`, staffId: schStaffId, staffName: memberName, date: schDate, startTime: schStart, endTime: schEnd, type: schType, status: "scheduled" };
       persistSchedules([...schedules, newSch]);
-      pushActivity("System", `Added ${schType} schedule for ${memberName} on ${schDate}`);
+      // Phase 9C: Log staffId only (PII-safe)
+      pushActivity("System", `Added ${schType} schedule for staff ${schStaffId} on ${schDate}`);
       showFeedback(`Schedule added for ${memberName}.`);
     }
     closeScheduleModal();
   };
 
   const handleDeleteSchedule = (sch: Schedule) => {
-    if (!window.confirm(`Delete schedule for ${sch.staffName} on ${sch.date}?`)) return;
-    persistSchedules(schedules.filter(s => s.id !== sch.id));
-    pushActivity("System", `Deleted schedule for ${sch.staffName} on ${sch.date}`);
-    showFeedback(`Schedule deleted.`, "info");
+    if (!canManageStaffSchedule) {
+      handleDeniedAccess("delete", "staff schedule");
+      return;
+    }
+    setConfirmModal({
+      title: "Delete Schedule?",
+      message: `Delete schedule for ${sch.staffName} on ${sch.date}?`,
+      onConfirm: () => {
+        persistSchedules(schedules.filter(s => s.id !== sch.id));
+        // Phase 9C: Log staffId only (PII-safe)
+        pushActivity("System", `Deleted schedule for staff ${sch.staffId} on ${sch.date}`);
+        showFeedback(`Schedule deleted.`, "info");
+        setConfirmModal(null);
+      },
+      isDanger: true,
+    });
   };
 
   const handleScheduleStatus = (sch: Schedule, newStatus: Schedule["status"]) => {
+    if (!canManageStaffSchedule) {
+      handleDeniedAccess("change status", "staff schedule");
+      return;
+    }
     const updated = schedules.map(s => s.id === sch.id ? { ...s, status: newStatus } : s);
     persistSchedules(updated);
-    pushActivity("System", `Marked ${sch.staffName}'s schedule on ${sch.date} as ${newStatus}`);
+    // Phase 9C: Log staffId only (PII-safe)
+    pushActivity("System", `Marked schedule for staff ${sch.staffId} on ${sch.date} as ${newStatus}`);
     showFeedback(`Schedule marked as ${newStatus}.`);
   };
 
   // ── bulk actions ──────────────────────────────────────────────────────────
   const handleBulkDeactivate = () => {
+    if (!canDeactivateStaff) {
+      handleDeniedAccess("bulk deactivate", "staff members");
+      return;
+    }
     const targets = staff.filter(s => selectedIds.has(s.id) && s.status === "active");
     if (targets.length === 0) { showFeedback("No active staff selected.", "info"); return; }
     const adminTargets = targets.filter(s => isLastActiveAdmin(s));
     if (adminTargets.length > 0) { showFeedback("At least one active admin is required.", "error"); return; }
-    if (!window.confirm(`Deactivate ${targets.length} staff member(s)?`)) return;
-    persistStaff(staff.map(s => selectedIds.has(s.id) && s.status === "active" ? { ...s, status: "inactive" } : s));
-    pushActivity("System", `Bulk deactivated ${targets.length} staff member(s)`);
-    showFeedback(`Deactivated ${targets.length} staff member(s).`);
-    setSelectedIds(new Set());
+    setConfirmModal({
+      title: "Deactivate Staff?",
+      message: `Deactivate ${targets.length} staff member(s)?`,
+      onConfirm: () => {
+        persistStaff(staff.map(s => selectedIds.has(s.id) && s.status === "active" ? { ...s, status: "inactive" } : s));
+        // Phase 9C: Log count only (PII-safe)
+        pushActivity("System", `Bulk deactivated ${targets.length} staff member(s)`);
+        showFeedback(`Deactivated ${targets.length} staff member(s).`);
+        setSelectedIds(new Set());
+        setConfirmModal(null);
+      },
+      isDanger: true,
+    });
   };
   const handleBulkReactivate = () => {
+    if (!canDeactivateStaff) {
+      handleDeniedAccess("bulk reactivate", "staff members");
+      return;
+    }
     const targets = staff.filter(s => selectedIds.has(s.id) && s.status === "inactive");
     if (targets.length === 0) { showFeedback("No inactive staff selected.", "info"); return; }
-    if (!window.confirm(`Reactivate ${targets.length} staff member(s)?`)) return;
-    persistStaff(staff.map(s => selectedIds.has(s.id) && s.status === "inactive" ? { ...s, status: "active" } : s));
-    pushActivity("System", `Bulk reactivated ${targets.length} staff member(s)`);
-    showFeedback(`Reactivated ${targets.length} staff member(s).`);
-    setSelectedIds(new Set());
+    setConfirmModal({
+      title: "Reactivate Staff?",
+      message: `Reactivate ${targets.length} staff member(s)?`,
+      onConfirm: () => {
+        persistStaff(staff.map(s => selectedIds.has(s.id) && s.status === "inactive" ? { ...s, status: "active" } : s));
+        // Phase 9C: Log count only (PII-safe)
+        pushActivity("System", `Bulk reactivated ${targets.length} staff member(s)`);
+        showFeedback(`Reactivated ${targets.length} staff member(s).`);
+        setSelectedIds(new Set());
+        setConfirmModal(null);
+      },
+      isDanger: false,
+    });
   };
   const handleBulkExport = () => {
+    if (!canExportStaff) {
+      handleDeniedAccess("bulk export", "staff members");
+      return;
+    }
     const targets = staff.filter(s => selectedIds.has(s.id));
     if (targets.length === 0) { showFeedback("No staff selected.", "info"); return; }
-    const h = "ID,Name,Role,Department,Email,Phone,Status,Join Date,Permission Count\n";
-    const rows = targets.map(s => [s.id, `"${s.name}"`, s.role, `"${s.department}"`, s.email, s.phone, s.status, s.joinDate, s.permissions.includes("all") ? "all" : s.permissions.length].join(",")).join("\n");
+    // Phase 9C: Remove PII from bulk staff export (PII-safe)
+    const h = "ID,Role,Department,Status,Join Date,Permission Count\n";
+    const rows = targets.map(s => [s.id, s.role, `"${s.department}"`, s.status, s.joinDate, s.permissions.includes("all") ? "all" : s.permissions.length].join(",")).join("\n");
     const blob = new Blob([h + rows], { type: "text/csv" });
     const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "staff-selected.csv"; a.click();
     showFeedback(`Exported ${targets.length} staff member(s).`);
@@ -370,25 +619,97 @@ export default function StaffPage() {
 
   // ── import staff JSON ─────────────────────────────────────────────────────
   const handleImportJSON = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!canCreateStaff) {
+      handleDeniedAccess("import", "staff members");
+      return;
+    }
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
         const raw = JSON.parse(ev.target?.result as string);
+        
+        // Phase 9C: Validate JSON structure before import
+        if (typeof raw !== "object" || raw === null) {
+          showFeedback("Invalid JSON: not a valid JSON object.", "error");
+          return;
+        }
+        
         const incoming: StaffMember[] = Array.isArray(raw) ? raw : (raw.staff ?? []);
-        if (!Array.isArray(incoming)) { showFeedback("Invalid JSON: expected array or {staff:[...]}", "error"); return; }
-        let imported = 0; let skipped = 0;
-        const next = [...staff];
+        if (!Array.isArray(incoming)) { 
+          showFeedback("Invalid JSON: expected array or {staff:[...]}", "error"); 
+          return; 
+        }
+        
+        // Phase 9C: Validate each staff record structure
+        const validRoles: StaffMember["role"][] = ["admin", "doctor", "nurse", "receptionist", "billing", "auditor", "readonly"];
+        const validStatuses: StaffMember["status"][] = ["active", "inactive"];
+        let validCount = 0;
+        let invalidCount = 0;
+        let createCount = 0;
+        let updateCount = 0;
+        
         incoming.forEach((m: Partial<StaffMember>) => {
-          if (!m.name || !m.email || !m.role) { skipped++; return; }
-          const exists = next.findIndex(s => s.id === m.id || s.email === m.email);
-          if (exists >= 0) { next[exists] = { ...next[exists], ...m } as StaffMember; imported++; }
-          else { next.push({ id: m.id || `STF-${Date.now()}-${imported}`, name: m.name, email: m.email, role: m.role as StaffMember["role"], phone: m.phone || "", department: m.department || "", status: m.status || "active", joinDate: m.joinDate || new Date().toISOString().split("T")[0], permissions: m.permissions || [] }); imported++; }
+          if (!m.name || !m.email || !m.role) {
+            invalidCount++;
+            return;
+          }
+          if (!validRoles.includes(m.role as StaffMember["role"])) {
+            invalidCount++;
+            return;
+          }
+          if (m.status && !validStatuses.includes(m.status as StaffMember["status"])) {
+            invalidCount++;
+            return;
+          }
+          validCount++;
+          
+          const exists = staff.findIndex(s => s.id === m.id || s.email === m.email);
+          if (exists >= 0) {
+            updateCount++;
+          } else {
+            createCount++;
+          }
         });
-        persistStaff(next);
-        pushActivity("System", `Imported ${imported} staff member(s) (${skipped} skipped)`);
-        showFeedback(`Imported ${imported}, skipped ${skipped}.`);
+        
+        if (validCount === 0) {
+          showFeedback("No valid staff records found in import.", "error");
+          return;
+        }
+        
+        // Phase 9C: Show preview summary before import
+        const summary = `${validCount} valid records (${createCount} new, ${updateCount} updates)${invalidCount > 0 ? `, ${invalidCount} invalid skipped` : ""}`;
+        
+        // Phase 9C: Check if import would remove all active admins
+        const activeAdminsAfterImport = staff.filter(s => s.role === "admin" && s.status === "active").length;
+        const incomingAdmins = incoming.filter((m: Partial<StaffMember>) => m.role === "admin" && m.status === "active").length;
+        const wouldRemoveAllAdmins = activeAdminsAfterImport > 0 && incomingAdmins === 0 && incoming.length > 0;
+        
+        if (wouldRemoveAllAdmins) {
+          showFeedback("Import would remove all active admins. At least one active admin must remain.", "error");
+          return;
+        }
+        
+        setConfirmModal({
+          title: "Import Staff Data?",
+          message: `This will import: ${summary}. Continue?`,
+          onConfirm: () => {
+            let imported = 0; let skipped = 0;
+            const next = [...staff];
+            incoming.forEach((m: Partial<StaffMember>) => {
+              if (!m.name || !m.email || !m.role) { skipped++; return; }
+              const exists = next.findIndex(s => s.id === m.id || s.email === m.email);
+              if (exists >= 0) { next[exists] = { ...next[exists], ...m } as StaffMember; imported++; }
+              else { next.push({ id: m.id || `STF-${Date.now()}-${imported}`, name: m.name, email: m.email, role: m.role as StaffMember["role"], phone: m.phone || "", department: m.department || "", status: m.status || "active", joinDate: m.joinDate || new Date().toISOString().split("T")[0], permissions: m.permissions || [] }); imported++; }
+            });
+            persistStaff(next);
+            pushActivity("System", `Imported ${imported} staff member(s) (${skipped} skipped)`);
+            showFeedback(`Imported ${imported}, skipped ${skipped}.`);
+            setConfirmModal(null);
+          },
+          isDanger: false,
+        });
       } catch { showFeedback("Failed to parse JSON file.", "error"); }
       if (importInputRef.current) importInputRef.current.value = "";
     };
@@ -397,36 +718,90 @@ export default function StaffPage() {
 
   // ── reset demo staff ──────────────────────────────────────────────────────
   const handleResetDemoStaff = () => {
-    if (!window.confirm("Restore default demo staff? This will overwrite current staff data.")) return;
-    persistStaff(DEFAULT_STAFF);
-    pushActivity("System", "Reset staff to demo defaults");
-    showFeedback("Demo staff restored.");
+    if (!canResetDemoStaff) {
+      handleDeniedAccess("reset", "demo staff");
+      return;
+    }
+    // Phase 9C: Check if reset would leave at least one active admin
+    const activeAdminsInDefault = DEFAULT_STAFF.filter(s => s.role === "admin" && s.status === "active").length;
+    if (activeAdminsInDefault === 0) {
+      showFeedback("Default staff configuration has no active admins. Reset blocked.", "error");
+      return;
+    }
+    
+    // Phase 9C: Require typed confirmation for reset demo staff
+    setTypedConfirm({
+      requiredText: "RESET STAFF",
+      onConfirm: () => {
+        persistStaff(DEFAULT_STAFF);
+        // Phase 9C: Log count only (PII-safe)
+        pushActivity("System", `Reset staff to demo defaults (${DEFAULT_STAFF.length} staff members)`);
+        showFeedback("Demo staff restored.");
+        setTypedConfirm(null);
+        setTypedValue("");
+      },
+    });
   };
 
   // ── export helpers ─────────────────────────────────────────────────────────
   const exportStaffCSV = () => {
+    if (!canExportStaff) {
+      handleDeniedAccess("export", "staff members");
+      return;
+    }
     if (staff.length === 0) { showFeedback("No staff to export.", "info"); return; }
-    const h = "ID,Name,Role,Email,Phone,Department,Status,Join Date,Permission Count\n";
-    const rows = staff.map(s => [s.id, `"${s.name}"`, s.role, s.email, s.phone, `"${s.department}"`, s.status, s.joinDate, s.permissions.includes("all") ? "all" : s.permissions.length].join(",")).join("\n");
+    // Phase 9C: Remove PII from staff CSV export (PII-safe)
+    const h = "ID,Role,Department,Status,Join Date,Permission Count\n";
+    const rows = staff.map(s => [s.id, s.role, `"${s.department}"`, s.status, s.joinDate, s.permissions.includes("all") ? "all" : s.permissions.length].join(",")).join("\n");
     const blob = new Blob([h + rows], { type: "text/csv" });
     const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "staff.csv"; a.click();
     showFeedback(`Exported ${staff.length} staff member(s).`);
   };
   const exportScheduleCSV = () => {
+    if (!canExportStaff) {
+      handleDeniedAccess("export", "staff schedules");
+      return;
+    }
     if (schedules.length === 0) { showFeedback("No schedules to export.", "info"); return; }
-    const h = "ID,Staff Name,Date,Start,End,Type,Status\n";
-    const rows = schedules.map(s => [s.id, `"${s.staffName}"`, s.date, s.startTime, s.endTime, s.type, s.status].join(",")).join("\n");
+    // Phase 9C: Remove staff name from schedule CSV export (PII-safe)
+    const h = "ID,Staff ID,Date,Start,End,Type,Status\n";
+    const rows = schedules.map(s => [s.id, s.staffId, s.date, s.startTime, s.endTime, s.type, s.status].join(",")).join("\n");
     const blob = new Blob([h + rows], { type: "text/csv" });
     const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "schedules.csv"; a.click();
     showFeedback(`Exported ${schedules.length} schedule(s).`);
   };
   const exportActivityCSV = () => {
+    if (!canExportStaff) {
+      handleDeniedAccess("export", "staff activity");
+      return;
+    }
     if (activity.length === 0) { showFeedback("No activity to export.", "info"); return; }
-    const h = "ID,User,Action,Time\n";
-    const rows = activity.map(a => [a.id, `"${a.user}"`, `"${a.action.replace(/"/g, '""')}"`, a.time].join(",")).join("\n");
+    // Phase 9C: Remove staff names from activity CSV export (PII-safe)
+    const h = "ID,Action,Time\n";
+    const rows = activity.map(a => [a.id, `"${a.action.replace(/"/g, '""')}"`, a.time].join(",")).join("\n");
     const blob = new Blob([h + rows], { type: "text/csv" });
     const a2 = document.createElement("a"); a2.href = URL.createObjectURL(blob); a2.download = "activity-log.csv"; a2.click();
     showFeedback(`Exported ${activity.length} activity entr${activity.length === 1 ? "y" : "ies"}.`);
+  };
+
+  const handleClearActivity = () => {
+    if (!canClearStaffActivity) {
+      handleDeniedAccess("clear", "staff activity");
+      return;
+    }
+    // Phase 9C: Require typed confirmation for clearing staff activity
+    setTypedConfirm({
+      requiredText: "CLEAR STAFF ACTIVITY",
+      onConfirm: () => {
+        const count = activity.length;
+        persistActivity([]);
+        // Phase 9C: Log count only (PII-safe)
+        pushActivity("System", `Cleared ${count} staff activity entr${count === 1 ? "y" : "ies"}`);
+        showFeedback("Activity cleared.", "info");
+        setTypedConfirm(null);
+        setTypedValue("");
+      },
+    });
   };
 
   // ── Escape key ─────────────────────────────────────────────────────────────
@@ -457,21 +832,31 @@ export default function StaffPage() {
   });
 
   return (
-    <div style={{ padding: 24, maxWidth: 1400 }}>
+    <div style={{ padding: 24, width: "100%", boxSizing: "border-box" }}>
+      {feedback && (
+        <div style={{ position: "fixed", bottom: 24, right: 24, zIndex: 2000, ...feedbackStyle(feedback.type), boxShadow: "0 4px 16px rgba(0,0,0,0.15)", display: "flex", alignItems: "center", gap: 10 }}>
+          <i className={`ti ${feedback.type === "success" ? "ti-circle-check" : feedback.type === "error" ? "ti-alert-circle" : "ti-info-circle"}`} />
+          {feedback.message}
+          <button onClick={() => setFeedback(null)} style={{ background: "none", border: "none", cursor: "pointer", padding: 0, marginLeft: 4, color: "inherit", opacity: 0.7, fontSize: 14 }}>
+            <i className="ti ti-x" />
+          </button>
+        </div>
+      )}
       <div style={{ marginBottom: 24, display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
         <div>
           <h1 style={{ fontSize: "var(--font-xl)", fontWeight: 800, margin: 0, marginBottom: 8 }}>Staff & Roles</h1>
-          <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>Doctors, receptionist, permissions, schedules, activity tracking</div>
+          <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)" }}>Doctors, receptionists, nurses, permissions, schedules, activity tracking</div>
         </div>
-        {feedback && <div style={feedbackStyle(feedback.type)}>{feedback.message}</div>}
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12, marginBottom: 24 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12, marginBottom: 24 }}>
         <StatCard label="Total Staff" value={staff.length} color="var(--accent)" icon="ti-users" bg="var(--accent-soft)" />
         <StatCard label="Doctors" value={doctors.length} color="var(--blue)" icon="ti-stethoscope" bg="var(--blue-bg)" />
-        <StatCard label="Receptionists" value={receptionists.length} color="var(--green)" icon="ti-user-shield" bg="var(--green-bg)" />
         <StatCard label="Nurses" value={nurses.length} color="var(--amber)" icon="ti-heart-pulse" bg="var(--amber-bg)" />
+        <StatCard label="Receptionists" value={receptionists.length} color="var(--green)" icon="ti-user-shield" bg="var(--green-bg)" />
+        <StatCard label="Admins" value={admins.length} color="var(--purple)" icon="ti-shield-lock" bg="var(--purple-bg)" />
         <StatCard label="Active" value={staff.filter(s => s.status === "active").length} color="var(--green)" icon="ti-check" bg="var(--green-bg)" />
+        <StatCard label="Inactive" value={staff.filter(s => s.status === "inactive").length} color="var(--red)" icon="ti-user-off" bg="var(--red-bg)" />
       </div>
 
       {/* Tab Navigation */}
@@ -484,25 +869,11 @@ export default function StaffPage() {
         </div>
       </div>
 
-      {/* Department Summary */}
+      {/* Staff Tab — two-column layout */}
       {activeTab === "staff" && (
-        <div className="card card-padded" style={{ marginBottom: 16 }}>
-          <div className="section-label" style={{ marginBottom: 10 }}>
-            <i className="ti ti-building" style={{ marginRight: 4 }} />Department Summary
-          </div>
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            {deptSummary.map(([dept, counts]) => (
-              <div key={dept} style={{ padding: "8px 12px", background: "var(--surface2)", borderRadius: "var(--radius)", minWidth: 130 }}>
-                <div style={{ fontSize: "var(--font-xs)", fontWeight: 600 }}>{dept}</div>
-                <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{counts.active} active / {counts.total} total</div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {activeTab === "staff" && (
-        <>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 320px", gap: 16, alignItems: "start" }}>
+          {/* ── Main column: filters + table ── */}
+          <div>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
               {(["all","doctor","receptionist","nurse","admin","active","inactive"] as StaffFilter[]).map(f => (
@@ -512,31 +883,47 @@ export default function StaffPage() {
               ))}
             </div>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              <button className="btn btn-ghost" onClick={exportStaffCSV} title="Export staff as CSV">
-                <i className="ti ti-download" style={{ fontSize: 13, marginRight: 4 }} />Export CSV
-              </button>
-              <button className="btn btn-ghost" onClick={() => importInputRef.current?.click()} title="Import staff from JSON">
-                <i className="ti ti-upload" style={{ fontSize: 13, marginRight: 4 }} />Import JSON
-              </button>
-              <input ref={importInputRef} type="file" accept="application/json" style={{ display: "none" }} onChange={handleImportJSON} />
-              <button className="btn btn-ghost" onClick={handleResetDemoStaff} title="Restore default demo staff">
-                <i className="ti ti-refresh" style={{ fontSize: 13, marginRight: 4 }} />Reset Demo Staff
-              </button>
-              <button className="btn btn-primary" onClick={openAddModal}>
-                <i className="ti ti-plus" style={{ fontSize: 14, marginRight: 4 }} />Add Staff Member
-              </button>
+              {canExportStaff && (
+                <button className="btn btn-ghost" onClick={exportStaffCSV} title="Export staff as CSV">
+                  <i className="ti ti-download" style={{ fontSize: 13, marginRight: 4 }} />Export CSV
+                </button>
+              )}
+              {canCreateStaff && (
+                <>
+                  <button className="btn btn-ghost" onClick={() => importInputRef.current?.click()} title="Import staff from JSON">
+                    <i className="ti ti-upload" style={{ fontSize: 13, marginRight: 4 }} />Import JSON
+                  </button>
+                  <input ref={importInputRef} type="file" accept="application/json" style={{ display: "none" }} onChange={handleImportJSON} />
+                </>
+              )}
+              {canResetDemoStaff && (
+                <button className="btn btn-ghost" onClick={handleResetDemoStaff} title="Restore default demo staff">
+                  <i className="ti ti-refresh" style={{ fontSize: 13, marginRight: 4 }} />Reset Demo
+                </button>
+              )}
+              {canCreateStaff && (
+                <button className="btn btn-primary" onClick={openAddModal}>
+                  <i className="ti ti-plus" style={{ fontSize: 14, marginRight: 4 }} />Add Staff Member
+                </button>
+              )}
             </div>
           </div>
 
           {/* Search */}
-          <div style={{ marginBottom: 12 }}>
+          <div style={{ marginBottom: 12, position: "relative" }}>
+            <i className="ti ti-search" style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--muted)", fontSize: 14, pointerEvents: "none" }} />
             <input
               type="text"
               placeholder="Search by name, role, email, phone, department..."
               value={staffSearch}
               onChange={e => setStaffSearch(e.target.value)}
-              style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)", boxSizing: "border-box" }}
+              style={{ width: "100%", padding: "8px 12px 8px 32px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)", boxSizing: "border-box", paddingRight: staffSearch ? 32 : 12 }}
             />
+            {staffSearch && (
+              <button onClick={() => setStaffSearch("")} style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", cursor: "pointer", color: "var(--muted)", fontSize: 14, padding: 0 }}>
+                <i className="ti ti-x" />
+              </button>
+            )}
           </div>
 
           {/* Bulk action bar */}
@@ -544,9 +931,15 @@ export default function StaffPage() {
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8, marginBottom: 12, padding: "8px 14px", background: "var(--accent-soft)", borderRadius: "var(--radius)", border: "1px solid var(--border)" }}>
               <span style={{ fontSize: "var(--font-sm)", fontWeight: 600, color: "var(--accent)" }}>{selectedIds.size} selected</span>
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={handleBulkDeactivate}>Deactivate Selected</button>
-                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={handleBulkReactivate}>Reactivate Selected</button>
-                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={handleBulkExport}>Export Selected CSV</button>
+                {canDeactivateStaff && (
+                  <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={handleBulkDeactivate}>Deactivate Selected</button>
+                )}
+                {canDeactivateStaff && (
+                  <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={handleBulkReactivate}>Reactivate Selected</button>
+                )}
+                {canExportStaff && (
+                  <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={handleBulkExport}>Export Selected CSV</button>
+                )}
                 <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => setSelectedIds(new Set())}>Clear Selection</button>
               </div>
             </div>
@@ -616,11 +1009,20 @@ export default function StaffPage() {
                     <td>
                       <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                         <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => { setViewStaff(s); setViewTab("overview"); }}>View</button>
-                        <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => openEditModal(s)}>Edit</button>
-                        <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: s.status === "active" ? "var(--red)" : "var(--green)" }}
-                          onClick={() => handleToggleStatus(s)}>
-                          {s.status === "active" ? "Deactivate" : "Reactivate"}
-                        </button>
+                        {canEditStaff && (
+                          <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => openEditModal(s)}>Edit</button>
+                        )}
+                        {canDeactivateStaff && (
+                          <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: s.status === "active" ? "var(--red)" : "var(--green)" }}
+                            onClick={() => handleToggleStatus(s)}>
+                            {s.status === "active" ? "Deactivate" : "Reactivate"}
+                          </button>
+                        )}
+                        {canDeleteStaff && (
+                          <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--red)" }} onClick={() => handleDeleteStaff(s)} title="Delete staff member">
+                            <i className="ti ti-trash" style={{ fontSize: 12 }} />
+                          </button>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -628,7 +1030,71 @@ export default function StaffPage() {
               </tbody>
             </table>
           </div>
-        </>
+          </div>
+
+          {/* ── Sidebar ── */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            {/* Department Summary */}
+            <div className="card card-padded">
+              <div className="section-label" style={{ marginBottom: 10 }}>
+                <i className="ti ti-building" style={{ marginRight: 4 }} />Departments
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {deptSummary.map(([dept, counts]) => (
+                  <div key={dept} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 10px", background: "var(--surface2)", borderRadius: "var(--radius)" }}>
+                    <div style={{ fontSize: "var(--font-xs)", fontWeight: 600 }}>{dept}</div>
+                    <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>
+                      <span style={{ color: "var(--green)", fontWeight: 600 }}>{counts.active}</span>/{counts.total}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Recent Activity */}
+            <div className="card card-padded">
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                <div className="section-label" style={{ margin: 0 }}>
+                  <i className="ti ti-activity" style={{ marginRight: 4 }} />Recent Activity
+                </div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {canExportStaff && (
+                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={exportActivityCSV} title="Export CSV">
+                      <i className="ti ti-download" style={{ fontSize: 11 }} />
+                    </button>
+                  )}
+                  {canClearStaffActivity && (
+                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--red)" }} title="Clear activity"
+                      onClick={handleClearActivity}>
+                      <i className="ti ti-trash" style={{ fontSize: 11 }} />
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {activity.length === 0 ? (
+                  <div style={{ textAlign: "center", padding: 16, color: "var(--muted)", fontSize: "var(--font-xs)" }}>No activity yet.</div>
+                ) : (activity.slice(0, showAllActivity ? activity.length : 12)).map(a => (
+                  <div key={a.id} style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "6px 0", borderBottom: "1px solid var(--border)" }}>
+                    <div style={{ width: 28, height: 28, borderRadius: "50%", background: "var(--accent-soft)", color: "var(--accent)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, flexShrink: 0 }}>
+                      {a.user.split(" ").map((n: string) => n[0]).join("").slice(0, 2)}
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: "var(--font-xs)", fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{a.user}</div>
+                      <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{a.action}</div>
+                      <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", opacity: 0.7 }}>{fmtRelative(a.time)}</div>
+                    </div>
+                  </div>
+                ))}
+                {activity.length > 12 && (
+                  <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", alignSelf: "center", marginTop: 4 }} onClick={() => setShowAllActivity(p => !p)}>
+                    {showAllActivity ? "Show less" : `+${activity.length - 12} more`}
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
       )}
 
       {activeTab === "schedule" && (
@@ -642,12 +1108,16 @@ export default function StaffPage() {
                 <button onClick={() => setScheduleView("list")} style={{ padding: "6px 12px", fontSize: "var(--font-xs)", border: "none", cursor: "pointer", background: scheduleView === "list" ? "var(--accent-soft)" : "transparent", color: scheduleView === "list" ? "var(--accent)" : "var(--muted)", fontWeight: scheduleView === "list" ? 600 : 400 }}>List</button>
                 <button onClick={() => setScheduleView("week")} style={{ padding: "6px 12px", fontSize: "var(--font-xs)", border: "none", cursor: "pointer", background: scheduleView === "week" ? "var(--accent-soft)" : "transparent", color: scheduleView === "week" ? "var(--accent)" : "var(--muted)", fontWeight: scheduleView === "week" ? 600 : 400 }}>Week</button>
               </div>
-              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={exportScheduleCSV}>
-                <i className="ti ti-download" style={{ fontSize: 12, marginRight: 4 }} />Export CSV
-              </button>
-              <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)" }} onClick={() => openScheduleModal()}>
-                <i className="ti ti-plus" style={{ fontSize: 12, marginRight: 4 }} />Add Schedule
-              </button>
+              {canManageStaffSchedule && (
+                <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)" }} onClick={() => openScheduleModal()}>
+                  <i className="ti ti-plus" style={{ fontSize: 12, marginRight: 4 }} />Add Schedule
+                </button>
+              )}
+              {canExportStaff && (
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={exportScheduleCSV}>
+                  <i className="ti ti-download" style={{ fontSize: 12, marginRight: 4 }} />Export CSV
+                </button>
+              )}
             </div>
           </div>
 
@@ -698,8 +1168,12 @@ export default function StaffPage() {
                           {sch.status === "cancelled" && (
                             <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleScheduleStatus(sch, "scheduled")}>Restore</button>
                           )}
-                          <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => openScheduleModal(sch)}>Edit</button>
-                          <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--red)" }} onClick={() => handleDeleteSchedule(sch)}>Delete</button>
+                          {canManageStaffSchedule && (
+                            <>
+                              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => openScheduleModal(sch)}>Edit</button>
+                              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--red)" }} onClick={() => handleDeleteSchedule(sch)}>Delete</button>
+                            </>
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -760,35 +1234,41 @@ export default function StaffPage() {
           <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginBottom: 12 }}>
             Derived from logged schedules and activity. No fabricated figures.
           </div>
-          {doctors.length === 0 ? (
-            <div style={{ textAlign: "center", padding: 32, color: "var(--muted)" }}>No doctors on staff.</div>
+          {staff.length === 0 ? (
+            <div style={{ textAlign: "center", padding: 32, color: "var(--muted)" }}>No staff on record.</div>
           ) : (
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 12 }}>
-              {doctors.map(doc => {
-                const docSchedules = schedules.filter(s => s.staffId === doc.id);
-                const totalShifts = docSchedules.length;
-                const completed = docSchedules.filter(s => s.status === "completed").length;
-                const cancelled = docSchedules.filter(s => s.status === "cancelled").length;
-                const scheduledUpcoming = docSchedules.filter(s => s.status === "scheduled").length;
-                const completedConsultations = docSchedules.filter(s => s.type === "consultation" && s.status === "completed").length;
-                const surgeries = docSchedules.filter(s => s.type === "surgery").length;
-                const estimatedPatients = completedConsultations * 4;
+              {staff.map(member => {
+                const memberSchedules = schedules.filter(s => s.staffId === member.id);
+                const totalShifts = memberSchedules.length;
+                const completed = memberSchedules.filter(s => s.status === "completed").length;
+                const cancelled = memberSchedules.filter(s => s.status === "cancelled").length;
+                const scheduledUpcoming = memberSchedules.filter(s => s.status === "scheduled").length;
+                const completedConsultations = memberSchedules.filter(s => s.type === "consultation" && s.status === "completed").length;
+                const surgeries = memberSchedules.filter(s => s.type === "surgery").length;
+                const activityCount = activity.filter(a => a.user === member.name).length;
+                const roleColor = member.role === "doctor" ? "var(--blue)" : member.role === "nurse" ? "var(--amber)" : member.role === "receptionist" ? "var(--green)" : "var(--accent)";
                 return (
-                  <div key={doc.id} style={{ padding: 16, background: "var(--surface2)", borderRadius: "var(--radius)", border: "1px solid var(--border)" }}>
-                    <div style={{ fontSize: "var(--font-sm)", fontWeight: 700, marginBottom: 4 }}>{doc.name}</div>
-                    <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginBottom: 12 }}>{doc.department} · {doc.status === "active" ? "Active" : "Inactive"}</div>
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  <div key={member.id} style={{ padding: 16, background: "var(--surface2)", borderRadius: "var(--radius)", border: "1px solid var(--border)" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+                      <div style={{ width: 32, height: 32, borderRadius: "50%", background: "var(--surface3)", color: roleColor, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 800, flexShrink: 0 }}>
+                        {member.name.split(" ").map(n => n[0]).join("").slice(0, 2)}
+                      </div>
+                      <div>
+                        <div style={{ fontSize: "var(--font-sm)", fontWeight: 700 }}>{member.name}</div>
+                        <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{member.department} · <span style={{ color: roleColor, fontWeight: 600 }}>{member.role}</span> · {member.status === "active" ? <span style={{ color: "var(--green)" }}>Active</span> : <span style={{ color: "var(--red)" }}>Inactive</span>}</div>
+                      </div>
+                    </div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 12 }}>
                       <MetricCard label="Total Shifts" value={totalShifts > 0 ? String(totalShifts) : "—"} color="var(--purple)" />
                       <MetricCard label="Completed" value={completed > 0 ? String(completed) : "—"} color="var(--green)" />
                       <MetricCard label="Cancelled" value={cancelled > 0 ? String(cancelled) : "—"} color="var(--red)" />
                       <MetricCard label="Upcoming" value={scheduledUpcoming > 0 ? String(scheduledUpcoming) : "—"} color="var(--blue)" />
-                      <MetricCard label="Surgeries" value={surgeries > 0 ? String(surgeries) : "—"} color="var(--amber)" />
-                      <MetricCard label="Est. Patients Seen" value={estimatedPatients > 0 ? String(estimatedPatients) : "—"} color="var(--blue)" />
+                      {(member.role === "doctor") && <MetricCard label="Surgeries" value={surgeries > 0 ? String(surgeries) : "—"} color="var(--amber)" />}
+                      {(member.role === "doctor") && <MetricCard label="Est. Patients" value={completedConsultations > 0 ? String(completedConsultations * 4) : "—"} color="var(--blue)" />}
+                      <MetricCard label="Activity Entries" value={activityCount > 0 ? String(activityCount) : "—"} color="var(--muted)" />
                     </div>
-                    <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginTop: 8, fontStyle: "italic" }}>
-                      Est. patients seen = completed consultation shifts × 4 (demo estimate).
-                    </div>
-                    {totalShifts === 0 && <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginTop: 8, textAlign: "center" }}>No schedules added yet.</div>}
+                    {totalShifts === 0 && <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginTop: 8, textAlign: "center" }}>No schedules recorded yet.</div>}
                   </div>
                 );
               })}
@@ -798,27 +1278,10 @@ export default function StaffPage() {
       )}
 
       {activeTab === "permissions" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 16, marginBottom: 24 }}>
-          <div className="card card-padded">
-            <div className="section-label" style={{ marginBottom: 8 }}>Permission Summary by Role</div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 8, marginBottom: 16 }}>
-              {(["doctor","receptionist","nurse","admin"] as StaffMember["role"][]).map(role => {
-                const count = staff.filter(s => s.role === role).reduce((acc, s) => Math.max(acc, s.permissions.length), 0);
-                return (
-                  <div key={role} style={{ padding: 10, background: "var(--surface2)", borderRadius: "var(--radius)", textAlign: "center" }}>
-                    <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginBottom: 4 }}>{role.charAt(0).toUpperCase() + role.slice(1)}</div>
-                    <div style={{ fontSize: "var(--font-md)", fontWeight: 700, color: role === "admin" ? "var(--accent)" : "var(--text)" }}>
-                      {role === "admin" ? "All" : `${count}`}
-                    </div>
-                    <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{role === "admin" ? "full access" : "permissions"}</div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 280px", gap: 16, alignItems: "start", marginBottom: 24 }}>
           <div className="card card-padded">
             <div className="section-label" style={{ marginBottom: 12 }}>
-              <i className="ti ti-lock" style={{ marginRight: 4 }} />Role Permissions
+              <i className="ti ti-lock" style={{ marginRight: 4 }} />Role Permissions Matrix
             </div>
             <div style={{ overflowX: "auto" }}>
               <table className="tbl">
@@ -857,46 +1320,41 @@ export default function StaffPage() {
               Staff permission counts (from their profile): {staff.map(s => `${s.name.split(" ")[0]}: ${s.permissions.includes("all") ? "all" : s.permissions.length}`).join(" · ")}
             </div>
           </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div className="card card-padded">
+              <div className="section-label" style={{ marginBottom: 10 }}>Permission Summary by Role</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {(["doctor","receptionist","nurse","admin"] as StaffMember["role"][]).map(role => {
+                  const count = staff.filter(s => s.role === role).reduce((acc, s) => Math.max(acc, s.permissions.length), 0);
+                  const roleColor = role === "doctor" ? "var(--blue)" : role === "receptionist" ? "var(--green)" : role === "nurse" ? "var(--amber)" : "var(--accent)";
+                  return (
+                    <div key={role} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 12px", background: "var(--surface2)", borderRadius: "var(--radius)" }}>
+                      <span style={{ fontSize: "var(--font-sm)", fontWeight: 600, color: roleColor }}>{role.charAt(0).toUpperCase() + role.slice(1)}</span>
+                      <span style={{ fontSize: "var(--font-sm)", fontWeight: 700 }}>{role === "admin" ? "Full access" : `${count} perms`}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="card card-padded">
+              <div className="section-label" style={{ marginBottom: 10 }}>Staff Member Permissions</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {staff.map(s => (
+                  <div key={s.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid var(--border)", gap: 8 }}>
+                    <div>
+                      <div style={{ fontSize: "var(--font-xs)", fontWeight: 600 }}>{s.name}</div>
+                      <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{s.role}</div>
+                    </div>
+                    <span className="badge" style={{ background: "var(--accent-soft)", color: "var(--accent)", whiteSpace: "nowrap" }}>
+                      {s.permissions.includes("all") ? "All" : `${s.permissions.length}`}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
         </div>
       )}
-
-      {/* Recent Activity */}
-      <div className="card card-padded" style={{ marginTop: 24 }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
-          <div className="section-label" style={{ margin: 0 }}>
-            <i className="ti ti-activity" style={{ marginRight: 4 }} />Recent Activity
-          </div>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={exportActivityCSV}>
-              <i className="ti ti-download" style={{ fontSize: 12, marginRight: 4 }} />Export CSV
-            </button>
-            <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--red)" }}
-              onClick={() => {
-                if (!window.confirm("Clear all activity? This cannot be undone.")) return;
-                persistActivity([]);
-                showFeedback("Activity cleared.", "info");
-              }}>
-              <i className="ti ti-trash" style={{ fontSize: 12, marginRight: 4 }} />Clear Activity
-            </button>
-          </div>
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {activity.length === 0 ? (
-            <div style={{ textAlign: "center", padding: 24, color: "var(--muted)", fontSize: "var(--font-sm)" }}>No activity yet.</div>
-          ) : activity.slice(0, 20).map(a => (
-            <div key={a.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: 12, background: "var(--surface2)", borderRadius: "var(--radius)" }}>
-              <div style={{ width: 36, height: 36, borderRadius: "50%", background: "var(--accent-soft)", color: "var(--accent)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, flexShrink: 0 }}>
-                {a.user.split(" ").map((n: string) => n[0]).join("").slice(0, 2)}
-              </div>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: "var(--font-sm)", fontWeight: 600 }}>{a.user}</div>
-                <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{a.action}</div>
-              </div>
-              <span style={{ fontSize: "var(--font-xs)", color: "var(--muted)", whiteSpace: "nowrap" }}>{fmtRelative(a.time)}</span>
-            </div>
-          ))}
-        </div>
-      </div>
 
       {/* View Staff Modal */}
       {viewStaff && (
@@ -997,13 +1455,24 @@ export default function StaffPage() {
                 )
               )}
             </div>
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", padding: "0 20px 20px" }}>
-              <button className="btn btn-ghost" onClick={() => { setViewStaff(null); openEditModal(viewStaff); }}>Edit</button>
-              <button className="btn btn-ghost" style={{ color: viewStaff.status === "active" ? "var(--red)" : "var(--green)" }}
-                onClick={() => handleToggleStatus(viewStaff)}>
-                {viewStaff.status === "active" ? "Deactivate" : "Reactivate"}
-              </button>
-              <button className="btn btn-primary" onClick={() => setViewStaff(null)}>Close</button>
+            <div style={{ display: "flex", gap: 8, justifyContent: "space-between", padding: "0 20px 20px", flexWrap: "wrap" }}>
+              {canDeleteStaff && (
+                <button className="btn btn-ghost" style={{ color: "var(--red)" }} onClick={() => { setViewStaff(null); handleDeleteStaff(viewStaff); }}>
+                  <i className="ti ti-trash" style={{ fontSize: 12, marginRight: 4 }} />Delete
+                </button>
+              )}
+              <div style={{ display: "flex", gap: 8 }}>
+                {canEditStaff && (
+                  <button className="btn btn-ghost" onClick={() => { setViewStaff(null); openEditModal(viewStaff); }}>Edit</button>
+                )}
+                {canDeactivateStaff && (
+                  <button className="btn btn-ghost" style={{ color: viewStaff.status === "active" ? "var(--red)" : "var(--green)" }}
+                    onClick={() => handleToggleStatus(viewStaff)}>
+                    {viewStaff.status === "active" ? "Deactivate" : "Reactivate"}
+                  </button>
+                )}
+                <button className="btn btn-primary" onClick={() => setViewStaff(null)}>Close</button>
+              </div>
             </div>
           </div>
         </div>
@@ -1057,13 +1526,20 @@ export default function StaffPage() {
                 <input type="text" value={formDept} onChange={e => setFormDept(e.target.value)} placeholder="Enter department..."
                   style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)", boxSizing: "border-box" }} />
               </div>
-              <div style={{ marginBottom: 12 }}>
-                <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Status</label>
-                <select value={formStatus} onChange={e => setFormStatus(e.target.value as "active" | "inactive")}
-                  style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)" }}>
-                  <option value="active">Active</option>
-                  <option value="inactive">Inactive</option>
-                </select>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+                <div>
+                  <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Status</label>
+                  <select value={formStatus} onChange={e => setFormStatus(e.target.value as "active" | "inactive")}
+                    style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)" }}>
+                    <option value="active">Active</option>
+                    <option value="inactive">Inactive</option>
+                  </select>
+                </div>
+                <div>
+                  <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 4, display: "block" }}>Join Date</label>
+                  <input type="date" value={formJoinDate} onChange={e => setFormJoinDate(e.target.value)}
+                    style={{ width: "100%", padding: "8px 12px", borderRadius: "var(--radius)", border: "1px solid var(--border)", fontSize: "var(--font-sm)" }} />
+                </div>
               </div>
               <div style={{ marginBottom: 16 }}>
                 <label style={{ fontSize: "var(--font-sm)", fontWeight: 600, marginBottom: 6, display: "block" }}>Permissions</label>
@@ -1153,6 +1629,128 @@ export default function StaffPage() {
           </div>
         </div>
       )}
+
+      {/* Confirmation Modal */}
+      {confirmModal && (
+        <div style={{
+          position: "fixed",
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          background: "rgba(0, 0, 0, 0.5)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          zIndex: 1000,
+        }}>
+          <div style={{
+            background: "var(--surface)",
+            borderRadius: "var(--radius)",
+            padding: 24,
+            maxWidth: 400,
+            width: "90%",
+            boxShadow: "0 8px 32px rgba(0, 0, 0, 0.2)",
+          }}>
+            <div style={{ fontSize: "var(--font-lg)", fontWeight: 700, marginBottom: 12 }}>
+              {confirmModal.title}
+            </div>
+            <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)", marginBottom: 20 }}>
+              {confirmModal.message}
+            </div>
+            <div style={{ display: "flex", gap: 12, justifyContent: "flex-end" }}>
+              <button
+                className="btn btn-ghost"
+                onClick={() => setConfirmModal(null)}
+                style={{ fontSize: "var(--font-sm)" }}
+              >
+                Cancel
+              </button>
+              <button
+                className={confirmModal.isDanger ? "btn btn-danger" : "btn btn-primary"}
+                onClick={confirmModal.onConfirm}
+                style={{ fontSize: "var(--font-sm)" }}
+              >
+                Confirm
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      
+      {/* Phase 9C: Typed confirmation modal for dangerous actions */}
+      {typedConfirm && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0, 0, 0, 0.5)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+            zIndex: 9999,
+          }}
+          onClick={(e) => { if (e.target === e.currentTarget) { setTypedConfirm(null); setTypedValue(""); } }}
+        >
+          <div
+            style={{
+              background: "var(--surface)",
+              borderRadius: "var(--radius)",
+              padding: 24,
+              maxWidth: 480,
+              width: "100%",
+              boxShadow: "0 8px 32px rgba(0, 0, 0, 0.2)",
+            }}
+          >
+            <div style={{ fontSize: "var(--font-lg)", fontWeight: 700, marginBottom: 12 }}>
+              Confirm Dangerous Action
+            </div>
+            <div style={{ fontSize: "var(--font-sm)", color: "var(--muted)", marginBottom: 16 }}>
+              This action is irreversible. Type <strong>"{typedConfirm.requiredText}"</strong> to confirm.
+            </div>
+            <input
+              type="text"
+              value={typedValue}
+              onChange={(e) => setTypedValue(e.target.value)}
+              placeholder={`Type "${typedConfirm.requiredText}"`}
+              style={{
+                width: "100%",
+                padding: "10px 12px",
+                borderRadius: "var(--radius)",
+                border: "1px solid var(--border)",
+                fontSize: "var(--font-sm)",
+                fontFamily: "monospace",
+                marginBottom: 16,
+                outline: "none",
+              }}
+            />
+            <div style={{ display: "flex", gap: 12, justifyContent: "flex-end" }}>
+              <button
+                className="btn btn-ghost"
+                onClick={() => { setTypedConfirm(null); setTypedValue(""); }}
+                style={{ fontSize: "var(--font-sm)" }}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn btn-danger"
+                onClick={() => {
+                  if (typedValue === typedConfirm.requiredText) {
+                    typedConfirm.onConfirm();
+                  } else {
+                    showFeedback("Confirmation text does not match.", "error");
+                  }
+                }}
+                disabled={typedValue !== typedConfirm.requiredText}
+                style={{ fontSize: "var(--font-sm)", opacity: typedValue === typedConfirm.requiredText ? 1 : 0.5 }}
+              >
+                Confirm
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1235,3 +1833,5 @@ function StatCard({ label, value, color, icon, bg }: {
     </div>
   );
 }
+
+

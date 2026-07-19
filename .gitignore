@@ -25,3 +25,6 @@ dist-ssr
 
 # Rust build output
 /backend/target/
+
+# Backend environment files
+backend/.env

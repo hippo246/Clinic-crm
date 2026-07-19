@@ -1,6 +1,23 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
 import type { Patient } from "./types";
 import { fmtDate } from "./utils";
+import {
+  validateRequired,
+  validateDate,
+  validateNumberRange,
+  validateMaxLength,
+  safeString,
+} from "../shared/validation/validators";
+import { validateInvoiceData } from "../shared/validation/entityValidation";
+import { VALID_INVOICE_STATUSES, VALID_PAYMENT_METHODS } from "../shared/constants/validationConstants";
+import { hasRole, normalizeRole, UserRole } from "../shared/permissions/permissions";
+import { logDeniedAction } from "../shared/services/deniedActionLogger";
+// Phase 8B: Import workflow audit helper and state machine
+import { logWorkflowAction } from "../shared/workflow/workflowAudit";
+import { validateWorkflowTransition, type WorkflowEntityType } from "../shared/workflow/workflowStateMachine";
+// Phase 8C: Import patient validation and handoff helpers
+import { validateWorkflowPatientReference } from "../shared/workflow/workflowValidation";
+import { logSuccessfulHandoff, logBlockedHandoff } from "../shared/workflow/workflowHandoff";
 
 // ─── Responsive styles ────────────────────────────────────────────────────────
 const billingCss = `
@@ -66,7 +83,6 @@ interface BillingActivity {
   timestamp: string;
   action: string;
   patientId?: string;
-  patientName?: string;
   invoiceNumber?: string;
   details?: string;
 }
@@ -112,6 +128,9 @@ const COMMON_SERVICES: { label: string; price: number }[] = [
 const TAX_PRESETS = [0, 5, 12, 18];
 
 export default function BillingPage({ patients, onUpdatePatient, userRole = "admin" }: { patients: Patient[]; onUpdatePatient?: (updated: Patient, action?: string) => void; userRole?: "receptionist" | "doctor" | "admin" }) {
+  // Normalize role to ensure it's a valid UserRole
+  const normalizedRole = normalizeRole(userRole) as UserRole;
+
   const [activeTab, setActiveTab] = useState<"invoices" | "payments" | "insurance">("invoices");
   const [showCreateInvoice, setShowCreateInvoice] = useState(false);
   const [showEditInvoice, setShowEditInvoice] = useState(false);
@@ -170,18 +189,140 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
     setFeedback({ type, message });
   }
 
-  function logActivity(action: string, patientId?: string, patientName?: string, invoiceNumber?: string, details?: string) {
+  // ─── Local Permission Guards (Phase 6F) ─────────────────────────────────────────────
+  const canExportInvoices = hasRole(normalizedRole, ["admin", "billing"]);
+  const canExportPayments = hasRole(normalizedRole, ["admin", "billing"]);
+  const canExportInsurance = hasRole(normalizedRole, ["admin", "billing"]);
+  const canExportBillingActivity = hasRole(normalizedRole, ["admin"]);
+  const canCreateInvoice = hasRole(normalizedRole, ["admin", "billing", "receptionist"]);
+  const canEditInvoice = hasRole(normalizedRole, ["admin", "billing"]);
+  const canDeleteInvoice = hasRole(normalizedRole, ["admin"]);
+  const canRecordPayment = hasRole(normalizedRole, ["admin", "billing", "receptionist"]);
+  const canDeletePayment = hasRole(normalizedRole, ["admin"]);
+  const canManageInsurance = hasRole(normalizedRole, ["admin", "billing"]);
+  const canClearActivity = hasRole(normalizedRole, ["admin"]);
+
+  // ─── Local Denied Helper (Phase 6F) ───────────────────────────────────────────────
+  const handleDeniedAccess = (action: string, resource: string) => {
+    showFeedback(`You do not have permission to ${action} ${resource}.`, "error");
+    logDeniedAction({
+      role: normalizedRole,
+      action,
+      resource,
+      reason: "Insufficient permissions",
+      severity: "medium",
+    });
+  };
+
+  // Phase 8B: Remove patientName from activity log (PHI-safe)
+  function logActivity(action: string, patientId?: string, invoiceNumber?: string, details?: string) {
     const activity: BillingActivity = {
       timestamp: new Date().toISOString(),
       action,
       patientId,
-      patientName,
       invoiceNumber,
       details,
     };
     const next = [activity, ...billingActivity].slice(0, 50);
     setBillingActivity(next);
     writeJSON(BILLING_ACTIVITY_KEY, next);
+  }
+
+  function validateInvoiceDataLocal(invoice: Omit<Invoice, "id" | "invoiceNumber" | "createdAt" | "paymentHistory">): { valid: boolean; errors: string[]; warnings: string[] } {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    // Validate patient
+    const patientError = validateRequired(invoice.patientId, "Patient");
+    if (patientError) errors.push(patientError);
+
+    // Validate invoice date
+    if (!validateDate(new Date().toISOString())) {
+      errors.push("Invalid invoice date.");
+    }
+
+    // Validate due date
+    if (invoice.dueDate && !validateDate(invoice.dueDate)) {
+      errors.push("Invalid due date.");
+    }
+
+    // Validate line items
+    if (!invoice.items || invoice.items.length === 0) {
+      errors.push("At least one line item is required.");
+    } else {
+      const validItems = invoice.items.filter(item => item.description && item.description.trim());
+      if (validItems.length === 0) {
+        errors.push("At least one line item with a description is required.");
+      }
+
+      // Validate each item
+      invoice.items.forEach((item, index) => {
+        if (!item.description || !item.description.trim()) return; // Skip empty items
+
+        if (item.quantity <= 0) {
+          errors.push(`Item ${index + 1}: Quantity must be greater than 0.`);
+        }
+        if (item.unitPrice < 0) {
+          errors.push(`Item ${index + 1}: Unit price cannot be negative.`);
+        }
+        if (item.total < 0) {
+          errors.push(`Item ${index + 1}: Total cannot be negative.`);
+        }
+      });
+    }
+
+    // Validate discount
+    if (invoice.discount < 0) {
+      errors.push("Discount cannot be negative.");
+    }
+
+    // Validate tax
+    if (invoice.tax < 0) {
+      errors.push("Tax cannot be negative.");
+    }
+
+    // Validate total
+    if (invoice.total < 0) {
+      errors.push("Total cannot be negative.");
+    }
+
+    // Validate notes max length
+    if (invoice.notes) {
+      const notesError = validateMaxLength(invoice.notes, 1000, "Notes");
+      if (notesError) errors.push(notesError);
+    }
+
+    // Use shared entity validation as final check
+    const entityValidation = validateInvoiceData(invoice as Record<string, unknown>);
+    if (!entityValidation.valid && entityValidation.errors.length > 0) {
+      entityValidation.errors.forEach((err) => {
+        if (!errors.includes(err)) errors.push(err);
+      });
+    }
+
+    return { valid: errors.length === 0, errors, warnings };
+  }
+
+  function validatePaymentDataLocal(payment: { amount: string; method: Payment["method"] }, invoice: Invoice): { valid: boolean; errors: string[]; warnings: string[] } {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    // Validate amount
+    const amount = parseFloat(payment.amount);
+    if (isNaN(amount) || amount <= 0) {
+      errors.push("Please enter a valid payment amount greater than 0.");
+    }
+
+    // Validate payment method
+    const methodError = validateRequired(payment.method, "Payment method");
+    if (methodError) errors.push(methodError);
+
+    // Check if amount exceeds balance (warning only, confirmation handled separately)
+    if (!isNaN(amount) && amount > (invoice.total - invoice.paidAmount)) {
+      warnings.push(`Payment amount ($${amount.toFixed(2)}) exceeds remaining balance ($${(invoice.total - invoice.paidAmount).toFixed(2)}).`);
+    }
+
+    return { valid: errors.length === 0, errors, warnings };
   }
   
   // Enhance invoices with missing fields
@@ -233,12 +374,57 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
   }, [enhancedInvoices, invoiceSearch, invoiceFilterStatus, invoiceFilterMethod, invoiceFilterDateFrom, invoiceFilterDateTo, invoiceFilterOverdue]);
 
   const handleCreateInvoice = (invoiceData: Omit<Invoice, "id" | "invoiceNumber" | "createdAt" | "paymentHistory">) => {
+    if (!canCreateInvoice) {
+      handleDeniedAccess("create", "invoice");
+      return;
+    }
+
+    // Phase 8C: Validate patient reference before creating invoice
+    const patientValidation = validateWorkflowPatientReference(invoiceData.patientId, patients, {
+      requireActive: true,
+      allowDeleted: false,
+      action: "create invoice"
+    });
+    if (!patientValidation.valid) {
+      showFeedback(patientValidation.reason, "error");
+      logBlockedHandoff({
+        fromModule: "billing",
+        toModule: "billing",
+        action: "create_invoice",
+        patientId: invoiceData.patientId,
+        reason: patientValidation.reason,
+        actor: normalizedRole,
+      });
+      return;
+    }
+
+    const validation = validateInvoiceDataLocal(invoiceData);
+    
+    // Show errors and block creation
+    if (validation.errors.length > 0) {
+      validation.errors.forEach(error => showFeedback(error, "error"));
+      return;
+    }
+
+    // Show warnings but don't block
+    validation.warnings.forEach(warning => showFeedback(warning, "warning"));
+
+    // Normalize data before save
+    const normalizedData = {
+      ...invoiceData,
+      notes: invoiceData.notes ? safeString(invoiceData.notes).trim() : undefined,
+      items: invoiceData.items.map(item => ({
+        ...item,
+        description: safeString(item.description).trim(),
+      })),
+    };
+
     const existingInvoices = readJSON<Invoice[]>(INVOICES_KEY, []);
     const year = new Date().getFullYear();
     // Sequential per year, e.g. INV-2026-0001, instead of a raw timestamp
     const seq = existingInvoices.filter((i: any) => (i.invoiceNumber || "").startsWith(`INV-${year}-`)).length + 1;
     const newInvoice: Invoice = {
-      ...invoiceData,
+      ...normalizedData,
       id: `inv-${Date.now()}`,
       invoiceNumber: `INV-${year}-${String(seq).padStart(4, "0")}`,
       createdAt: new Date().toISOString(),
@@ -246,18 +432,26 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
     };
     writeJSON(INVOICES_KEY, [...existingInvoices, newInvoice]);
     setShowCreateInvoice(false);
-    logActivity("invoice created", invoiceData.patientId, invoiceData.patientName, newInvoice.invoiceNumber, `Total: $${invoiceData.total.toFixed(2)}`);
+    logActivity("invoice created", invoiceData.patientId, newInvoice.invoiceNumber, `Total: $${invoiceData.total.toFixed(2)}`);
     showFeedback(`Invoice ${newInvoice.invoiceNumber} created successfully!`, "success");
   };
 
   const handleRecordPayment = () => {
-    if (!selectedInvoice || !paymentAmount) return;
-
-    const amount = parseFloat(paymentAmount);
-    if (isNaN(amount) || amount <= 0) {
-      showFeedback("Please enter a valid payment amount.", "error");
+    if (!canRecordPayment) {
+      handleDeniedAccess("record", "payment");
       return;
     }
+    if (!selectedInvoice || !paymentAmount) return;
+
+    const validation = validatePaymentDataLocal({ amount: paymentAmount, method: paymentMethod }, selectedInvoice);
+    
+    // Show errors and block payment
+    if (validation.errors.length > 0) {
+      validation.errors.forEach(error => showFeedback(error, "error"));
+      return;
+    }
+
+    const amount = parseFloat(paymentAmount);
 
     const remainingBalance = selectedInvoice.total - selectedInvoice.paidAmount;
     if (amount > remainingBalance) {
@@ -300,7 +494,7 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
     setShowPaymentModal(false);
     setSelectedInvoice(null);
     setPaymentAmount("");
-    logActivity("payment recorded", invoice.patientId, invoice.patientName, invoice.invoiceNumber, `$${amount.toFixed(2)} via ${paymentMethod}`);
+    logActivity("payment recorded", invoice.patientId, invoice.invoiceNumber, `$${amount.toFixed(2)} via ${paymentMethod}`);
     showFeedback(`Payment of $${amount.toFixed(2)} recorded successfully!`, "success");
   }
 
@@ -351,7 +545,7 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
     w.document.close();
     w.focus();
     w.print();
-    logActivity("invoice printed", inv.patientId, inv.patientName, inv.invoiceNumber);
+    logActivity("invoice printed", inv.patientId, inv.invoiceNumber);
   };
 
   function handlePrintReceipt(invoice: Invoice, payment: Payment) {
@@ -389,27 +583,58 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
     w.document.close();
     w.focus();
     w.print();
-    logActivity("receipt printed", invoice.patientId, invoice.patientName, invoice.invoiceNumber, `$${payment.amount.toFixed(2)}`);
+    logActivity("receipt printed", invoice.patientId, invoice.invoiceNumber, `$${payment.amount.toFixed(2)}`);
   }
 
   function handleUpdateInvoiceStatus(id: string, status: Invoice["status"]) {
+    const invoice = enhancedInvoices.find((i: Invoice) => i.id === id);
+    if (!invoice) return;
+
+    // Phase 8B: Validate status transition using state machine
+    const transitionResult = validateWorkflowTransition(
+      "invoice" as WorkflowEntityType,
+      invoice.status,
+      status
+    );
+    if (!transitionResult.valid) {
+      showFeedback(`Invalid status transition: ${transitionResult.reason}`, "error");
+      return;
+    }
+
     const updatedInvoices = enhancedInvoices.map((inv: Invoice) =>
       inv.id === id ? { ...inv, status } : inv
     );
     writeJSON(INVOICES_KEY, updatedInvoices);
-    const invoice = enhancedInvoices.find((i: Invoice) => i.id === id);
-    logActivity("invoice status updated", invoice?.patientId, invoice?.patientName, invoice?.invoiceNumber, `Status: ${status}`);
+
+    // Phase 8B: Log workflow action for status change
+    logWorkflowAction({
+      action: "status_change",
+      entityType: "invoice",
+      entityId: id,
+      patientId: invoice.patientId,
+      metadata: {
+        fromStatus: invoice.status,
+        toStatus: status,
+        performedBy: normalizedRole,
+      },
+    });
+
+    logActivity("invoice status updated", invoice?.patientId, invoice?.invoiceNumber, `Status: ${status}`);
     showFeedback(`Invoice marked as ${status}.`, "success");
   }
 
   function handleDeleteInvoice(id: string) {
+    if (!canDeleteInvoice) {
+      handleDeniedAccess("delete", "invoice");
+      return;
+    }
     setConfirmModal({
       message: "Are you sure you want to delete this invoice? This action cannot be undone.",
       onConfirm: () => {
         const invoice = enhancedInvoices.find((i: Invoice) => i.id === id);
         const updatedInvoices = enhancedInvoices.filter((inv: Invoice) => inv.id !== id);
         writeJSON(INVOICES_KEY, updatedInvoices);
-        logActivity("invoice deleted", invoice?.patientId, invoice?.patientName, invoice?.invoiceNumber);
+        logActivity("invoice deleted", invoice?.patientId, invoice?.invoiceNumber);
         showFeedback("Invoice deleted.", "success");
       },
     });
@@ -430,11 +655,15 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
       items: invoice.items.map((item, idx) => ({ ...item, id: `item-${Date.now()}-${idx}` })),
     };
     writeJSON(INVOICES_KEY, [...existingInvoices, newInvoice]);
-    logActivity("invoice duplicated", invoice.patientId, invoice.patientName, invoice.invoiceNumber, `New: ${newInvoice.invoiceNumber}`);
+    logActivity("invoice duplicated", invoice.patientId, invoice.invoiceNumber, `New: ${newInvoice.invoiceNumber}`);
     showFeedback(`Invoice duplicated as ${newInvoice.invoiceNumber}.`, "success");
   }
 
   function handleEditInvoiceModal(invoice: Invoice) {
+    if (!canEditInvoice) {
+      handleDeniedAccess("edit", "invoice");
+      return;
+    }
     if (invoice.status === "paid" || invoice.status === "cancelled") {
       setConfirmModal({
         message: "This invoice is paid or cancelled. Editing may affect payment records. Continue?",
@@ -450,6 +679,10 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
   }
 
   function handleUpdateInvoice(invoiceData: Omit<Invoice, "id" | "invoiceNumber" | "createdAt" | "paymentHistory">) {
+    if (!canEditInvoice) {
+      handleDeniedAccess("edit", "invoice");
+      return;
+    }
     if (!editingInvoice) return;
     const updatedInvoices = enhancedInvoices.map((inv: Invoice) =>
       inv.id === editingInvoice.id ? { ...invoiceData, id: inv.id, invoiceNumber: inv.invoiceNumber, createdAt: inv.createdAt, paymentHistory: inv.paymentHistory } : inv
@@ -457,19 +690,23 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
     writeJSON(INVOICES_KEY, updatedInvoices);
     setShowEditInvoice(false);
     setEditingInvoice(null);
-    logActivity("invoice updated", invoiceData.patientId, invoiceData.patientName, editingInvoice.invoiceNumber, `Total: $${invoiceData.total.toFixed(2)}`);
+    logActivity("invoice updated", invoiceData.patientId, editingInvoice.invoiceNumber, `Total: $${invoiceData.total.toFixed(2)}`);
     showFeedback(`Invoice ${editingInvoice.invoiceNumber} updated successfully.`, "success");
   }
 
   function handleExportInvoicesCSV() {
+    if (!canExportInvoices) {
+      handleDeniedAccess("export", "invoices");
+      return;
+    }
     if (enhancedInvoices.length === 0) {
       showFeedback("No invoices to export.", "info");
       return;
     }
-    const headers = ["Invoice Number", "Patient", "Patient ID", "Date", "Due Date", "Subtotal", "Tax", "Discount", "Total", "Paid", "Balance", "Status", "Payment Method"];
+    // Phase 8H: Remove patientName from CSV export (PHI-safe)
+    const headers = ["Invoice Number", "Patient ID", "Date", "Due Date", "Subtotal", "Tax", "Discount", "Total", "Paid", "Balance", "Status", "Payment Method"];
     const rows = enhancedInvoices.map((inv: Invoice) => [
       inv.invoiceNumber,
-      inv.patientName,
       inv.patientId,
       fmtDate(inv.createdAt),
       fmtDate(inv.dueDate),
@@ -495,11 +732,14 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
   }
 
   function handleExportPaymentsCSV() {
+    if (!canExportPayments) {
+      handleDeniedAccess("export", "payments");
+      return;
+    }
     const allPayments = enhancedInvoices.flatMap((inv: Invoice) =>
       inv.paymentHistory.map((pay: Payment) => ({
         ...pay,
         invoiceNumber: inv.invoiceNumber,
-        patientName: inv.patientName,
         patientId: inv.patientId,
       }))
     );
@@ -507,11 +747,11 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
       showFeedback("No payments to export.", "info");
       return;
     }
-    const headers = ["Payment ID", "Invoice Number", "Patient", "Patient ID", "Date", "Amount", "Method", "Reference"];
+    // Phase 8H: Remove patientName from CSV export (PHI-safe)
+    const headers = ["Payment ID", "Invoice Number", "Patient ID", "Date", "Amount", "Method", "Reference"];
     const rows = allPayments.map((p: any) => [
       p.id,
       p.invoiceNumber,
-      p.patientName,
       p.patientId,
       fmtDate(p.date),
       p.amount.toFixed(2),
@@ -531,14 +771,18 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
   }
 
   function handleExportInsuranceCSV() {
+    if (!canExportInsurance) {
+      handleDeniedAccess("export", "insurance data");
+      return;
+    }
     if (patients.length === 0) {
       showFeedback("No patients to export.", "info");
       return;
     }
-    const headers = ["Patient ID", "Name", "Insurance Status", "Expiry Date"];
+    // Phase 8H: Remove patientName from CSV export (PHI-safe)
+    const headers = ["Patient ID", "Insurance Status", "Expiry Date"];
     const rows = patients.map((p: Patient) => [
       p.id,
-      p.name,
       p.insuranceStatus || "None",
       (p as any).insuranceExpiry ? fmtDate((p as any).insuranceExpiry) : "",
     ]);
@@ -555,16 +799,19 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
   }
 
   function handleExportActivityCSV() {
+    if (!canExportBillingActivity) {
+      handleDeniedAccess("export", "billing activity");
+      return;
+    }
     if (billingActivity.length === 0) {
       showFeedback("No activity to export.", "info");
       return;
     }
-    const headers = ["Timestamp", "Action", "Patient ID", "Patient Name", "Invoice Number", "Details"];
+    const headers = ["Timestamp", "Action", "Patient ID", "Invoice Number", "Details"];
     const rows = billingActivity.map((a: BillingActivity) => [
       fmtDate(a.timestamp),
       a.action,
       a.patientId || "",
-      a.patientName || "",
       a.invoiceNumber || "",
       a.details || "",
     ]);
@@ -580,6 +827,10 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
   }
 
   function handleClearActivity() {
+    if (!canClearActivity) {
+      handleDeniedAccess("clear", "billing activity");
+      return;
+    }
     setConfirmModal({
       message: "Are you sure you want to clear all billing activity logs?",
       onConfirm: () => {
@@ -636,12 +887,16 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
             <div className="section-label" style={{ margin: 0 }}>Activity Log ({billingActivity.length})</div>
             <div style={{ display: "flex", gap: 4 }}>
-              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handleExportActivityCSV}>
-                <i className="ti ti-download" style={{ fontSize: 11, marginRight: 4 }} />Export CSV
-              </button>
-              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px", color: "var(--red)" }} onClick={handleClearActivity}>
-                <i className="ti ti-trash" style={{ fontSize: 11, marginRight: 4 }} />Clear
-              </button>
+              {canExportBillingActivity && (
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handleExportActivityCSV}>
+                  <i className="ti ti-download" style={{ fontSize: 11, marginRight: 4 }} />Export CSV
+                </button>
+              )}
+              {canClearActivity && (
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px", color: "var(--red)" }} onClick={handleClearActivity}>
+                  <i className="ti ti-trash" style={{ fontSize: 11, marginRight: 4 }} />Clear
+                </button>
+              )}
             </div>
           </div>
           {billingActivity.length === 0 ? (
@@ -652,9 +907,9 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
                 <div key={i} style={{ fontSize: "var(--font-xs)", padding: 8, background: "var(--surface2)", borderRadius: "var(--radius)" }}>
                   <div style={{ fontWeight: 600, marginBottom: 2 }}>{a.action}</div>
                   <div style={{ color: "var(--muted)" }}>{fmtDate(a.timestamp)}</div>
-                  {(a.patientName || a.invoiceNumber || a.details) && (
+                  {(a.patientId || a.invoiceNumber || a.details) && (
                     <div style={{ color: "var(--muted)" }}>
-                      {a.patientName && `${a.patientName} · `}
+                      {a.patientId && `${patients.find(p => p.id === a.patientId)?.name || a.patientId} · `}
                       {a.invoiceNumber && `${a.invoiceNumber} · `}
                       {a.details}
                     </div>
@@ -718,10 +973,12 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
         <div>
           <div className="bl-section-header" style={{ display: "flex", justifyContent: "space-between", marginBottom: 16, alignItems: "center", flexWrap: "wrap", gap: 12 }}>
             <div style={{ fontSize: "var(--font-md)", fontWeight: 700 }}>Invoice Management</div>
-            <button className="btn btn-primary bl-full-btn" onClick={() => setShowCreateInvoice(true)}>
-              <i className="ti ti-plus" style={{ fontSize: 12, marginRight: 4 }} />
-              Create Invoice
-            </button>
+            {canCreateInvoice && (
+              <button className="btn btn-primary bl-full-btn" onClick={() => setShowCreateInvoice(true)}>
+                <i className="ti ti-plus" style={{ fontSize: 12, marginRight: 4 }} />
+                Create Invoice
+              </button>
+            )}
           </div>
 
           <div className="card card-padded" style={{ marginBottom: 16 }}>
@@ -779,9 +1036,11 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
                   Clear Filters
                 </button>
               )}
-              <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)", padding: "6px 10px" }} onClick={handleExportInvoicesCSV}>
-                <i className="ti ti-download" style={{ marginRight: 4, fontSize: 11 }} />Export CSV
-              </button>
+              {canExportInvoices && (
+                <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)", padding: "6px 10px" }} onClick={handleExportInvoicesCSV}>
+                  <i className="ti ti-download" style={{ marginRight: 4, fontSize: 11 }} />Export CSV
+                </button>
+              )}
             </div>
           </div>
 
@@ -827,7 +1086,7 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
                     </td>
                     <td>
                       <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                        {inv.status !== "paid" && inv.status !== "cancelled" && (
+                        {inv.status !== "paid" && inv.status !== "cancelled" && canRecordPayment && (
                           <button
                             className="btn btn-primary"
                             style={{ fontSize: "var(--font-xs)", padding: "2px 8px" }}
@@ -836,9 +1095,11 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
                             Pay
                           </button>
                         )}
-                        <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px" }} onClick={() => handleEditInvoiceModal(inv)} title="Edit">
-                          <i className="ti ti-pencil" style={{ fontSize: 12 }} />
-                        </button>
+                        {canEditInvoice && (
+                          <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px" }} onClick={() => handleEditInvoiceModal(inv)} title="Edit">
+                            <i className="ti ti-pencil" style={{ fontSize: 12 }} />
+                          </button>
+                        )}
                         <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px" }} onClick={() => handlePrintInvoice(inv)} title="Print invoice">
                           <i className="ti ti-print" style={{ fontSize: 12 }} />
                         </button>
@@ -847,15 +1108,17 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
                             <i className="ti ti-receipt" style={{ fontSize: 12 }} />
                           </button>
                         )}
-                        <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px" }} onClick={() => handleDuplicateInvoice(inv)} title="Duplicate">
-                          <i className="ti ti-copy" style={{ fontSize: 12 }} />
-                        </button>
-                        {inv.status === "draft" || inv.status === "pending" ? (
+                        {canCreateInvoice && (
+                          <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px" }} onClick={() => handleDuplicateInvoice(inv)} title="Duplicate">
+                            <i className="ti ti-copy" style={{ fontSize: 12 }} />
+                          </button>
+                        )}
+                        {canManageInsurance && (inv.status === "draft" || inv.status === "pending") && (
                           <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px", color: "var(--amber)" }} onClick={() => handleUpdateInvoiceStatus(inv.id, "cancelled")} title="Cancel">
                             <i className="ti ti-x" style={{ fontSize: 12 }} />
                           </button>
-                        ) : null}
-                        {userRole !== "doctor" && (
+                        )}
+                        {canDeleteInvoice && (
                           <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "2px 8px", color: "var(--red)" }} onClick={() => handleDeleteInvoice(inv.id)} title="Delete">
                             <i className="ti ti-trash" style={{ fontSize: 12 }} />
                           </button>
@@ -874,10 +1137,12 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
         <div>
           <div className="bl-section-header" style={{ display: "flex", justifyContent: "space-between", marginBottom: 16, alignItems: "center", flexWrap: "wrap", gap: 12 }}>
             <div style={{ fontSize: "var(--font-md)", fontWeight: 700 }}>Payment History</div>
-            <button className="btn btn-primary bl-full-btn" style={{ fontSize: "var(--font-xs)", padding: "6px 12px" }} onClick={handleExportPaymentsCSV}>
-              <i className="ti ti-download" style={{ fontSize: 12, marginRight: 4 }} />
-              Export CSV
-            </button>
+            {canExportPayments && (
+              <button className="btn btn-primary bl-full-btn" style={{ fontSize: "var(--font-xs)", padding: "6px 12px" }} onClick={handleExportPaymentsCSV}>
+                <i className="ti ti-download" style={{ fontSize: 12, marginRight: 4 }} />
+                Export CSV
+              </button>
+            )}
           </div>
           <div className="card card-padded">
             {enhancedInvoices.flatMap((inv: Invoice) =>
@@ -926,10 +1191,12 @@ export default function BillingPage({ patients, onUpdatePatient, userRole = "adm
         <div>
           <div className="bl-section-header" style={{ display: "flex", justifyContent: "space-between", marginBottom: 16, alignItems: "center", flexWrap: "wrap", gap: 12 }}>
             <div style={{ fontSize: "var(--font-md)", fontWeight: 700 }}>Insurance Overview</div>
-            <button className="btn btn-primary bl-full-btn" style={{ fontSize: "var(--font-xs)", padding: "6px 12px" }} onClick={handleExportInsuranceCSV}>
-              <i className="ti ti-download" style={{ fontSize: 12, marginRight: 4 }} />
-              Export CSV
-            </button>
+            {canExportInsurance && (
+              <button className="btn btn-primary bl-full-btn" style={{ fontSize: "var(--font-xs)", padding: "6px 12px" }} onClick={handleExportInsuranceCSV}>
+                <i className="ti ti-download" style={{ fontSize: 12, marginRight: 4 }} />
+                Export CSV
+              </button>
+            )}
           </div>
           <div className="bl-insurance-stats" style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 24 }}>
             <StatCard label="Active" value={insuranceStats.active} color="var(--green)" icon="ti-shield-check" bg="var(--green-bg)" />

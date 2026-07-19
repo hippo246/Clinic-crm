@@ -8,6 +8,13 @@ import {
   InsuranceChart,
   RiskDistributionChart
 } from "./Charts";
+import { hasRole, normalizeRole } from "../shared/permissions";
+import { logDeniedAction } from "../shared/services/deniedActionLogger";
+// Phase 8E: Import workflow audit and validation helpers
+import { logWorkflowAction } from "../shared/workflow/workflowAudit";
+import { validateWorkflowTransition, type WorkflowEntityType } from "../shared/workflow/workflowStateMachine";
+import { validateWorkflowPatientReference } from "../shared/workflow/workflowValidation";
+import { logSuccessfulHandoff, logBlockedHandoff } from "../shared/workflow/workflowHandoff";
 
 function getInitials(name: string): string {
   return name.split(" ").filter(Boolean).map(n => n[0]).join("").slice(0, 2).toUpperCase();
@@ -23,6 +30,30 @@ function writeJSON(key: string, value: unknown): void {
 
 // ─── Appointments ─────────────────────────────────────────────────────────────
 export function AppointmentsPage({ patients, onUpdatePatient, onViewPatient, userRole = "admin" }: { patients: Patient[]; onUpdatePatient?: (patient: Patient) => void; onViewPatient?: (patient: Patient) => void; userRole?: "receptionist" | "doctor" | "admin" }) {
+  const normalizedRole = normalizeRole(userRole);
+
+  // Local permission guards
+  const canViewAppointments = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canCreateAppointment = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canEditAppointment = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canCancelAppointment = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canDeleteAppointment = hasRole(normalizedRole, ["admin"]);
+  const canExportAppointments = hasRole(normalizedRole, ["admin", "receptionist"]);
+  const canPrintAppointments = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canViewBillingDetails = hasRole(normalizedRole, ["admin", "billing"]);
+  const canViewInsuranceDetails = hasRole(normalizedRole, ["admin", "billing"]);
+
+  const handleDeniedAccess = (action: string, resource: string) => {
+    setPageFeedback({ type: "error", message: `You don't have permission to ${action} ${resource}.` });
+    logDeniedAction({
+      action,
+      resource,
+      role: normalizedRole,
+      reason: "Insufficient permissions",
+      severity: "medium",
+    });
+  };
+
   const [currentDate, setCurrentDate] = useState(new Date());
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
   const [showNewAppointmentModal, setShowNewAppointmentModal] = useState(false);
@@ -88,6 +119,45 @@ export function AppointmentsPage({ patients, onUpdatePatient, onViewPatient, use
     if (!wlDate) { setWlError("Please select a preferred date."); return; }
     if (!wlTime) { setWlError("Please select a preferred time."); return; }
     if (!wlReason) { setWlError("Please enter a reason."); return; }
+
+    // Phase 8E: Validate patient reference before adding to waitlist
+    const patientValidation = validateWorkflowPatientReference(wlPatient.id, patients, {
+      requireActive: true, // Require active patient for waitlist
+      allowDeleted: false,
+      action: "add to waitlist"
+    });
+    if (!patientValidation.valid) {
+      setWlError(patientValidation.reason);
+      logBlockedHandoff({
+        fromModule: "waitlist",
+        toModule: "waitlist",
+        action: "add_waitlist",
+        patientId: wlPatient.id,
+        reason: patientValidation.reason,
+        actor: normalizedRole,
+      });
+      return;
+    }
+
+    // Phase 8E: Check for duplicate waitlist entries (same patient, same date)
+    const duplicateWaitlist = waitlist.find(w => {
+      return w.patientId === wlPatient.id && w.requestedDate === wlDate;
+    });
+    if (duplicateWaitlist) {
+      setWlError("Patient already has a waitlist entry for this date.");
+      logWorkflowAction({
+        action: "duplicate_prevented",
+        entityType: "waitlist",
+        entityId: duplicateWaitlist.id,
+        patientId: wlPatient.id,
+        metadata: {
+          reason: "Duplicate waitlist entry on same date",
+          performedBy: normalizedRole,
+        },
+      });
+      return;
+    }
+
     const entry: WaitlistEntry = {
       id: `wl-${Date.now()}`,
       patientId: wlPatient.id,
@@ -243,28 +313,74 @@ export function AppointmentsPage({ patients, onUpdatePatient, onViewPatient, use
   };
 
   const handleCancelAppointment = (p: Patient) => {
+    if (!canCancelAppointment) {
+      handleDeniedAccess("cancel", "appointment");
+      return;
+    }
     if (!onUpdatePatient) { showFeedback("No update handler — changes not saved.", "error"); return; }
-    // Queue/App uses extended appointment statuses; cast keeps frontend workflow compatible.
+    
+    // Phase 8E: Validate patient reference before cancel
+    const patientValidation = validateWorkflowPatientReference(p.id, patients, {
+      requireActive: false, // Allow cancelling appointments for inactive patients
+      allowDeleted: false,
+      action: "cancel appointment"
+    });
+    if (!patientValidation.valid) {
+      showFeedback(patientValidation.reason, "error");
+      logBlockedHandoff({
+        fromModule: "appointments",
+        toModule: "appointments",
+        action: "cancel_appointment",
+        patientId: p.id,
+        reason: patientValidation.reason,
+        actor: normalizedRole,
+      });
+      return;
+    }
+
+    // Phase 8E: Separate appointment status from patient status
+    // Appointment cancellation should NOT set patient status to Inactive
     const updatedPatient: Patient = {
       ...p,
-      // keep nextAppointment for audit; status reflects cancellation
-      status: "Inactive" as Patient["status"],
+      // Keep patient status unchanged - only clear appointment
+      nextAppointment: undefined,
+      // Track appointment status separately if needed
+      ...(p as any).appointmentStatus ? { appointmentStatus: "cancelled" as const } : {},
       updatedAt: new Date().toISOString(),
     };
     onUpdatePatient(updatedPatient);
+    
+    // Phase 8E: Log appointment cancellation with PHI-safe audit logging
+    logWorkflowAction({
+      action: "appointment_cancelled",
+      entityType: "appointment",
+      entityId: p.id,
+      patientId: p.id,
+      metadata: {
+        oldStatus: (p as any).appointmentStatus || "scheduled",
+        newStatus: "cancelled",
+        performedBy: normalizedRole,
+      },
+    });
+    
     showFeedback(`Appointment for ${p.name} cancelled.`);
   };
 
   const handleExportAppointments = () => {
+    if (!canExportAppointments) {
+      handleDeniedAccess("export", "appointments");
+      return;
+    }
     if (filteredUpcoming.length === 0) {
       showFeedback("No appointments to export with current filters.", "info");
       return;
     }
-    const header = "Patient ID,Patient Name,Doctor,Appointment Date,Status,Type\n";
+    // Phase 8J: Remove patientName from appointment CSV export (PHI-safe)
+    const header = "Patient ID,Doctor,Appointment Date,Status,Type\n";
     const rows = filteredUpcoming.map(p => {
       const apptType = (p as any).appointmentType || "";
       const apptDate = p.nextAppointment ? new Date(p.nextAppointment).toLocaleString() : "";
-      return [`"${p.id}"`, `"${p.name}"`, `"${p.doctor || ""}"`, `"${apptDate}"`, `"${p.status}"`, `"${apptType}"`].join(",");
+      return [`"${p.id}"`, `"${p.doctor || ""}"`, `"${apptDate}"`, `"${p.status}"`, `"${apptType}"`].join(",");
     }).join("\n");
     const blob = new Blob([header + rows], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
@@ -274,6 +390,10 @@ export function AppointmentsPage({ patients, onUpdatePatient, onViewPatient, use
   };
 
   const handleCreateAppointment = () => {
+    if (!canCreateAppointment) {
+      handleDeniedAccess("create", "appointment");
+      return;
+    }
     setModalError("");
     setModalSuccess("");
 
@@ -282,6 +402,52 @@ export function AppointmentsPage({ patients, onUpdatePatient, onViewPatient, use
     if (!appointmentDate) { setModalError("Please select a date."); return; }
     if (!appointmentTime) { setModalError("Please select a time."); return; }
     if (!appointmentType) { setModalError("Please select an appointment type."); return; }
+
+    // Phase 8E: Validate patient reference before creating appointment
+    const patientValidation = validateWorkflowPatientReference(selectedPatientForAppointment.id, patients, {
+      requireActive: true, // Require active patient for new appointments
+      allowDeleted: false,
+      action: "create appointment"
+    });
+    if (!patientValidation.valid) {
+      setModalError(patientValidation.reason);
+      logBlockedHandoff({
+        fromModule: "appointments",
+        toModule: "appointments",
+        action: "create_appointment",
+        patientId: selectedPatientForAppointment.id,
+        reason: patientValidation.reason,
+        actor: normalizedRole,
+      });
+      return;
+    }
+
+    // Phase 8E: Check for duplicate appointments (same patient, same date, active status)
+    const appointmentDateStr = appointmentDate;
+    const duplicateAppointment = patients.find(p => {
+      if (p.id === selectedPatientForAppointment.id && p.nextAppointment) {
+        const existingApptDate = new Date(p.nextAppointment).toISOString().split("T")[0];
+        const existingApptStatus = (p.status || "").toLowerCase();
+        // Check if same date and status is not completed/cancelled/no-show
+        return existingApptDate === appointmentDateStr && 
+               !["completed", "cancelled", "no-show"].includes(existingApptStatus);
+      }
+      return false;
+    });
+    if (duplicateAppointment && !reschedulePatient) {
+      setModalError("Patient already has an active appointment on this date. Please reschedule the existing appointment first.");
+      logWorkflowAction({
+        action: "duplicate_prevented",
+        entityType: "appointment",
+        entityId: duplicateAppointment.id,
+        patientId: selectedPatientForAppointment.id,
+        metadata: {
+          reason: "Duplicate appointment on same date",
+          performedBy: normalizedRole,
+        },
+      });
+      return;
+    }
 
     const [hoursStr, minutesStr] = appointmentTime.split(":");
     const hours = parseInt(hoursStr, 10);
@@ -305,6 +471,8 @@ export function AppointmentsPage({ patients, onUpdatePatient, onViewPatient, use
       ...selectedPatientForAppointment,
       nextAppointment: appointmentDateTime.toISOString(),
       status: "Scheduled" as Patient["status"],
+      // Track appointment status separately
+      ...(selectedPatientForAppointment as any).appointmentStatus ? { appointmentStatus: "scheduled" as const } : {},
       updatedAt: new Date().toISOString(),
     };
 
@@ -313,6 +481,19 @@ export function AppointmentsPage({ patients, onUpdatePatient, onViewPatient, use
     } else {
       console.warn("AppointmentsPage: no onUpdatePatient handler — appointment not persisted");
     }
+
+    // Phase 8E: Log appointment creation with PHI-safe audit logging
+    logWorkflowAction({
+      action: reschedulePatient ? "appointment_rescheduled" : "appointment_created",
+      entityType: "appointment",
+      entityId: selectedPatientForAppointment.id,
+      patientId: selectedPatientForAppointment.id,
+      metadata: {
+        appointmentDate: appointmentDateTime.toISOString(),
+        appointmentType,
+        performedBy: normalizedRole,
+      },
+    });
 
     // If scheduled from waitlist, remove the waitlist entry
     if (waitlistEntryToRemove) {
@@ -862,9 +1043,11 @@ export function AppointmentsPage({ patients, onUpdatePatient, onViewPatient, use
 
       {/* Export + Waitlist button row */}
       <div style={{ display: "flex", gap: 8, marginTop: 16, marginBottom: 24, flexWrap: "wrap" }}>
-        <button className="btn btn-ghost" onClick={handleExportAppointments}>
-          <i className="ti ti-download" style={{ fontSize: 14, marginRight: 4 }} />Export CSV
-        </button>
+        {canExportAppointments && (
+          <button className="btn btn-ghost" onClick={handleExportAppointments}>
+            <i className="ti ti-download" style={{ fontSize: 14, marginRight: 4 }} />Export CSV
+          </button>
+        )}
         <button className="btn btn-ghost" onClick={() => { resetWaitlistModal(); setShowWaitlistModal(true); }}>
           <i className="ti ti-clock-plus" style={{ fontSize: 14, marginRight: 4 }} />Add to Waitlist
         </button>
@@ -1057,7 +1240,7 @@ export function AppointmentsPage({ patients, onUpdatePatient, onViewPatient, use
                 <button
                   className="btn btn-primary"
                   onClick={handleCreateAppointment}
-                  disabled={!selectedPatientForAppointment || !appointmentDate || !appointmentTime || !appointmentType || !!modalSuccess}
+                  disabled={!canCreateAppointment || !selectedPatientForAppointment || !appointmentDate || !appointmentTime || !appointmentType || !!modalSuccess}
                 >
                   {reschedulePatient ? "Reschedule" : "Schedule Appointment"}
                 </button>
@@ -1105,15 +1288,20 @@ export function BillingPage({ patients }: { patients: Patient[] }) {
   };
 
   const handleExportInvoices = () => {
+    if (!canViewBillingDetails) {
+      handleDeniedAccess("export", "invoices");
+      return;
+    }
     let invoices: any[] = [];
     try { invoices = JSON.parse(localStorage.getItem("clinic_crm_invoices") || "[]"); } catch { invoices = []; }
     if (invoices.length === 0) {
       showBillingFeedback("No invoices to export yet.", "info");
       return;
     }
-    const header = "ID,Patient,Amount,Description,Due Date,Status,Created\n";
+    // Phase 8J: Remove patientName from invoice CSV export (PHI-safe)
+    const header = "ID,Patient ID,Amount,Description,Due Date,Status,Created\n";
     const rows = invoices.map((inv: any) =>
-      [inv.id, `"${inv.patientName}"`, inv.amount, `"${inv.description}"`, inv.dueDate, inv.status, inv.createdAt].join(",")
+      [inv.id, `"${inv.patientId}"`, inv.amount, `"${inv.description}"`, inv.dueDate, inv.status, inv.createdAt].join(",")
     ).join("\n");
     const blob = new Blob([header + rows], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
@@ -1123,6 +1311,10 @@ export function BillingPage({ patients }: { patients: Patient[] }) {
   };
 
   const handleCreateInvoice = () => {
+    if (!canViewBillingDetails) {
+      handleDeniedAccess("create", "invoice");
+      return;
+    }
     setInvoiceModalError("");
     if (!selectedPatientForInvoice) { setInvoiceModalError("Please select a patient."); return; }
     if (!invoiceAmount) { setInvoiceModalError("Please enter an amount."); return; }
@@ -1179,13 +1371,17 @@ export function BillingPage({ patients }: { patients: Patient[] }) {
         <h2 style={{ fontSize: "var(--font-xl)", fontWeight: 800, margin: 0 }}>Billing & Insurance</h2>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           {billingFeedback && <div style={feedbackStyle(billingFeedback.type)}>{billingFeedback.message}</div>}
-          <button className="btn btn-ghost" onClick={handleExportInvoices}>
-            <i className="ti ti-download" style={{ fontSize: 14, marginRight: 4 }} />Export Invoices
-          </button>
-          <button className="btn btn-primary" onClick={() => setShowInvoiceModal(true)}>
-            <i className="ti ti-plus" style={{ fontSize: 14, marginRight: 4 }} />
-            Create Invoice
-          </button>
+          {canViewBillingDetails && (
+            <button className="btn btn-ghost" onClick={handleExportInvoices}>
+              <i className="ti ti-download" style={{ fontSize: 14, marginRight: 4 }} />Export Invoices
+            </button>
+          )}
+          {canViewBillingDetails && (
+            <button className="btn btn-primary" onClick={() => setShowInvoiceModal(true)}>
+              <i className="ti ti-plus" style={{ fontSize: 14, marginRight: 4 }} />
+              Create Invoice
+            </button>
+          )}
         </div>
       </div>
 
@@ -1305,7 +1501,7 @@ export function BillingPage({ patients }: { patients: Patient[] }) {
               </div>
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
                 <button className="btn btn-ghost" onClick={() => { setShowInvoiceModal(false); resetInvoiceModal(); }}>Cancel</button>
-                <button className="btn btn-primary" onClick={handleCreateInvoice} disabled={!selectedPatientForInvoice || !invoiceAmount || !invoiceDescription}>Create Invoice</button>
+                <button className="btn btn-primary" onClick={handleCreateInvoice} disabled={!canViewBillingDetails || !selectedPatientForInvoice || !invoiceAmount || !invoiceDescription}>Create Invoice</button>
               </div>
             </div>
           </div>

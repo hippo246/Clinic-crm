@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { login as firebaseLogin } from '../../firebase';
 import { apiClient } from '../api';
+import { logSecurity } from '../../shared/services/auditLogger';
 
 interface LoginProps {
   onLoginSuccess: () => void;
@@ -27,9 +28,39 @@ export function Login({ onLoginSuccess }: LoginProps) {
       // Validate token with backend
       await apiClient.validateFirebaseToken(token);
       
+      // Log successful login (Phase 2B → 10F: PHI-safe logging)
+      try {
+        logSecurity({
+          type: "successful_login",
+          severity: "low",
+          title: "Successful login",
+          description: "User logged in successfully",
+          userName: "[REDACTED]", // Phase 10F: Do not log email/PHI
+          userRole: "unknown",
+          ipAddress: "local",
+        });
+      } catch {
+        // Fail silently
+      }
+      
       onLoginSuccess();
     } catch (err: any) {
       setError(err.message || 'Login failed. Please check your credentials.');
+      
+      // Log failed login attempt (Phase 2B → 10F: PHI-safe logging)
+      try {
+        logSecurity({
+          type: "failed_login",
+          severity: "medium",
+          title: "Failed login attempt",
+          description: "Login failed",
+          userName: "[REDACTED]", // Phase 10F: Do not log email/PHI
+          userRole: "unknown",
+          ipAddress: "local",
+        });
+      } catch {
+        // Fail silently
+      }
     } finally {
       setLoading(false);
     }
@@ -60,6 +91,18 @@ export function Login({ onLoginSuccess }: LoginProps) {
         }}>
           Clinic CRM Login
         </h2>
+
+        <div style={{
+          background: '#fff3cd',
+          border: '1px solid #ffc107',
+          borderRadius: '6px',
+          padding: '0.75rem',
+          marginBottom: '1rem',
+          fontSize: '0.875rem',
+          color: '#856404',
+        }}>
+          <strong>Demo Mode:</strong> This is a frontend demo. Production requires backend authentication and RBAC enforcement.
+        </div>
         
         {error && (
           <div style={{
@@ -155,7 +198,7 @@ export function Login({ onLoginSuccess }: LoginProps) {
           fontSize: '0.875rem',
           color: '#666',
         }}>
-          <p>Secure authentication powered by Firebase</p>
+          <p>Frontend demo authentication. Production requires backend auth with proper security controls.</p>
         </div>
       </div>
     </div>

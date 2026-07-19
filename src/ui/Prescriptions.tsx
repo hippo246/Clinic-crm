@@ -1,6 +1,28 @@
 import React, { useState, useEffect, useRef } from "react";
 import type { Patient } from "./types";
 import { fmtDate } from "./utils";
+import {
+  validateRequired,
+  validateMaxLength,
+  safeString,
+} from "../shared/validation/validators";
+import { validatePrescriptionData } from "../shared/validation/entityValidation";
+import { hasRole, normalizeRole } from "../shared/permissions/permissions";
+import { logDeniedAction } from "../shared/services/deniedActionLogger";
+// Phase 8B: Import workflow audit helper and state machine
+import { logWorkflowAction } from "../shared/workflow/workflowAudit";
+import { validateWorkflowTransition, type WorkflowEntityType } from "../shared/workflow/workflowStateMachine";
+// Phase 8C: Import patient validation and handoff helpers
+import { validateWorkflowPatientReference } from "../shared/workflow/workflowValidation";
+import { logSuccessfulHandoff, logFailedHandoff, logBlockedHandoff } from "../shared/workflow/workflowHandoff";
+// Phase 8D: Import clinical safety validation helpers
+import {
+  checkDuplicatePrescription,
+  validatePrescriptionStructure,
+  validateMedicationDoseStructure,
+  validateRefillStructure,
+  cleanupOldDrafts,
+} from "../shared/workflow/clinicalSafety";
 
 interface Prescription {
   id: string;
@@ -55,7 +77,6 @@ interface ActivityEntry {
   timestamp: string;
   action: string;
   patientId?: string;
-  patientName?: string;
   details?: string;
 }
 
@@ -95,8 +116,31 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
   // State with safe localStorage helpers
   const [prescriptions, setPrescriptions] = useState<Prescription[]>(() => readJSON(PRESCRIPTIONS_KEY, []));
   const [refillRequests, setRefillRequests] = useState<RefillRequest[]>(() => readJSON(REFILLS_KEY, []));
-  const [drafts, setDrafts] = useState<PrescriptionDraft[]>(() => readJSON(DRAFTS_KEY, []));
-  const [activity, setActivity] = useState<ActivityEntry[]>(() => readJSON(ACTIVITY_KEY, []));
+  const [drafts, setDrafts] = useState<PrescriptionDraft[]>(() => {
+    const loaded = readJSON(DRAFTS_KEY, []);
+    // Phase 8D: Clean up old drafts (older than 48 hours)
+    const cleanupResult = cleanupOldDrafts(loaded, 48);
+    if (cleanupResult.cleanupCount > 0) {
+      writeJSON(DRAFTS_KEY, cleanupResult.cleanedDrafts);
+      // Log cleanup count only (PHI-safe)
+      console.log(`Cleaned up ${cleanupResult.cleanupCount} old prescription drafts`);
+    }
+    return cleanupResult.cleanedDrafts;
+  });
+  const [activity, setActivity] = useState<ActivityEntry[]>(() => {
+    const loaded = readJSON(ACTIVITY_KEY, []);
+    // Phase 8D: Clean up old activity entries (keep last 50, remove entries older than 48 hours)
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - 48 * 60 * 60 * 1000);
+    const cleaned = loaded.filter((entry: ActivityEntry) => {
+      const entryDate = new Date(entry.timestamp);
+      return entryDate > cutoff;
+    });
+    if (cleaned.length !== loaded.length) {
+      writeJSON(ACTIVITY_KEY, cleaned.slice(0, 50));
+    }
+    return cleaned.slice(0, 50);
+  });
   const [templates, setTemplates] = useState<PrescriptionTemplate[]>(() => {
     const loaded = readJSON(TEMPLATES_KEY, []);
     // Seed default templates if none exist
@@ -160,17 +204,43 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
     setTimeout(() => setFeedback(null), 4000);
   };
 
-  const logActivity = (action: string, patientId?: string, patientName?: string, details?: string) => {
+  // Phase 8B: Remove patientName from activity log (PHI-safe)
+  const logActivity = (action: string, patientId?: string, details?: string) => {
     const entry: ActivityEntry = {
       timestamp: new Date().toISOString(),
       action,
       patientId,
-      patientName,
       details,
     };
     const updated = [entry, ...activity].slice(0, 50);
     setActivity(updated);
     writeJSON(ACTIVITY_KEY, updated);
+  };
+
+  // Normalized role for consistent permission checks
+  const normalizedRole = normalizeRole(userRole) as "admin" | "doctor" | "nurse" | "receptionist" | "billing" | "auditor" | "readonly";
+
+  // Local permission guards for Prescription actions
+  const canCreatePrescription = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canEditPrescription = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canDeletePrescription = hasRole(normalizedRole, ["admin"]);
+  const canDuplicatePrescription = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canRenewPrescription = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canApplyPrescriptionTemplate = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canManagePrescriptionTemplates = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canExportPrescription = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canPrintPrescription = hasRole(normalizedRole, ["admin", "doctor"]);
+  const canExportPrescriptionActivity = hasRole(normalizedRole, ["admin"]);
+
+  // Local denied access helper
+  const handleDeniedAccess = (action: string, resource: string) => {
+    showFeedback(`You don't have permission to ${action} ${resource}.`, "error");
+    logDeniedAction({
+      action,
+      resource,
+      role: normalizedRole,
+      reason: "insufficient_permissions",
+    });
   };
 
   function persistPrescriptions(next: Prescription[]) {
@@ -255,6 +325,73 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
     setNotes("");
   }
 
+  function validatePrescriptionForm(): { valid: boolean; errors: string[]; warnings: string[] } {
+    const errors: string[] = [];
+    const warnings: string[] = [];
+
+    // Validate patient
+    if (!selectedPatient) {
+      errors.push("Please select a patient.");
+    }
+
+    // Validate doctor
+    const doctorError = validateRequired(doctor, "Doctor");
+    if (doctorError) errors.push(doctorError);
+
+    // Validate medications
+    const filledMeds = medications.filter(m => m.name.trim());
+    if (filledMeds.length === 0) {
+      errors.push("Add at least one medication.");
+    }
+
+    // Check for duplicate medications (warning)
+    const medNames = filledMeds.map(m => m.name.toLowerCase().trim());
+    const duplicates = medNames.filter((name, index) => medNames.indexOf(name) !== index);
+    if (duplicates.length > 0) {
+      warnings.push(`Duplicate medication(s): ${[...new Set(duplicates)].join(", ")}`);
+    }
+
+    // Check for missing recommended fields (warning)
+    const missingFields = filledMeds.filter(m => !m.dosage || !m.frequency || !m.duration);
+    if (missingFields.length > 0) {
+      warnings.push("Some medications are missing dosage, frequency, or duration. Please review.");
+    }
+
+    // Check patient allergies (warning)
+    if (selectedPatient?.allergies && selectedPatient.allergies !== "None") {
+      const allergyWarning = filledMeds.some(m =>
+        selectedPatient.allergies?.toLowerCase().includes(m.name.toLowerCase())
+      );
+      if (allergyWarning) {
+        warnings.push("Warning: Patient has allergies. Please review medications.");
+      }
+    }
+
+    // Validate notes max length
+    if (notes) {
+      const notesError = validateMaxLength(notes, 2000, "Notes");
+      if (notesError) errors.push(notesError);
+    }
+
+    // Use shared entity validation as final check
+    if (selectedPatient && doctor && filledMeds.length > 0) {
+      const prescriptionData = {
+        patient_id: selectedPatient.id,
+        patientId: selectedPatient.id,
+        doctor,
+        medications: filledMeds,
+      };
+      const entityValidation = validatePrescriptionData(prescriptionData);
+      if (!entityValidation.valid && entityValidation.errors.length > 0) {
+        entityValidation.errors.forEach((err) => {
+          if (!errors.includes(err)) errors.push(err);
+        });
+      }
+    }
+
+    return { valid: errors.length === 0, errors, warnings };
+  }
+
   function handleSaveDraft() {
     if (!doctor) {
       showFeedback("Doctor is required to save draft.", "warning");
@@ -265,6 +402,28 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
       showFeedback("Add at least one medication to save draft.", "warning");
       return;
     }
+
+    // Phase 8C: Validate patient reference before saving draft
+    if (selectedPatient) {
+      const patientValidation = validateWorkflowPatientReference(selectedPatient.id, patients, {
+        requireActive: true,
+        allowDeleted: false,
+        action: "save prescription draft"
+      });
+      if (!patientValidation.valid) {
+        showFeedback(patientValidation.reason, "error");
+        logBlockedHandoff({
+          fromModule: "prescriptions",
+          toModule: "prescriptions",
+          action: "save_draft",
+          patientId: selectedPatient.id,
+          reason: patientValidation.reason,
+          actor: normalizedRole,
+        });
+        return;
+      }
+    }
+
     const draft: PrescriptionDraft = {
       id: `draft-${Date.now()}`,
       patientId: selectedPatient?.id,
@@ -279,7 +438,21 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
       ? drafts.filter(d => d.patientId !== selectedPatient.id)
       : drafts;
     persistDrafts([draft, ...updatedDrafts]);
-    logActivity("draft saved", selectedPatient?.id, selectedPatient?.name);
+
+    // Phase 8B: Log workflow action for draft save
+    if (selectedPatient) {
+      logWorkflowAction({
+        action: "draft_save",
+        entityType: "prescription",
+        entityId: draft.id,
+        patientId: selectedPatient.id,
+        metadata: {
+          performedBy: normalizedRole,
+        },
+      });
+    }
+
+    logActivity("draft saved", selectedPatient?.id);
     showFeedback("Draft saved successfully.", "success");
   }
 
@@ -291,7 +464,7 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
     setDoctor(draft.doctor);
     setMedications(draft.medications.map(m => ({ ...m, id: `m${Date.now()}-${Math.random()}` })));
     setNotes(draft.notes);
-    logActivity("draft loaded", draft.patientId, draft.patientName);
+    logActivity("draft loaded", draft.patientId);
     showFeedback("Draft loaded.", "info");
   }
 
@@ -309,77 +482,149 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
   }
 
   function handleCreatePrescription() {
-    // Validation
+    if (!canCreatePrescription) {
+      handleDeniedAccess("create", "prescription");
+      return;
+    }
+
+    // Phase 8C: Validate patient reference before creating prescription
     if (!selectedPatient) {
-      showFeedback("Please select a patient.", "error");
+      showFeedback("Please select a patient first.", "error");
       return;
     }
-    if (!doctor) {
-      showFeedback("Please select a doctor.", "error");
+    const patientValidation = validateWorkflowPatientReference(selectedPatient.id, patients, {
+      requireActive: true,
+      allowDeleted: false,
+      action: "create prescription"
+    });
+    if (!patientValidation.valid) {
+      showFeedback(patientValidation.reason, "error");
+      logBlockedHandoff({
+        fromModule: "prescriptions",
+        toModule: "prescriptions",
+        action: "create_prescription",
+        patientId: selectedPatient.id,
+        reason: patientValidation.reason,
+        actor: normalizedRole,
+      });
       return;
     }
+
+    const validation = validatePrescriptionForm();
+
+    // Show errors first
+    if (validation.errors.length > 0) {
+      validation.errors.forEach(error => showFeedback(error, "error"));
+      return;
+    }
+
+    // Show warnings but don't block
+    validation.warnings.forEach(warning => showFeedback(warning, "warning"));
+
     const filledMeds = medications.filter(m => m.name.trim());
-    if (filledMeds.length === 0) {
-      showFeedback("Add at least one medication.", "error");
-      return;
-    }
 
-    // Check for duplicate medications
-    const medNames = filledMeds.map(m => m.name.toLowerCase().trim());
-    const duplicates = medNames.filter((name, index) => medNames.indexOf(name) !== index);
-    if (duplicates.length > 0) {
-      showFeedback(`Duplicate medication(s): ${[...new Set(duplicates)].join(", ")}`, "warning");
-    }
-
-    // Check for missing recommended fields
-    const missingFields = filledMeds.filter(m => !m.dosage || !m.frequency || !m.duration);
-    if (missingFields.length > 0) {
-      showFeedback("Some medications are missing dosage, frequency, or duration. Please review.", "warning");
-    }
-
-    // Check patient allergies
-    if (selectedPatient.allergies && selectedPatient.allergies !== "None") {
-      const allergyWarning = filledMeds.some(m =>
-        selectedPatient.allergies?.toLowerCase().includes(m.name.toLowerCase())
+    // Phase 8D: Check for duplicate active prescriptions
+    for (const med of filledMeds) {
+      const duplicateCheck = checkDuplicatePrescription(
+        selectedPatient!.id,
+        med.name,
+        med.dosage,
+        prescriptions
       );
-      if (allergyWarning) {
-        showFeedback("Warning: Patient has allergies. Please review medications.", "warning");
+      if (duplicateCheck.isDuplicate) {
+        showFeedback(duplicateCheck.reason || "Duplicate active prescription detected", "error");
+        logWorkflowAction({
+          action: "duplicate_prevented",
+          entityType: "prescription",
+          entityId: duplicateCheck.existingRecordId,
+          patientId: selectedPatient!.id,
+          metadata: {
+            reason: duplicateCheck.reason,
+            performedBy: normalizedRole,
+          },
+        });
+        return;
       }
     }
 
+    // Phase 8D: Validate dose/frequency structure
+    const doseValidation = validateMedicationDoseStructure(filledMeds);
+    if (!doseValidation.valid) {
+      doseValidation.errors.forEach(error => showFeedback(error, "error"));
+      logWorkflowAction({
+        action: "validation_failed",
+        entityType: "prescription",
+        patientId: selectedPatient!.id,
+        metadata: {
+          reason: "Dose/frequency validation failed",
+          errors: doseValidation.errors,
+          performedBy: normalizedRole,
+        },
+      });
+      return;
+    }
+    // Show warnings but don't block
+    doseValidation.warnings.forEach(warning => showFeedback(warning, "warning"));
+
     const newRx: Prescription = {
       id: `rx_${Date.now()}`,
-      patientId: selectedPatient.id,
-      patientName: selectedPatient.name,
-      doctor,
-      medications: filledMeds,
+      patientId: selectedPatient!.id,
+      patientName: selectedPatient!.name,
+      doctor: safeString(doctor).trim(),
+      medications: filledMeds.map(m => ({
+        ...m,
+        name: safeString(m.name).trim(),
+        dosage: safeString(m.dosage).trim(),
+        frequency: safeString(m.frequency).trim(),
+        duration: safeString(m.duration).trim(),
+        instructions: safeString(m.instructions).trim(),
+      })),
       createdAt: new Date().toISOString(),
       status: "active",
-      notes,
+      notes: safeString(notes).trim(),
     };
     persistPrescriptions([newRx, ...prescriptions]);
 
     // Clear draft for this patient
-    const updatedDrafts = drafts.filter(d => d.patientId !== selectedPatient.id);
+    const updatedDrafts = drafts.filter(d => d.patientId !== selectedPatient!.id);
     persistDrafts(updatedDrafts);
+
+    // Phase 8C: Log handoff for prescription creation
+    logSuccessfulHandoff({
+      fromModule: "prescriptions",
+      toModule: "patient_profile",
+      action: "prescription_created",
+      patientId: selectedPatient!.id,
+      resourceId: newRx.id,
+      resourceType: "prescription",
+      actor: normalizedRole,
+    });
 
     // Note: Patient prescription update skipped due to type mismatch between Medication and Patient.prescription types
     // Prescriptions are stored in localStorage separately
 
-    logActivity("prescription created", selectedPatient.id, selectedPatient.name, `${filledMeds.length} medication(s)`);
+    logActivity("prescription created", selectedPatient!.id, `${filledMeds.length} medication(s)`);
     showFeedback("Prescription created successfully.", "success");
     clearForm();
     setActiveTab("history");
   }
 
   function handleApplyTemplate(template: PrescriptionTemplate) {
+    if (!canApplyPrescriptionTemplate) {
+      handleDeniedAccess("apply", "prescription template");
+      return;
+    }
     setMedications(template.medications.map(m => ({ ...m, id: `m${Date.now()}-${Math.random()}` })));
     if (template.notes) setNotes(template.notes);
-    logActivity("template applied", undefined, undefined, `Template: ${template.name}`);
+    logActivity("template applied", undefined, `Template: ${template.name}`);
     showFeedback(`Template "${template.name}" applied.`, "success");
   }
 
   function handleSaveTemplate() {
+    if (!canManagePrescriptionTemplates) {
+      handleDeniedAccess("save", "prescription template");
+      return;
+    }
     const filledMeds = medications.filter(m => m.name.trim());
     if (filledMeds.length === 0) {
       showFeedback("Add at least one medication to save as template.", "warning");
@@ -393,18 +638,22 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
       notes: notes || undefined,
     };
     persistTemplates([...templates, newTemplate]);
-    logActivity("template saved", undefined, undefined, `Template: ${newTemplate.name}`);
+    logActivity("template saved", undefined, `Template: ${newTemplate.name}`);
     showFeedback("Template saved successfully.", "success");
     setShowTemplateModal(false);
   }
 
   function handleDeleteTemplate(templateId: string) {
+    if (!canManagePrescriptionTemplates) {
+      handleDeniedAccess("delete", "prescription template");
+      return;
+    }
     setConfirmModal({
       message: "Are you sure you want to delete this template?",
       onConfirm: () => {
         const updated = templates.filter(t => t.id !== templateId);
         persistTemplates(updated);
-        logActivity("template deleted", undefined, undefined, `Template ID: ${templateId}`);
+        logActivity("template deleted", undefined, `Template ID: ${templateId}`);
         showFeedback("Template deleted.", "info");
         setConfirmModal(null);
       },
@@ -412,16 +661,24 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
   }
 
   function handleDuplicatePrescription(rx: Prescription) {
+    if (!canDuplicatePrescription) {
+      handleDeniedAccess("duplicate", "prescription");
+      return;
+    }
     setSelectedPatient(patients.find(p => p.id === rx.patientId) || null);
     setDoctor(rx.doctor);
     setMedications(rx.medications.map(m => ({ ...m, id: `m${Date.now()}-${Math.random()}` })));
     setNotes(rx.notes);
     setActiveTab("create");
-    logActivity("prescription duplicated", rx.patientId, rx.patientName);
+    logActivity("prescription duplicated", rx.patientId);
     showFeedback("Prescription duplicated. Review and save as new.", "info");
   }
 
   function handleEditPrescription(rx: Prescription) {
+    if (!canEditPrescription) {
+      handleDeniedAccess("edit", "prescription");
+      return;
+    }
     if (rx.status !== "active") {
       showFeedback("Only active prescriptions can be edited.", "warning");
       return;
@@ -432,25 +689,45 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
     setMedications(rx.medications.map(m => ({ ...m, id: `m${Date.now()}-${Math.random()}` })));
     setNotes(rx.notes);
     setActiveTab("create");
-    logActivity("prescription editing started", rx.patientId, rx.patientName);
+    logActivity("prescription editing started", rx.patientId);
   }
 
   function handleUpdatePrescription() {
-    if (!editingRx) return;
-    const filledMeds = medications.filter(m => m.name.trim());
-    if (filledMeds.length === 0) {
-      showFeedback("Add at least one medication.", "error");
+    if (!canEditPrescription) {
+      handleDeniedAccess("edit", "prescription");
       return;
     }
+    if (!editingRx) return;
+
+    const validation = validatePrescriptionForm();
+
+    // Show errors first
+    if (validation.errors.length > 0) {
+      validation.errors.forEach(error => showFeedback(error, "error"));
+      return;
+    }
+
+    // Show warnings but don't block
+    validation.warnings.forEach(warning => showFeedback(warning, "warning"));
+
+    const filledMeds = medications.filter(m => m.name.trim());
+
     const updated: Prescription = {
       ...editingRx,
-      medications: filledMeds,
-      doctor,
-      notes,
+      medications: filledMeds.map(m => ({
+        ...m,
+        name: safeString(m.name).trim(),
+        dosage: safeString(m.dosage).trim(),
+        frequency: safeString(m.frequency).trim(),
+        duration: safeString(m.duration).trim(),
+        instructions: safeString(m.instructions).trim(),
+      })),
+      doctor: safeString(doctor).trim(),
+      notes: safeString(notes).trim(),
     };
     const updatedList = prescriptions.map(p => p.id === editingRx.id ? updated : p);
     persistPrescriptions(updatedList);
-    logActivity("prescription updated", editingRx.patientId, editingRx.patientName);
+    logActivity("prescription updated", editingRx.patientId);
     showFeedback("Prescription updated successfully.", "success");
     setEditingRx(null);
     clearForm();
@@ -458,23 +735,124 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
   }
 
   function handleMarkCompleted(rxId: string) {
+    if (!canEditPrescription) {
+      handleDeniedAccess("mark completed", "prescription");
+      return;
+    }
     const rx = prescriptions.find(p => p.id === rxId);
     if (!rx) return;
+
+    // Phase 8B: Validate status transition using state machine
+    const transitionResult = validateWorkflowTransition(
+      "prescription" as WorkflowEntityType,
+      rx.status,
+      "completed"
+    );
+    if (!transitionResult.valid) {
+      showFeedback(`Invalid status transition: ${transitionResult.reason}`, "error");
+      return;
+    }
+
+    // Phase 8D.1: Validate prescription structure before completion
+    const structureValidation = validatePrescriptionStructure(rx);
+    if (!structureValidation.valid) {
+      structureValidation.errors.forEach(error => showFeedback(error, "error"));
+      logWorkflowAction({
+        action: "validation_failed",
+        entityType: "prescription",
+        entityId: rxId,
+        patientId: rx.patientId,
+        metadata: {
+          reason: "Structural validation failed before completion",
+          errors: structureValidation.errors,
+          performedBy: normalizedRole,
+        },
+      });
+      return;
+    }
+    // Show warnings but don't block
+    structureValidation.warnings.forEach(warning => showFeedback(warning, "warning"));
+
+    // Phase 8D.1: Validate dose/frequency structure before completion
+    const doseValidation = validateMedicationDoseStructure(rx.medications);
+    if (!doseValidation.valid) {
+      doseValidation.errors.forEach(error => showFeedback(error, "error"));
+      logWorkflowAction({
+        action: "validation_failed",
+        entityType: "prescription",
+        entityId: rxId,
+        patientId: rx.patientId,
+        metadata: {
+          reason: "Dose/frequency validation failed before completion",
+          errors: doseValidation.errors,
+          performedBy: normalizedRole,
+        },
+      });
+      return;
+    }
+    // Show warnings but don't block
+    doseValidation.warnings.forEach(warning => showFeedback(warning, "warning"));
+
     const updated = { ...rx, status: "completed" as const };
     persistPrescriptions(prescriptions.map(p => p.id === rxId ? updated : p));
-    logActivity("prescription marked completed", rx.patientId, rx.patientName);
+
+    // Phase 8B: Log workflow action for status change
+    logWorkflowAction({
+      action: "status_change",
+      entityType: "prescription",
+      entityId: rxId,
+      patientId: rx.patientId,
+      metadata: {
+        fromStatus: rx.status,
+        toStatus: "completed",
+        performedBy: normalizedRole,
+      },
+    });
+
+    logActivity("prescription marked completed", rx.patientId);
     showFeedback("Prescription marked as completed.", "success");
   }
 
   function handleCancelPrescription(rxId: string) {
+    if (!canDeletePrescription) {
+      handleDeniedAccess("cancel", "prescription");
+      return;
+    }
     setConfirmModal({
       message: "Are you sure you want to cancel this prescription?",
       onConfirm: () => {
         const rx = prescriptions.find(p => p.id === rxId);
         if (!rx) return;
+
+        // Phase 8B: Validate status transition using state machine
+        const transitionResult = validateWorkflowTransition(
+          "prescription" as WorkflowEntityType,
+          rx.status,
+          "cancelled"
+        );
+        if (!transitionResult.valid) {
+          showFeedback(`Invalid status transition: ${transitionResult.reason}`, "error");
+          setConfirmModal(null);
+          return;
+        }
+
         const updated = { ...rx, status: "cancelled" as const };
         persistPrescriptions(prescriptions.map(p => p.id === rxId ? updated : p));
-        logActivity("prescription cancelled", rx.patientId, rx.patientName);
+
+        // Phase 8B: Log workflow action for status change
+        logWorkflowAction({
+          action: "status_change",
+          entityType: "prescription",
+          entityId: rxId,
+          patientId: rx.patientId,
+          metadata: {
+            fromStatus: rx.status,
+            toStatus: "cancelled",
+            performedBy: normalizedRole,
+          },
+        });
+
+        logActivity("prescription cancelled", rx.patientId);
         showFeedback("Prescription cancelled.", "success");
         setConfirmModal(null);
       },
@@ -482,6 +860,10 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
   }
 
   function handleDeletePrescription(rxId: string) {
+    if (!canDeletePrescription) {
+      handleDeniedAccess("delete", "prescription");
+      return;
+    }
     setConfirmModal({
       message: "Are you sure you want to delete this prescription? This cannot be undone.",
       onConfirm: () => {
@@ -489,7 +871,7 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
         const updated = prescriptions.filter(p => p.id !== rxId);
         persistPrescriptions(updated);
         if (viewingRx?.id === rxId) setViewingRx(null);
-        logActivity("prescription deleted", rx?.patientId, rx?.patientName);
+        logActivity("prescription deleted", rx?.patientId);
         showFeedback("Prescription deleted.", "success");
         setConfirmModal(null);
       },
@@ -511,7 +893,7 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
       notes: refillForm.notes,
     };
     persistRefills([newRefill, ...refillRequests]);
-    logActivity("refill request created", undefined, refillForm.patientName, refillForm.medication);
+    logActivity("refill request created", undefined, refillForm.medication);
     showFeedback("Refill request created.", "success");
     setShowRefillModal(false);
     setRefillForm({ prescriptionId: "", patientName: "", medication: "", notes: "" });
@@ -521,6 +903,37 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
     const refill = refillRequests.find(r => r.id === id);
     if (!refill) return;
 
+    // Phase 8D: Require doctor/admin role for refill approval/rejection
+    if (decision === "approved" || decision === "rejected") {
+      if (!hasRole(normalizedRole, ["admin", "doctor"])) {
+        handleDeniedAccess(decision, "refill request");
+        return;
+      }
+    }
+
+    // Phase 8D: Validate refill structure before approval
+    if (decision === "approved") {
+      const refillValidation = validateRefillStructure({
+        prescriptionId: refill.prescriptionId,
+        patientId: refill.patientName, // Note: using patientName as patientId in current model
+        medication: refill.medication,
+      });
+      if (!refillValidation.valid) {
+        refillValidation.errors.forEach(error => showFeedback(error, "error"));
+        logWorkflowAction({
+          action: "validation_failed",
+          entityType: "refill",
+          entityId: id,
+          metadata: {
+            reason: "Refill validation failed before approval",
+            errors: refillValidation.errors,
+            performedBy: normalizedRole,
+          },
+        });
+        return;
+      }
+    }
+
     if (decision === "approved") {
       const rx = prescriptions.find(p => p.id === refill.prescriptionId);
       if (rx && (rx.status === "cancelled" || rx.status === "completed")) {
@@ -528,7 +941,17 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
           message: "This prescription is cancelled or completed. Are you sure you want to approve the refill?",
           onConfirm: () => {
             persistRefills(refillRequests.map(r => r.id === id ? { ...r, status: decision } : r));
-            logActivity("refill approved", undefined, refill.patientName, refill.medication);
+            // Phase 8D: Log refill approval with PHI-safe audit logging
+            logWorkflowAction({
+              action: "refill_approved",
+              entityType: "refill",
+              entityId: id,
+              metadata: {
+                prescriptionId: refill.prescriptionId,
+                performedBy: normalizedRole,
+              },
+            });
+            logActivity("refill approved", undefined, refill.medication);
             showFeedback("Refill approved.", "success");
             setConfirmModal(null);
           },
@@ -538,7 +961,31 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
     }
 
     persistRefills(refillRequests.map(r => r.id === id ? { ...r, status: decision } : r));
-    logActivity(`refill ${decision}`, undefined, refill.patientName, refill.medication);
+
+    // Phase 8D: Log refill decision with PHI-safe audit logging
+    if (decision === "approved") {
+      logWorkflowAction({
+        action: "refill_approved",
+        entityType: "refill",
+        entityId: id,
+        metadata: {
+          prescriptionId: refill.prescriptionId,
+          performedBy: normalizedRole,
+        },
+      });
+    } else if (decision === "rejected") {
+      logWorkflowAction({
+        action: "refill_rejected",
+        entityType: "refill",
+        entityId: id,
+        metadata: {
+          prescriptionId: refill.prescriptionId,
+          performedBy: normalizedRole,
+        },
+      });
+    }
+
+    logActivity(`refill ${decision}`, undefined, refill.medication);
     showFeedback(`Refill ${decision}.`, "success");
   }
 
@@ -556,6 +1003,10 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
   }
 
   function handleExportPrescriptionsCSV() {
+    if (!canExportPrescription) {
+      handleDeniedAccess("export", "prescriptions CSV");
+      return;
+    }
     const filtered = prescriptions.filter(p => {
       if (filterStatus && p.status !== filterStatus) return false;
       if (filterDoctor && p.doctor !== filterDoctor) return false;
@@ -598,11 +1049,34 @@ export default function PrescriptionsPage({ patients, onUpdatePatient, userRole 
     a.click();
     URL.revokeObjectURL(url);
 
-    logActivity("prescriptions exported as CSV", undefined, undefined, `${filtered.length} records`);
+    logActivity("prescriptions exported as CSV", undefined, `${filtered.length} records`);
     showFeedback(`Exported ${filtered.length} prescription(s) as CSV.`, "success");
   }
 
   function handleExportPrescriptionTXT(rx: Prescription) {
+    if (!canExportPrescription) {
+      handleDeniedAccess("export", "prescription TXT");
+      return;
+    }
+
+    // Phase 8D: Validate prescription structure before export
+    const structureValidation = validatePrescriptionStructure(rx);
+    if (!structureValidation.valid) {
+      structureValidation.errors.forEach(error => showFeedback(error, "error"));
+      logWorkflowAction({
+        action: "validation_failed",
+        entityType: "prescription",
+        entityId: rx.id,
+        patientId: rx.patientId,
+        metadata: {
+          reason: "Structural validation failed before export",
+          errors: structureValidation.errors,
+          performedBy: normalizedRole,
+        },
+      });
+      return;
+    }
+
     const txt = `
 PRESCRIPTION
 ============
@@ -638,6 +1112,10 @@ Generated by Clinic CRM
   }
 
   function handleExportRefillsCSV() {
+    if (!canExportPrescription) {
+      handleDeniedAccess("export", "refill requests CSV");
+      return;
+    }
     if (refillRequests.length === 0) {
       showFeedback("No refill requests to export.", "info");
       return;
@@ -662,22 +1140,25 @@ Generated by Clinic CRM
     a.click();
     URL.revokeObjectURL(url);
 
-    logActivity("refill requests exported as CSV", undefined, undefined, `${refillRequests.length} records`);
+    logActivity("refill requests exported as CSV", undefined, `${refillRequests.length} records`);
     showFeedback(`Exported ${refillRequests.length} refill request(s) as CSV.`, "success");
   }
 
   function handleExportActivityCSV() {
+    if (!canExportPrescriptionActivity) {
+      handleDeniedAccess("export", "prescription activity CSV");
+      return;
+    }
     if (activity.length === 0) {
       showFeedback("No activity to export.", "info");
       return;
     }
 
-    const header = "Timestamp,Action,Patient ID,Patient Name,Details\n";
+    const header = "Timestamp,Action,Patient ID,Details\n";
     const rows = activity.map(a => [
       `"${new Date(a.timestamp).toLocaleString()}"`,
       `"${a.action}"`,
       `"${a.patientId || ""}"`,
-      `"${(a.patientName || "").replace(/"/g, '""')}"`,
       `"${(a.details || "").replace(/"/g, '""')}"`,
     ].join(",")).join("\n");
 
@@ -693,6 +1174,10 @@ Generated by Clinic CRM
   }
 
   function handleClearActivity() {
+    if (!canExportPrescriptionActivity) {
+      handleDeniedAccess("clear", "prescription activity");
+      return;
+    }
     setConfirmModal({
       message: "Are you sure you want to clear all activity logs?",
       onConfirm: () => {
@@ -708,6 +1193,10 @@ Generated by Clinic CRM
   const pendingRefills = refillRequests.filter((r: RefillRequest) => r.status === "pending");
 
   function handlePrint(p: Prescription) {
+    if (!canPrintPrescription) {
+      handleDeniedAccess("print", "prescription");
+      return;
+    }
     const win = window.open("", "_blank");
     if (!win) return;
     const medsHtml = p.medications.map(m => `
@@ -839,12 +1328,16 @@ Generated by Clinic CRM
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
             <div className="section-label" style={{ margin: 0 }}>Activity Log ({activity.length})</div>
             <div style={{ display: "flex", gap: 4 }}>
-              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handleExportActivityCSV}>
-                <i className="ti ti-download" style={{ fontSize: 11, marginRight: 4 }} />Export CSV
-              </button>
-              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px", color: "var(--red)" }} onClick={handleClearActivity}>
-                <i className="ti ti-trash" style={{ fontSize: 11, marginRight: 4 }} />Clear
-              </button>
+              {canExportPrescriptionActivity && (
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handleExportActivityCSV}>
+                  <i className="ti ti-download" style={{ fontSize: 11, marginRight: 4 }} />Export CSV
+                </button>
+              )}
+              {canExportPrescriptionActivity && (
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px", color: "var(--red)" }} onClick={handleClearActivity}>
+                  <i className="ti ti-trash" style={{ fontSize: 11, marginRight: 4 }} />Clear
+                </button>
+              )}
               <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={() => setShowActivity(false)}>
                 <i className="ti ti-x" style={{ fontSize: 11 }} />
               </button>
@@ -862,7 +1355,11 @@ Generated by Clinic CRM
                     <span style={{ fontWeight: 600 }}>{a.action}</span>
                     <span style={{ color: "var(--muted)" }}>{new Date(a.timestamp).toLocaleString()}</span>
                   </div>
-                  {a.patientName && <div style={{ color: "var(--muted)" }}>Patient: {a.patientName}</div>}
+                  {a.patientId && (
+                    <div style={{ color: "var(--muted)" }}>
+                      Patient: {patients.find(p => p.id === a.patientId)?.name || a.patientId}
+                    </div>
+                  )}
                   {a.details && <div style={{ color: "var(--muted)", fontStyle: "italic" }}>{a.details}</div>}
                 </div>
               ))}
@@ -877,9 +1374,11 @@ Generated by Clinic CRM
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
             <div className="section-label" style={{ margin: 0 }}>Clinical Templates</div>
             <div style={{ display: "flex", gap: 4 }}>
-              <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handleSaveTemplate}>
-                <i className="ti ti-plus" style={{ fontSize: 11, marginRight: 4 }} />Save Current as Template
-              </button>
+              {canManagePrescriptionTemplates && (
+                <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={handleSaveTemplate}>
+                  <i className="ti ti-plus" style={{ fontSize: 11, marginRight: 4 }} />Save Current as Template
+                </button>
+              )}
               <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 10px" }} onClick={() => setShowTemplateModal(false)}>
                 <i className="ti ti-x" style={{ fontSize: 11 }} />
               </button>
@@ -900,9 +1399,11 @@ Generated by Clinic CRM
                     <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", flex: 1 }} onClick={() => handleApplyTemplate(t)}>
                       Apply
                     </button>
-                    <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", color: "var(--red)" }} onClick={() => handleDeleteTemplate(t.id)}>
-                      <i className="ti ti-trash" style={{ fontSize: 11 }} />
-                    </button>
+                    {canManagePrescriptionTemplates && (
+                      <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "4px 8px", color: "var(--red)" }} onClick={() => handleDeleteTemplate(t.id)}>
+                        <i className="ti ti-trash" style={{ fontSize: 11 }} />
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}
@@ -1225,19 +1726,25 @@ Generated by Clinic CRM
                     <td>
                       <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                         <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => setViewingRx(p)}>View</button>
-                        {p.status === "active" && userRole !== "receptionist" && (
+                        {p.status === "active" && canEditPrescription && (
                           <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleEditPrescription(p)}>Edit</button>
                         )}
-                        <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleDuplicatePrescription(p)}>Duplicate</button>
-                        {p.status === "active" && (
+                        {canDuplicatePrescription && (
+                          <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleDuplicatePrescription(p)}>Duplicate</button>
+                        )}
+                        {p.status === "active" && canEditPrescription && (
                           <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--green)" }} onClick={() => handleMarkCompleted(p.id)}>Complete</button>
                         )}
-                        {p.status === "active" && userRole !== "receptionist" && (
+                        {p.status === "active" && canDeletePrescription && (
                           <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--red)" }} onClick={() => handleCancelPrescription(p.id)}>Cancel</button>
                         )}
-                        <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handlePrint(p)}>Print</button>
-                        <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleExportPrescriptionTXT(p)}>Export</button>
-                        {userRole !== "receptionist" && (
+                        {canPrintPrescription && (
+                          <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handlePrint(p)}>Print</button>
+                        )}
+                        {canExportPrescription && (
+                          <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleExportPrescriptionTXT(p)}>Export</button>
+                        )}
+                        {canDeletePrescription && (
                           <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--red)" }} onClick={() => handleDeletePrescription(p.id)}>Delete</button>
                         )}
                       </div>
@@ -1292,16 +1799,16 @@ Generated by Clinic CRM
                   </td>
                   <td>
                     <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                      {r.status === "pending" && userRole !== "receptionist" && (
+                      {r.status === "pending" && canEditPrescription && (
                         <>
                           <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleRefillDecision(r.id, "approved")}>Approve</button>
                           <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--red)" }} onClick={() => handleRefillDecision(r.id, "rejected")}>Reject</button>
                         </>
                       )}
-                      {r.status !== "pending" && userRole !== "receptionist" && (
+                      {r.status !== "pending" && canEditPrescription && (
                         <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)" }} onClick={() => handleRefillDecision(r.id, "pending")}>Mark Pending</button>
                       )}
-                      {userRole !== "receptionist" && (
+                      {canEditPrescription && (
                         <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", color: "var(--red)" }} onClick={() => handleDeleteRefill(r.id)}>Delete</button>
                       )}
                     </div>
@@ -1381,30 +1888,36 @@ Generated by Clinic CRM
                 <i className="ti ti-share" style={{ fontSize: 13, marginRight: 4 }} />
                 Share
               </button>
-              <button className="btn btn-ghost" onClick={() => handleExportPrescriptionTXT(viewingRx)}>
-                <i className="ti ti-download" style={{ fontSize: 13, marginRight: 4 }} />
-                Export
-              </button>
-              <button className="btn btn-ghost" onClick={() => handleDuplicatePrescription(viewingRx)}>
-                <i className="ti ti-copy" style={{ fontSize: 13, marginRight: 4 }} />
-                Duplicate
-              </button>
-              {viewingRx.status === "active" && userRole !== "receptionist" && (
+              {canExportPrescription && (
+                <button className="btn btn-ghost" onClick={() => handleExportPrescriptionTXT(viewingRx)}>
+                  <i className="ti ti-download" style={{ fontSize: 13, marginRight: 4 }} />
+                  Export
+                </button>
+              )}
+              {canDuplicatePrescription && (
+                <button className="btn btn-ghost" onClick={() => handleDuplicatePrescription(viewingRx)}>
+                  <i className="ti ti-copy" style={{ fontSize: 13, marginRight: 4 }} />
+                  Duplicate
+                </button>
+              )}
+              {viewingRx.status === "active" && canEditPrescription && (
                 <button className="btn btn-ghost" style={{ color: "var(--green)" }} onClick={() => handleMarkCompleted(viewingRx.id)}>
                   <i className="ti ti-check" style={{ fontSize: 13, marginRight: 4 }} />
                   Complete
                 </button>
               )}
-              {viewingRx.status === "active" && userRole !== "receptionist" && (
+              {viewingRx.status === "active" && canDeletePrescription && (
                 <button className="btn btn-ghost" style={{ color: "var(--red)" }} onClick={() => handleCancelPrescription(viewingRx.id)}>
                   <i className="ti ti-x" style={{ fontSize: 13, marginRight: 4 }} />
                   Cancel
                 </button>
               )}
-              <button className="btn btn-primary" onClick={() => handlePrint(viewingRx)}>
-                <i className="ti ti-printer" style={{ fontSize: 13, marginRight: 4 }} />
-                Print
-              </button>
+              {canPrintPrescription && (
+                <button className="btn btn-primary" onClick={() => handlePrint(viewingRx)}>
+                  <i className="ti ti-printer" style={{ fontSize: 13, marginRight: 4 }} />
+                  Print
+                </button>
+              )}
             </div>
           </div>
         </div>

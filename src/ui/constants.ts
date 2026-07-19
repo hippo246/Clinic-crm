@@ -123,3 +123,13 @@ export function can(role: string, permission: string): boolean {
   if (!allowed) return false;
   return allowed.includes(role);
 }
+
+// ─── Shared Infrastructure (Phase 1) ─────────────────────────────────────────────────
+// The following shared infrastructure has been created in src/shared/ for future migration:
+// - src/shared/constants/appConstants.ts (DOCTORS, INSURERS, GENDERS, BLOOD_GROUPS, STATUSES, etc.)
+// - src/shared/permissions/permissions.ts (UserRole, Permission, ROLE_PERMISSIONS, can, canAny, canAll)
+//
+// Current constants in this file (constants.ts) are kept as-is for backward compatibility.
+// The shared infrastructure has similar but not identical constants to avoid breaking changes.
+// Future phases may migrate to use the shared infrastructure incrementally after reviewing differences.
+// No breaking changes in Phase 1.

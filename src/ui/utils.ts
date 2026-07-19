@@ -1,5 +1,6 @@
-import type { Patient, AuditEntry, RiskResult, NextBestAction, VisitReadiness, PatientStats } from "./types";
+import type { Patient, AuditEntry, RiskResult, NextBestAction, VisitReadiness, PatientStats, DuplicateGroup, DuplicateConfidence, ReviewedDuplicatePair } from "./types";
 import { AVATAR_COLORS, ALERT_SEVERITY } from "./constants";
+import { logExport } from "../shared/services/auditLogger";
 
 // ─── Date / Format ─────────────────────────────────────────────────────────────
 export function fmtDate(d: Date | string | null | undefined): string {
@@ -277,37 +278,313 @@ export function buildSmartSnapshot(patient: Partial<Patient>): string {
   return parts.length > 0 ? parts.join(" ") : "No urgent flags for this patient.";
 }
 
-// ─── Duplicate Detection ───────────────────────────────────────────────────────
-export interface DuplicateGroup {
-  type: string;
-  patients: [Patient, Patient];
-  field: string;
-  value: string;
-}
+// ─── Duplicate Detection (Phase 7E Enhanced) ───────────────────────────────────
 
 export function detectDuplicates(patients: Patient[]): DuplicateGroup[] {
   const duplicates: DuplicateGroup[] = [];
   const phoneMap = new Map<string, Patient>();
+  const emailMap = new Map<string, Patient>();
   const nameMap  = new Map<string, Patient>();
 
   patients.forEach((p) => {
+    // Phone match - high confidence
     if (p.phone) {
       const norm = p.phone.replace(/\D/g, "").slice(-10);
       if (phoneMap.has(norm)) {
-        duplicates.push({ type: "phone", patients: [phoneMap.get(norm)!, p], field: "phone", value: p.phone });
+        duplicates.push({ 
+          type: "phone", 
+          patients: [phoneMap.get(norm)!, p], 
+          field: "phone", 
+          value: p.phone,
+          confidence: "high" as DuplicateConfidence
+        });
       } else {
         phoneMap.set(norm, p);
       }
     }
+    
+    // Email match - high confidence
+    if (p.email) {
+      const norm = p.email.toLowerCase().trim();
+      if (emailMap.has(norm)) {
+        duplicates.push({ 
+          type: "email", 
+          patients: [emailMap.get(norm)!, p], 
+          field: "email", 
+          value: p.email,
+          confidence: "high" as DuplicateConfidence
+        });
+      } else {
+        emailMap.set(norm, p);
+      }
+    }
+    
+    // Name + DOB match - high confidence
     const key = `${p.name.toLowerCase()}-${p.dob || ""}`;
     if (nameMap.has(key)) {
-      duplicates.push({ type: "name_dob", patients: [nameMap.get(key)!, p], field: "name", value: p.name });
+      duplicates.push({ 
+        type: "name_dob", 
+        patients: [nameMap.get(key)!, p], 
+        field: "name", 
+        value: p.name,
+        confidence: "high" as DuplicateConfidence
+      });
     } else {
       nameMap.set(key, p);
     }
   });
 
   return duplicates;
+}
+
+// ─── Reviewed Duplicate Storage (Phase 7E) ─────────────────────────────────────
+const REVIEWED_DUPLICATES_KEY = "clinic_crm_reviewed_duplicates_v1";
+
+export function getReviewedDuplicates(): ReviewedDuplicatePair[] {
+  try {
+    const raw = localStorage.getItem(REVIEWED_DUPLICATES_KEY);
+    if (!raw) return [];
+    return JSON.parse(raw) as ReviewedDuplicatePair[];
+  } catch (error) {
+    console.error("Failed to load reviewed duplicates:", error);
+    return [];
+  }
+}
+
+export function saveReviewedDuplicate(pair: ReviewedDuplicatePair): void {
+  try {
+    const reviewed = getReviewedDuplicates();
+    reviewed.push(pair);
+    localStorage.setItem(REVIEWED_DUPLICATES_KEY, JSON.stringify(reviewed));
+  } catch (error) {
+    console.error("Failed to save reviewed duplicate:", error);
+  }
+}
+
+export function isDuplicateReviewed(patientId1: string, patientId2: string): boolean {
+  const reviewed = getReviewedDuplicates();
+  return reviewed.some(
+    r => (r.patientId1 === patientId1 && r.patientId2 === patientId2) ||
+         (r.patientId1 === patientId2 && r.patientId2 === patientId1)
+  );
+}
+
+export function filterReviewedDuplicates(duplicates: DuplicateGroup[]): DuplicateGroup[] {
+  return duplicates.filter(dup => 
+    !isDuplicateReviewed(dup.patients[0].id, dup.patients[1].id)
+  );
+}
+
+// ─── Field-Level Privacy Helpers (Phase 7G) ───────────────────────────────────────
+export function maskPhone(phone: string): string {
+  if (!phone) return "";
+  const visible = phone.slice(0, 3);
+  const masked = "*".repeat(Math.max(0, phone.length - 3));
+  return visible + masked;
+}
+
+export function maskEmail(email: string): string {
+  if (!email) return "";
+  const [local, domain] = email.split("@");
+  if (!domain) return email;
+  const maskedLocal = local.slice(0, 2) + "*".repeat(Math.max(0, local.length - 2));
+  return maskedLocal + "@" + domain;
+}
+
+export function maskAddress(address: string): string {
+  if (!address) return "";
+  const parts = address.split(",");
+  if (parts.length <= 1) return address;
+  return parts[0] + ", " + "*".repeat(10);
+}
+
+export function canViewClinicalField(role: string, field: string): boolean {
+  const adminDoctorNurse = ["admin", "doctor", "nurse"].includes(role.toLowerCase());
+  if (["alerts", "conditions", "medications", "clinicalNotes", "diagnosis"].includes(field)) {
+    return adminDoctorNurse;
+  }
+  return true;
+}
+
+export function canViewBillingField(role: string, field: string): boolean {
+  const adminDoctorBilling = ["admin", "doctor", "billing"].includes(role.toLowerCase());
+  if (["insurer", "insuranceStatus", "insuranceExpiry", "insuranceId"].includes(field)) {
+    return adminDoctorBilling;
+  }
+  return true;
+}
+
+// ─── Merge Preview Helper (Phase 7E) ────────────────────────────────────────────
+import type { MergePreview } from "./types";
+
+export function buildMergePreview(masterPatient: Patient, duplicatePatient: Patient): MergePreview {
+  const fieldDifferences: Array<{
+    field: keyof Patient;
+    masterValue: any;
+    duplicateValue: any;
+    useMaster: boolean;
+  }> = [];
+  
+  const fieldsToCompare: (keyof Patient)[] = [
+    "name", "phone", "email", "dob", "age", "gender", "bloodGroup", 
+    "address", "doctor", "status", "insurer", "insuranceStatus", 
+    "insuranceExpiry", "lastVisit", "nextAppointment"
+  ];
+  
+  fieldsToCompare.forEach(field => {
+    const masterVal = masterPatient[field];
+    const dupVal = duplicatePatient[field];
+    
+    if (masterVal !== dupVal) {
+      fieldDifferences.push({
+        field,
+        masterValue: masterVal,
+        duplicateValue: dupVal,
+        useMaster: true // Default to keeping master value
+      });
+    }
+  });
+  
+  return {
+    masterPatient,
+    duplicatePatient,
+    fieldDifferences
+  };
+}
+
+// ─── Soft-Delete/Archive Helpers (Phase 7B) ─────────────────────────────────────
+export function isPatientDeleted(patient: Patient): boolean {
+  return !!patient.deletedAt;
+}
+
+export function isPatientArchived(patient: Patient): boolean {
+  return patient.status === "Archived" || !!patient.archivedAt;
+}
+
+export function getActivePatients(patients: Patient[]): Patient[] {
+  return patients.filter(p => !p.deletedAt);
+}
+
+export function getArchivedPatients(patients: Patient[]): Patient[] {
+  return patients.filter(p => !!p.deletedAt);
+}
+
+// ─── Import Validation Helpers (Phase 7D) ───────────────────────────────────────
+import type { PatientImportRow, PatientImportSummary, ImportRowStatus } from "./types";
+
+export function validateImportedPatientRow(row: Partial<Patient>, existingPatients: Patient[]): { status: ImportRowStatus; issues: string[]; matchedPatientId?: string } {
+  const issues: string[] = [];
+  
+  // Required field validation
+  if (!row.name || row.name.trim() === "") {
+    issues.push("Missing required field: name");
+  }
+  
+  // Phone format validation
+  if (row.phone && row.phone.trim() !== "") {
+    const phoneDigits = row.phone.replace(/\D/g, "");
+    if (phoneDigits.length < 10) {
+      issues.push("Invalid phone format (must have at least 10 digits)");
+    }
+  }
+  
+  // Email format validation
+  if (row.email && row.email.trim() !== "") {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(row.email)) {
+      issues.push("Invalid email format");
+    }
+  }
+  
+  // DOB validation
+  if (row.dob && row.dob.trim() !== "") {
+    const dobDate = new Date(row.dob);
+    if (isNaN(dobDate.getTime())) {
+      issues.push("Invalid date of birth format");
+    }
+  }
+  
+  // Duplicate detection
+  const matchedById = existingPatients.find(p => row.id && p.id === row.id);
+  const matchedByPhone = existingPatients.find(p => row.phone && p.phone === row.phone);
+  const matchedByEmail = existingPatients.find(p => row.email && p.email === row.email);
+  const matchedByNameDob = existingPatients.find(p => 
+    row.name && row.name === p.name && 
+    row.dob && row.dob === p.dob
+  );
+  
+  if (matchedById) {
+    return { status: "update", issues: [], matchedPatientId: matchedById.id };
+  }
+  
+  if (matchedByPhone || matchedByEmail || matchedByNameDob) {
+    issues.push("Potential duplicate detected (matches existing patient by phone, email, or name+DOB)");
+    return { status: "duplicate", issues, matchedPatientId: matchedByPhone?.id || matchedByEmail?.id || matchedByNameDob?.id };
+  }
+  
+  if (issues.length > 0) {
+    return { status: "invalid", issues };
+  }
+  
+  return { status: "valid", issues: [] };
+}
+
+export function buildPatientImportPreview(rows: Partial<Patient>[], existingPatients: Patient[]): PatientImportRow[] {
+  return rows.map((row, index) => {
+    const validation = validateImportedPatientRow(row, existingPatients);
+    return {
+      index,
+      data: row,
+      status: validation.status,
+      issues: validation.issues,
+      matchedPatientId: validation.matchedPatientId
+    };
+  });
+}
+
+export function getPatientImportSummary(previewRows: PatientImportRow[]): PatientImportSummary {
+  return {
+    total: previewRows.length,
+    valid: previewRows.filter(r => r.status === "valid").length,
+    invalid: previewRows.filter(r => r.status === "invalid").length,
+    duplicate: previewRows.filter(r => r.status === "duplicate").length,
+    update: previewRows.filter(r => r.status === "update").length,
+    skipped: previewRows.filter(r => r.status === "skipped").length
+  };
+}
+
+// ─── Rollback Backup Helper (Phase 7D) ───────────────────────────────────────────
+const BACKUP_KEY = "clinic_crm_patients_backup_v1";
+
+export async function createPatientBackup(patients: Patient[]): Promise<void> {
+  try {
+    localStorage.setItem(BACKUP_KEY, JSON.stringify({
+      timestamp: new Date().toISOString(),
+      patients: patients
+    }));
+  } catch (error) {
+    console.error("Failed to create patient backup:", error);
+  }
+}
+
+export async function restorePatientBackup(): Promise<Patient[] | null> {
+  try {
+    const raw = localStorage.getItem(BACKUP_KEY);
+    if (!raw) return null;
+    const backup = JSON.parse(raw);
+    return backup.patients as Patient[];
+  } catch (error) {
+    console.error("Failed to restore patient backup:", error);
+    return null;
+  }
+}
+
+export async function clearPatientBackup(): Promise<void> {
+  try {
+    localStorage.removeItem(BACKUP_KEY);
+  } catch (error) {
+    console.error("Failed to clear patient backup:", error);
+  }
 }
 
 // ─── LocalStorage-based persistence (Frontend-only mode) ───────────────────────
@@ -353,10 +630,17 @@ export async function loadAuditMap(): Promise<Record<string, AuditEntry[]>> {
 }
 
 // ─── CSV Export ─────────────────────────────────────────────────────────────────
+interface ExportOptions {
+  actor?: string;
+  exportType?: string;
+  count?: number; // Phase 7K: Record count for audit metadata
+}
+
 export function exportToCSV<T extends Record<string, any>>(
   data: T[],
   filename: string,
-  columns?: { key: keyof T; label: string }[]
+  columns?: { key: keyof T; label: string }[],
+  options?: ExportOptions
 ): void {
   if (data.length === 0) {
     console.warn("No data to export");
@@ -365,6 +649,19 @@ export function exportToCSV<T extends Record<string, any>>(
 
   const headers = columns || Object.keys(data[0]).map(key => ({ key, label: String(key) }));
   const csvHeaders = headers.map(h => h.label).join(",");
+  
+  // Add metadata header rows (Phase 7D)
+  const metadataRows: string[] = [];
+  if (options?.actor || options?.exportType) {
+    metadataRows.push(`# Exported at: ${new Date().toISOString()}`);
+    if (options?.actor) metadataRows.push(`# Exported by: ${options.actor}`);
+    if (options?.exportType) metadataRows.push(`# Export type: ${options.exportType}`);
+    // Phase 7K: Use count from options if provided, otherwise use data.length
+    const recordCount = options?.count !== undefined ? options.count : data.length;
+    metadataRows.push(`# Record count: ${recordCount}`);
+    metadataRows.push(`# Source: Clinic CRM`);
+    metadataRows.push(""); // Empty line after metadata
+  }
   
   const csvRows = data.map(row => 
     headers.map(h => {
@@ -376,7 +673,7 @@ export function exportToCSV<T extends Record<string, any>>(
     }).join(",")
   );
 
-  const csvContent = [csvHeaders, ...csvRows].join("\n");
+  const csvContent = [...metadataRows, csvHeaders, ...csvRows].join("\n");
   const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
   const link = document.createElement("a");
   const url = URL.createObjectURL(blob);
@@ -388,55 +685,52 @@ export function exportToCSV<T extends Record<string, any>>(
   link.click();
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
+  
+  // Phase 7K: PHI-safe export audit logging
+  const recordCount = options?.count !== undefined ? options.count : data.length;
+  logExport({
+    resourceType: "patient",
+    resourceLabel: options?.exportType || "csv_export",
+    details: `Exported ${recordCount} records as ${options?.exportType || "csv"}`,
+    recordCount,
+  });
 }
 
-export function exportPatientsToCSV(patients: Patient[]): void {
-  const columns = [
-    { key: "id" as keyof Patient, label: "Patient ID" },
-    { key: "name" as keyof Patient, label: "Name" },
-    { key: "phone" as keyof Patient, label: "Phone" },
-    { key: "email" as keyof Patient, label: "Email" },
-    { key: "dob" as keyof Patient, label: "Date of Birth" },
-    { key: "age" as keyof Patient, label: "Age" },
-    { key: "gender" as keyof Patient, label: "Gender" },
-    { key: "bloodGroup" as keyof Patient, label: "Blood Group" },
-    { key: "address" as keyof Patient, label: "Address" },
-    { key: "doctor" as keyof Patient, label: "Assigned Doctor" },
-    { key: "status" as keyof Patient, label: "Status" },
-    { key: "insurer" as keyof Patient, label: "Insurance Provider" },
-    { key: "insuranceStatus" as keyof Patient, label: "Insurance Status" },
-    { key: "insuranceExpiry" as keyof Patient, label: "Insurance Expiry" },
-    { key: "lastVisit" as keyof Patient, label: "Last Visit" },
-    { key: "nextAppointment" as keyof Patient, label: "Next Appointment" },
-    { key: "alerts" as keyof Patient, label: "Medical Alerts" },
-    { key: "conditions" as keyof Patient, label: "Conditions" },
-    { key: "medications" as keyof Patient, label: "Medications" },
-  ];
+export function exportPatientsToCSV(patients: Patient[], preset: "demographics" | "contact" | "clinical" | "full" = "full", actor?: string): void {
+  // Phase 7K: Filter out archived/deleted patients from normal exports
+  const activePatients = patients.filter(p => !p.deletedAt);
+  
+  // Define export presets (Phase 7D)
+  const presetFields: Record<string, (keyof Patient)[]> = {
+    demographics: ["id", "name", "dob", "age", "gender", "bloodGroup", "address"],
+    contact: ["id", "name", "phone", "email", "address"],
+    clinical: ["id", "name", "doctor", "status", "alerts", "conditions", "medications", "lastVisit", "nextAppointment"],
+    full: ["id", "name", "phone", "email", "dob", "age", "gender", "bloodGroup", "address", "doctor", "status", "insurer", "insuranceStatus", "insuranceExpiry", "lastVisit", "nextAppointment", "alerts", "conditions", "medications"]
+  };
+
+  const fields = presetFields[preset] || presetFields.full;
+  
+  const columns = fields.map(key => ({
+    key: key as keyof Patient,
+    label: key.charAt(0).toUpperCase() + key.slice(1).replace(/([A-Z])/g, ' $1').trim()
+  }));
   
   const timestamp = new Date().toISOString().split("T")[0];
-  exportToCSV(patients, `patients_export_${timestamp}`, columns);
+  const filename = `patients_${preset}_export_${timestamp}`;
+  
+  // Phase 7K: Pass count for audit metadata
+  exportToCSV(activePatients, filename, columns, { actor, exportType: preset, count: activePatients.length });
 }
 
 export function exportReportsToCSV(patients: Patient[]): void {
+  // Phase 8J: Remove PHI from patient report export (PHI-safe)
   const reportData = patients.map(p => ({
     "Patient ID": p.id,
-    "Patient Name": p.name,
     "Status": p.status,
     "Doctor": p.doctor,
-    "Age": p.age,
-    "Gender": p.gender,
-    "Insurance": p.insurer,
-    "Insurance Status": p.insuranceStatus,
-    "Insurance Expiry": p.insuranceExpiry,
-    "Last Visit": p.lastVisit,
     "Next Appointment": p.nextAppointment,
     "Follow-Up Date": p.followUpDate,
     "Follow-Up Status": p.followUpStatus,
-    "Alerts": p.alerts?.join(", ") || "",
-    "Conditions": p.conditions?.join(", ") || "",
-    "Phone Verified": p.phoneVerified ? "Yes" : "No",
-    "ID Verified": p.idVerified ? "Yes" : "No",
-    "Consent Signed": p.consentSigned ? "Yes" : "No",
     "Created At": p.createdAt,
   }));
   
@@ -502,3 +796,24 @@ function loadAuditMapFromLocalStorage(): Record<string, AuditEntry[]> {
     return {};
   }
 }
+
+// ─── Shared Infrastructure (Phase 1) ─────────────────────────────────────────────────
+// The following shared infrastructure has been created in src/shared/ for future migration:
+// - src/shared/utils/dateUtils.ts (fmtDate, fmtDateShort, calcAge, fmtRelative, etc.)
+// - src/shared/utils/formatUtils.ts (getInitials, getAvatarColor, formatPhone, formatCurrency, etc.)
+// - src/shared/utils/searchUtils.ts (fuzzyMatch, getHighlightParts, smartSearch, etc.)
+// - src/shared/utils/exportUtils.ts (exportToCSV, exportToJSON, downloadTextFile, etc.)
+// - src/shared/services/storageService.ts (readJSON, writeJSON, removeStorageItem, etc.)
+// - src/shared/services/notificationService.ts (createNotification, notificationQueue, etc.)
+// - src/shared/components/ui/Modal.tsx (reusable modal component)
+// - src/shared/components/feedback/Feedback.tsx (reusable feedback component)
+// - src/shared/components/feedback/ConfirmDialog.tsx (reusable confirmation dialog)
+// - src/shared/hooks/useLocalStorage.ts (custom hook for localStorage)
+// - src/shared/hooks/usePermission.ts (custom hook for permission checks)
+// - src/shared/permissions/permissions.ts (role-based permission system)
+// - src/shared/constants/appConstants.ts (app-wide constants)
+// - src/shared/types/common.types.ts (common types)
+//
+// Current functions in this file (utils.ts) are kept as-is for backward compatibility.
+// Future phases may migrate to use the shared infrastructure incrementally.
+// No breaking changes in Phase 1.

@@ -1,6 +1,8 @@
 import React, { useState, useMemo, useCallback, useEffect } from "react";
 import type { Patient } from "./types";
 import { fmtDate, getPatientStats } from "./utils";
+import { hasRole, normalizeRole } from "../shared/permissions/permissions";
+import { logDeniedAction } from "../shared/services/deniedActionLogger";
 
 type QueueStatus = "scheduled" | "checked-in" | "waiting" | "with-doctor" | "billing-pending" | "completed" | "no-show" | "cancelled";
 
@@ -58,6 +60,58 @@ type TaskPriority = "urgent" | "high" | "medium" | "low";
 type TaskStatus = "pending" | "in-progress" | "done";
 type TaskCategory = "call-patient" | "upload-lab" | "verify-insurance" | "collect-consent" | "send-prescription" | "prepare-report" | "pending-note" | "payment-pending" | "other";
 
+// Module-level constants for metadata
+const ALERT_META: Record<CriticalAlert["type"], { icon: string; label: string; bg: string; border: string; color: string }> = {
+  "high-risk":         { icon: "ti-alert-octagon", label: "High Risk",       bg: "var(--red-bg)",    border: "var(--red-border)",    color: "var(--red)" },
+  "allergy":           { icon: "ti-droplet-off",   label: "Allergy",         bg: "var(--red-bg)",    border: "var(--red-border)",    color: "var(--red)" },
+  "pregnancy":         { icon: "ti-heart",         label: "Pregnancy",       bg: "var(--purple-bg)", border: "var(--purple-border)", color: "var(--purple)" },
+  "heart-condition":   { icon: "ti-heart-broken",  label: "Cardiac",         bg: "var(--red-bg)",    border: "var(--red-border)",    color: "var(--red)" },
+  "critical-lab":      { icon: "ti-test-pipe",     label: "Critical Lab",    bg: "var(--red-bg)",    border: "var(--red-border)",    color: "var(--red)" },
+  "expired-insurance": { icon: "ti-shield-off",    label: "Ins. Expired",    bg: "var(--amber-bg)",  border: "var(--amber-border)",  color: "var(--amber)" },
+  "missing-consent":   { icon: "ti-file-x",        label: "No Consent",      bg: "var(--red-bg)",    border: "var(--red-border)",    color: "var(--red)" },
+  "overdue-followup":  { icon: "ti-clock-exclamation", label: "Overdue F/U", bg: "var(--amber-bg)",  border: "var(--amber-border)",  color: "var(--amber)" },
+};
+
+const ACTIVITY_META: Record<Activity["type"], { icon: string; color: string }> = {
+  "patient-registered": { icon: "ti-user-plus",      color: "var(--blue)" },
+  "appointment-booked": { icon: "ti-calendar-plus",  color: "var(--purple)" },
+  "invoice-paid":       { icon: "ti-cash",           color: "var(--green)" },
+  "prescription-issued":{ icon: "ti-pill",           color: "var(--blue)" },
+  "lab-uploaded":       { icon: "ti-test-tube",      color: "var(--amber)" },
+  "consent-signed":     { icon: "ti-file-check",     color: "var(--green)" },
+  "patient-edited":     { icon: "ti-pencil",         color: "var(--muted)" },
+  "file-deleted":       { icon: "ti-trash",          color: "var(--red)" },
+};
+
+const CATEGORY_META: Record<TaskCategory, { icon: string; label: string }> = {
+  "call-patient":       { icon: "ti-phone",          label: "Call Patient" },
+  "upload-lab":         { icon: "ti-test-tube",      label: "Upload Lab Result" },
+  "verify-insurance":   { icon: "ti-shield-check",   label: "Verify Insurance" },
+  "collect-consent":    { icon: "ti-file-check",     label: "Collect Consent" },
+  "send-prescription":  { icon: "ti-pill",           label: "Send Prescription" },
+  "prepare-report":     { icon: "ti-report",         label: "Prepare Report" },
+  "pending-note":       { icon: "ti-notes",          label: "Pending Note" },
+  "payment-pending":    { icon: "ti-currency-dollar",label: "Payment Pending" },
+  "other":              { icon: "ti-checklist",      label: "Task" },
+};
+
+const PRIORITY_COLOR: Record<TaskPriority, string> = {
+  urgent: "var(--red)", high: "var(--amber)", medium: "var(--blue)", low: "var(--muted)",
+};
+
+const STATUS_COLOR: Record<TaskStatus, string> = {
+  pending: "var(--amber)", "in-progress": "var(--blue)", done: "var(--green)",
+};
+
+const FORWARD_LABEL: Partial<Record<QueueStatus, string>> = {
+  "scheduled":       "Check In",
+  "checked-in":      "Start Consult",
+  "waiting":         "Start Consult",
+  "with-doctor":     "Send to Billing",
+  "billing-pending": "Mark Paid & Done",
+  "no-show":         "Reschedule",
+};
+
 interface ClinicTask {
   id: string;
   category: TaskCategory;
@@ -71,9 +125,50 @@ interface ClinicTask {
   recurring?: boolean;
 }
 export default function Dashboard({ patients, userRole = "admin", onAction, onUpdatePatient }: { patients: Patient[]; userRole?: "receptionist" | "doctor" | "admin"; onAction?: (actionId: string) => void; onUpdatePatient?: (updated: Patient, action?: string) => void }) {
+  // Normalize role to ensure it's a valid UserRole
+  const normalizedRole = normalizeRole(userRole) as "admin" | "doctor" | "nurse" | "receptionist" | "billing" | "auditor" | "readonly";
+
   const stats = getPatientStats(patients);
   const today = new Date();
   const todayStr = today.toISOString().split("T")[0];
+
+  // ─── Local Permission Guards (Phase 6H) ─────────────────────────────────────────────
+  const canViewDashboardQueue = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canViewPatientContact = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canOpenPatientProfile = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+  const canViewCriticalAlerts = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canViewPatientSafetyReview = hasRole(normalizedRole, ["admin", "doctor", "nurse"]);
+  const canViewBillingSnapshot = hasRole(normalizedRole, ["admin"]);
+  const canManageQueueFromDashboard = hasRole(normalizedRole, ["admin", "doctor", "nurse", "receptionist"]);
+
+  // Quick action permissions
+  const canRunQuickAction = (actionId: string): boolean => {
+    const actionPermissions: Record<string, string[]> = {
+      "add-patient": ["admin", "doctor", "nurse", "receptionist"],
+      "book-appointment": ["admin", "doctor", "nurse", "receptionist"],
+      "check-in": ["admin", "doctor", "nurse", "receptionist"],
+      "create-invoice": ["admin", "billing", "receptionist"],
+      "start-consult": ["admin", "doctor"],
+      "create-rx": ["admin", "doctor"],
+      "view-labs": ["admin", "doctor", "nurse"],
+      "upload-doc": ["admin", "doctor", "nurse"],
+      "send-message": ["admin", "doctor", "nurse", "receptionist"],
+      "view-reports": ["admin", "auditor", "doctor"],
+    };
+    return hasRole(normalizedRole, actionPermissions[actionId] || []);
+  };
+
+  // ─── Local Denied Helper (Phase 6H) ───────────────────────────────────────────────
+  const handleDeniedAccess = (action: string, resource: string) => {
+    showFeedback(`You do not have permission to ${action} ${resource}.`, "error");
+    logDeniedAction({
+      role: normalizedRole,
+      action,
+      resource,
+      reason: "Insufficient permissions",
+      severity: "medium",
+    });
+  };
 
   // Tick every 60 s so waiting times stay current
   const [tick, setTick] = useState(0);
@@ -726,12 +821,14 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
     win.document.close();
     logActivity({ type: "patient-edited", message: `Token slip printed for ${q.patient.name} (#${q.tokenNo})`, user: userRole });
   }, [logActivity, userRole, showFeedback]);
-  const waiting = queuePatients.filter(q => q.status === "waiting").length;
-  const checkedIn = queuePatients.filter(q => q.status === "checked-in").length;
-  const inConsultation = queuePatients.filter(q => q.status === "with-doctor").length;
-  const completed = queuePatients.filter(q => q.status === "completed").length;
-  const noShows = queuePatients.filter(q => q.status === "no-show").length;
-  const followUpsDone = followUps.filter(f => f.status === "completed").length;
+  const { waiting, checkedIn, inConsultation, completed, noShows, followUpsDone } = useMemo(() => ({
+    waiting: queuePatients.filter(q => q.status === "waiting").length,
+    checkedIn: queuePatients.filter(q => q.status === "checked-in").length,
+    inConsultation: queuePatients.filter(q => q.status === "with-doctor").length,
+    completed: queuePatients.filter(q => q.status === "completed").length,
+    noShows: queuePatients.filter(q => q.status === "no-show").length,
+    followUpsDone: followUps.filter(f => f.status === "completed").length,
+  }), [queuePatients, followUps]);
 
   // Appointment snapshot
   const apptSnapshot = useMemo(() => {
@@ -1047,7 +1144,14 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
           <div className="cd-quick-actions">
             {quickActions.map(action => (
               <button key={action.id} className="btn btn-primary" style={{ fontSize: "var(--font-xs)", padding: "6px 12px", display: "flex", alignItems: "center", gap: 5 }}
-                onClick={() => { if (onAction) onAction(action.id); else showFeedback(`${action.label} — not yet wired in this view.`, "info"); }}>
+                onClick={() => {
+                  if (!canRunQuickAction(action.id)) {
+                    handleDeniedAccess(action.id, "quick action");
+                    return;
+                  }
+                  if (onAction) onAction(action.id);
+                  else showFeedback(`${action.label} — not yet wired in this view.`, "info");
+                }}>
                 <i className={`ti ${action.icon}`} style={{ fontSize: 13 }} />
                 {action.label}
               </button>
@@ -1081,7 +1185,15 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
                   <div style={{ padding: "8px 12px", fontSize: "var(--font-xs)", color: "var(--muted)" }}>No patient found</div>
                 ) : patientSearchResults.map(p => (
                   <button key={p.id} style={{ display: "block", width: "100%", textAlign: "left", padding: "8px 12px", background: "none", border: "none", cursor: "pointer", fontSize: "var(--font-xs)", borderBottom: "1px solid var(--border)" }}
-                    onClick={() => { if (onAction) onAction(`view-patient:${p.id}`); else showFeedback(`Patient: ${p.name} · ${p.id} · ${p.phone || "no phone"}`, "info"); setPatientSearch(""); }}>
+                    onClick={() => {
+                      if (!canOpenPatientProfile) {
+                        handleDeniedAccess("view", "patient profile");
+                        return;
+                      }
+                      if (onAction) onAction(`view-patient:${p.id}`);
+                      else showFeedback(`Patient: ${p.name} · ${p.id} · ${p.phone || "no phone"}`, "info");
+                      setPatientSearch("");
+                    }}>
                     <div style={{ fontWeight: 700 }}>{p.name}</div>
                     <div style={{ color: "var(--muted)" }}>{p.id} · {p.phone || "—"}</div>
                   </button>
@@ -1126,7 +1238,7 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
         <OverviewCard label="Critical Alerts"   value={criticalAlerts.length} color="var(--red)"   icon="ti-alert-triangle" />
       </div>
       {/* Secondary row — admin/receptionist */}
-      {userRole !== "doctor" && (
+      {canViewDashboardQueue && (
         <div className="cd-grid-4">
           <OverviewCard label="Checked In"     value={checkedIn}       color="var(--green)"  icon="ti-login" />
           <OverviewCard label="In Consultation" value={inConsultation}  color="var(--purple)" icon="ti-stethoscope" />
@@ -1135,7 +1247,7 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
         </div>
       )}
       {/* Doctor-specific secondary row */}
-      {userRole === "doctor" && (
+      {hasRole(normalizedRole, ["doctor"]) && (
         <div className="cd-grid-4">
           <OverviewCard label="In Consultation" value={inConsultation}                                  color="var(--purple)" icon="ti-stethoscope" />
           <OverviewCard label="Checked In"      value={checkedIn}                                       color="var(--green)"  icon="ti-login" />
@@ -1144,7 +1256,7 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
         </div>
       )}
 
-      <div className={userRole === "doctor" ? "cd-grid-1-2" : "cd-grid-2-1"}>
+      <div className={hasRole(normalizedRole, ["doctor"]) ? "cd-grid-1-2" : "cd-grid-2-1"}>
         {/* Live Queue / Waiting Room — for doctor role this renders second (right/below) */}
         <div className="card card-padded">
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: collapsed["queue"] ? 0 : 12 }}>
@@ -1221,7 +1333,7 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
                     <td>
                       <div style={{ fontSize: "var(--font-sm)", fontWeight: 600 }}>{q.patient.name}</div>
                       <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginBottom: 2 }}>{q.patient.id}</div>
-                      {q.patient.phone && (isWaiting || q.status === "scheduled") && (
+                      {canViewPatientContact && q.patient.phone && (isWaiting || q.status === "scheduled") && (
                         <div style={{ display: "flex", gap: 3 }}>
                           <a href={`https://wa.me/${q.patient.phone.replace(/\D/g,"")}`} target="_blank" rel="noreferrer"
                             title="WhatsApp nudge"
@@ -1255,13 +1367,15 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
                     </td>
                     <td>
                       <div style={{ display: "flex", gap: 4, flexDirection: "column", alignItems: "flex-start" }}>
-                        <QueueActions
-                          status={q.status}
-                          onTransition={next => transitionStatus(q.id, next, q.doctor)}
-                          onNoShow={() => markNoShow(q.id)}
-                          onCancel={() => markCancelled(q.id)}
-                          userRole={userRole}
-                        />
+                        {canManageQueueFromDashboard && (
+                          <QueueActions
+                            status={q.status}
+                            onTransition={next => transitionStatus(q.id, next, q.doctor)}
+                            onNoShow={() => markNoShow(q.id)}
+                            onCancel={() => markCancelled(q.id)}
+                            userRole={userRole}
+                          />
+                        )}
                         <button className="btn btn-ghost" style={{ fontSize: 10, padding: "2px 7px", minHeight: 26 }} title="Print token slip" onClick={() => printTokenSlip(q)}>
                           <i className="ti ti-printer" style={{ fontSize: 10, marginRight: 2 }} />Slip
                         </button>
@@ -1278,43 +1392,34 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
         {/* Critical Alerts & Follow-ups */}
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           {/* Critical Patient Alerts */}
-          <div className="card card-padded">
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: collapsed["alerts"] ? 0 : 12 }}>
-              <div className="section-label" style={{ color: "var(--red)", margin: 0 }}>
-                <i className="ti ti-alert-triangle" style={{ marginRight: 4 }} />
-                Critical Alerts
-                <span style={{ marginLeft: 6, fontWeight: 400, color: "var(--muted)", fontSize: "var(--font-xs)" }}>
-                  {criticalAlerts.filter(a => a.severity === "critical").length} critical · {criticalAlerts.filter(a => a.severity === "high").length} high
-                </span>
-              </div>
-              <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-                <button className="btn btn-ghost" style={{ fontSize: 10, padding: "1px 6px" }} onClick={() => toggleSection("alerts")}>
-                  <i className={`ti ${collapsed["alerts"] ? "ti-chevron-down" : "ti-chevron-up"}`} />
-                </button>
-                {criticalAlerts.length > 0 && !collapsed["alerts"] && (
-                  <span style={{ fontSize: "var(--font-xs)", color: "var(--red)", fontWeight: 700, background: "var(--red-bg)", padding: "1px 8px", borderRadius: 99, border: "1px solid var(--red-border)" }}>
-                    {criticalAlerts.length} need attention
+          {canViewCriticalAlerts && (
+            <div className="card card-padded">
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: collapsed["alerts"] ? 0 : 12 }}>
+                <div className="section-label" style={{ color: "var(--red)", margin: 0 }}>
+                  <i className="ti ti-alert-triangle" style={{ marginRight: 4 }} />
+                  Critical Alerts
+                  <span style={{ marginLeft: 6, fontWeight: 400, color: "var(--muted)", fontSize: "var(--font-xs)" }}>
+                    {criticalAlerts.filter(a => a.severity === "critical").length} critical · {criticalAlerts.filter(a => a.severity === "high").length} high
                   </span>
-                )}
-              </div>
-            </div>
-            {!collapsed["alerts"] && <div style={{ maxHeight: 280, overflow: "auto", display: "flex", flexDirection: "column", gap: 6 }}>
-              {criticalAlerts.length === 0 ? (
-                <div style={{ textAlign: "center", padding: 20, color: "var(--muted)", fontSize: "var(--font-sm)" }}>
-                  <i className="ti ti-circle-check" style={{ fontSize: 20, color: "var(--green)", display: "block", marginBottom: 4 }} />
-                  No critical alerts
                 </div>
-              ) : criticalAlerts.filter(a => !acknowledgedAlerts.has(a.id)).map(alert => {
-                const ALERT_META: Record<CriticalAlert["type"], { icon: string; label: string; bg: string; border: string; color: string }> = {
-                  "high-risk":         { icon: "ti-alert-octagon", label: "High Risk",       bg: "var(--red-bg)",    border: "var(--red-border)",    color: "var(--red)" },
-                  "allergy":           { icon: "ti-droplet-off",   label: "Allergy",         bg: "var(--red-bg)",    border: "var(--red-border)",    color: "var(--red)" },
-                  "pregnancy":         { icon: "ti-heart",         label: "Pregnancy",       bg: "var(--purple-bg)", border: "var(--purple-border)", color: "var(--purple)" },
-                  "heart-condition":   { icon: "ti-heart-broken",  label: "Cardiac",         bg: "var(--red-bg)",    border: "var(--red-border)",    color: "var(--red)" },
-                  "critical-lab":      { icon: "ti-test-pipe",     label: "Critical Lab",    bg: "var(--red-bg)",    border: "var(--red-border)",    color: "var(--red)" },
-                  "expired-insurance": { icon: "ti-shield-off",    label: "Ins. Expired",    bg: "var(--amber-bg)",  border: "var(--amber-border)",  color: "var(--amber)" },
-                  "missing-consent":   { icon: "ti-file-x",        label: "No Consent",      bg: "var(--red-bg)",    border: "var(--red-border)",    color: "var(--red)" },
-                  "overdue-followup":  { icon: "ti-clock-exclamation", label: "Overdue F/U", bg: "var(--amber-bg)",  border: "var(--amber-border)",  color: "var(--amber)" },
-                };
+                <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                  <button className="btn btn-ghost" style={{ fontSize: 10, padding: "1px 6px" }} onClick={() => toggleSection("alerts")}>
+                    <i className={`ti ${collapsed["alerts"] ? "ti-chevron-down" : "ti-chevron-up"}`} />
+                  </button>
+                  {criticalAlerts.length > 0 && !collapsed["alerts"] && (
+                    <span style={{ fontSize: "var(--font-xs)", color: "var(--red)", fontWeight: 700, background: "var(--red-bg)", padding: "1px 8px", borderRadius: 99, border: "1px solid var(--red-border)" }}>
+                      {criticalAlerts.length} need attention
+                    </span>
+                  )}
+                </div>
+              </div>
+              {!collapsed["alerts"] && <div style={{ maxHeight: 280, overflow: "auto", display: "flex", flexDirection: "column", gap: 6 }}>
+                {criticalAlerts.length === 0 ? (
+                  <div style={{ textAlign: "center", padding: 20, color: "var(--muted)", fontSize: "var(--font-sm)" }}>
+                    <i className="ti ti-circle-check" style={{ fontSize: 20, color: "var(--green)", display: "block", marginBottom: 4 }} />
+                    No critical alerts
+                  </div>
+                ) : criticalAlerts.filter(a => !acknowledgedAlerts.has(a.id)).map(alert => {
                 const meta = ALERT_META[alert.type];
                 return (
                   <div key={alert.id} style={{ display: "flex", gap: 8, padding: "7px 10px", background: meta.bg, border: `1px solid ${meta.border}`, borderRadius: "var(--radius)", alignItems: "flex-start" }}>
@@ -1327,7 +1432,14 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
                       <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)", marginTop: 1 }}>{alert.message}</div>
                     </div>
                     <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "1px 6px", flexShrink: 0 }}
-                      onClick={() => { if (onAction) onAction(`view-patient:${alert.patient.id}`); else showFeedback(`Open patient profile for ${alert.patient.name}.`, "info"); }}>View</button>
+                      onClick={() => {
+                        if (!canOpenPatientProfile) {
+                          handleDeniedAccess("view", "patient profile");
+                          return;
+                        }
+                        if (onAction) onAction(`view-patient:${alert.patient.id}`);
+                        else showFeedback(`Open patient profile for ${alert.patient.name}.`, "info");
+                      }}>View</button>
                     {!acknowledgedAlerts.has(alert.id) && (
                       <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", padding: "1px 6px", flexShrink: 0, color: "var(--green)" }}
                         onClick={() => acknowledgeAlert(alert.id, alert.patient)}>✓ Ack</button>
@@ -1337,6 +1449,7 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
               })}
             </div>}
           </div>
+          )}
 
           {/* Follow-up Center */}
           <div className="card card-padded">
@@ -1494,8 +1607,8 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
       </div>
 
       {/* Patient Safety Review */}
-      {(() => {
-        const safetyItems = patients.filter(p => {
+      {canViewPatientSafetyReview && (() => {
+        const safetyItems = useMemo(() => patients.filter(p => {
           if (dismissedSafety.has(p.id)) return false;
           return (
             !(p as any).emergencyContact ||
@@ -1505,7 +1618,7 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
             (p.tags as string[] | undefined)?.includes("high-risk") ||
             (p as any).highRisk
           );
-        });
+        }), [patients, dismissedSafety]);
         if (safetyItems.length === 0 && userRole !== "admin") return null;
         return (
           <div className="card card-padded" style={{ marginBottom: 16 }}>
@@ -1539,7 +1652,7 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
                         <div style={{ fontSize: "var(--font-xs)", color: "var(--muted)" }}>{issues.join(" · ")}</div>
                       </div>
                       <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                        {p.phone && (
+                        {canViewPatientContact && p.phone && (
                           <a href={`tel:${p.phone}`} className="btn btn-ghost" style={{ fontSize: 10, padding: "2px 6px", textDecoration: "none", display: "inline-flex", alignItems: "center" }} title="Call patient">
                             <i className="ti ti-phone" style={{ fontSize: 10 }} />
                           </a>
@@ -1552,7 +1665,12 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
                           }}>Consent Reminder</button>
                         )}
                         <button className="btn btn-ghost" style={{ fontSize: 10, padding: "2px 6px" }} onClick={() => {
-                          if (onAction) onAction(`view-patient:${p.id}`); else showFeedback(`Patient: ${p.name} · ${p.id}`, "info");
+                          if (!canOpenPatientProfile) {
+                            handleDeniedAccess("view", "patient profile");
+                            return;
+                          }
+                          if (onAction) onAction(`view-patient:${p.id}`);
+                          else showFeedback(`Patient: ${p.name} · ${p.id}`, "info");
                         }}>View</button>
                         <button className="btn btn-ghost" style={{ fontSize: 10, padding: "2px 6px", color: "var(--muted)" }} title="Dismiss" onClick={() => setDismissedSafety(prev => new Set([...prev, p.id]))}>✕</button>
                       </div>
@@ -1651,25 +1769,26 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
 
       <div className="cd-grid-2-1-1">
         {/* Billing Snapshot */}
-        <div className="card card-padded">
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: collapsed["billing"] ? 0 : 12 }}>
-            <div className="section-label" style={{ margin: 0 }}>
-              <i className="ti ti-receipt" style={{ marginRight: 4 }} />
-              Billing Snapshot
-              <span style={{ marginLeft: 6, color: "var(--muted)", fontWeight: 400, fontSize: "var(--font-xs)" }}>Today</span>
+        {canViewBillingSnapshot && (
+          <div className="card card-padded">
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: collapsed["billing"] ? 0 : 12 }}>
+              <div className="section-label" style={{ margin: 0 }}>
+                <i className="ti ti-receipt" style={{ marginRight: 4 }} />
+                Billing Snapshot
+                <span style={{ marginLeft: 6, color: "var(--muted)", fontWeight: 400, fontSize: "var(--font-xs)" }}>Today</span>
+              </div>
+              <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                <button className="btn btn-ghost" style={{ fontSize: 10, padding: "1px 6px" }} onClick={() => toggleSection("billing")}>
+                  <i className={`ti ${collapsed["billing"] ? "ti-chevron-down" : "ti-chevron-up"}`} />
+                </button>
+                {revenue.pendingCount > 0 && !collapsed["billing"] && (
+                  <span style={{ fontSize: "var(--font-xs)", color: "var(--amber)", fontWeight: 700, background: "var(--amber-bg)", padding: "1px 8px", borderRadius: 99, border: "1px solid var(--amber-border)" }}>
+                    {revenue.pendingCount} unpaid invoice{revenue.pendingCount !== 1 ? "s" : ""}
+                  </span>
+                )}
+              </div>
             </div>
-            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-              <button className="btn btn-ghost" style={{ fontSize: 10, padding: "1px 6px" }} onClick={() => toggleSection("billing")}>
-                <i className={`ti ${collapsed["billing"] ? "ti-chevron-down" : "ti-chevron-up"}`} />
-              </button>
-              {revenue.pendingCount > 0 && !collapsed["billing"] && (
-                <span style={{ fontSize: "var(--font-xs)", color: "var(--amber)", fontWeight: 700, background: "var(--amber-bg)", padding: "1px 8px", borderRadius: 99, border: "1px solid var(--amber-border)" }}>
-                  {revenue.pendingCount} unpaid invoice{revenue.pendingCount !== 1 ? "s" : ""}
-                </span>
-              )}
-            </div>
-          </div>
-          {!collapsed["billing"] && <>
+            {!collapsed["billing"] && <>
           <div className="cd-grid-4-sm">
             {[
               { label: "Total Revenue", value: revenue.total, color: "var(--fg)", bold: true },
@@ -1697,10 +1816,14 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
             ))}
           </div>
           <div className="cd-grid-2-sm">
-            <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)", minHeight: 36 }} onClick={() => { if (onAction) onAction("create-invoice"); else showFeedback("Create Invoice — open Billing to continue.", "info"); }}><i className="ti ti-plus" style={{ marginRight: 4, fontSize: 11 }} />Create Invoice</button>
-            <button className="btn btn-ghost"   style={{ fontSize: "var(--font-xs)", minHeight: 36 }} onClick={() => { if (onAction) onAction("collect-payment"); else showFeedback("Collect Payment — open Billing to continue.", "info"); }}><i className="ti ti-cash" style={{ marginRight: 4, fontSize: 11 }} />Collect Payment</button>
-            <button className="btn btn-ghost"   style={{ fontSize: "var(--font-xs)", minHeight: 36 }} onClick={() => { if (onAction) onAction("pending-bills"); else showFeedback("Pending Bills — open Billing to continue.", "info"); }}><i className="ti ti-list" style={{ marginRight: 4, fontSize: 11 }} />Pending Bills</button>
-            <button className="btn btn-ghost"   style={{ fontSize: "var(--font-xs)", minHeight: 36 }} onClick={() => { if (onAction) onAction("print-receipt"); else showFeedback("Print Receipt — open Billing to continue.", "info"); }}><i className="ti ti-printer" style={{ marginRight: 4, fontSize: 11 }} />Print Receipt</button>
+            {canViewBillingSnapshot && (
+              <>
+                <button className="btn btn-primary" style={{ fontSize: "var(--font-xs)", minHeight: 36 }} onClick={() => { if (onAction) onAction("create-invoice"); else showFeedback("Create Invoice — open Billing to continue.", "info"); }}><i className="ti ti-plus" style={{ marginRight: 4, fontSize: 11 }} />Create Invoice</button>
+                <button className="btn btn-ghost"   style={{ fontSize: "var(--font-xs)", minHeight: 36 }} onClick={() => { if (onAction) onAction("collect-payment"); else showFeedback("Collect Payment — open Billing to continue.", "info"); }}><i className="ti ti-cash" style={{ marginRight: 4, fontSize: 11 }} />Collect Payment</button>
+                <button className="btn btn-ghost"   style={{ fontSize: "var(--font-xs)", minHeight: 36 }} onClick={() => { if (onAction) onAction("pending-bills"); else showFeedback("Pending Bills — open Billing to continue.", "info"); }}><i className="ti ti-list" style={{ marginRight: 4, fontSize: 11 }} />Pending Bills</button>
+                <button className="btn btn-ghost"   style={{ fontSize: "var(--font-xs)", minHeight: 36 }} onClick={() => { if (onAction) onAction("print-receipt"); else showFeedback("Print Receipt — open Billing to continue.", "info"); }}><i className="ti ti-printer" style={{ marginRight: 4, fontSize: 11 }} />Print Receipt</button>
+              </>
+            )}
           </div>
           <button className="btn btn-ghost" style={{ fontSize: "var(--font-xs)", minHeight: 32, marginTop: 8, width: "100%" }} onClick={() => {
             const dateLabel = dateRange === "week" ? `Week from ${todayStr}` : dateRange === "tomorrow" ? `Tomorrow ${selectedDateStr}` : dateRange === "custom" ? `Custom ${selectedDateStr}` : todayStr;
@@ -1831,9 +1954,10 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
           })()}
           </>}
         </div>
+        )}
 
         {/* Doctor / Staff Workload — admin only */}
-        {userRole === "admin" ? (
+        {hasRole(normalizedRole, ["admin"]) ? (
           <div className="card card-padded">
             <div className="section-label" style={{ marginBottom: 10 }}>
               <i className="ti ti-user-shield" style={{ marginRight: 4 }} />
@@ -1891,7 +2015,7 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
         )}
 
         {/* Doctor Comparison Table — feature 9, admin only */}
-        {userRole === "admin" && Object.keys(doctorWorkload).length > 1 && (
+        {hasRole(normalizedRole, ["admin"]) && Object.keys(doctorWorkload).length > 1 && (
           <div className="card card-padded" style={{ gridColumn: "1 / -1" }}>
             <div className="section-label" style={{ marginBottom: 10 }}>
               <i className="ti ti-table" style={{ marginRight: 4 }} />
@@ -1986,7 +2110,7 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
           )}
           <div style={{ maxHeight: 340, overflow: "auto", display: "flex", flexDirection: "column", gap: 6 }}>
             {(() => {
-              const filtered = activityLog.filter(a => {
+              const filtered = useMemo(() => activityLog.filter(a => {
                 if (activityFilter === "all") return true;
                 const msg = a.message.toLowerCase();
                 if (activityFilter === "queue") return ["checked in","waiting","with doctor","billing","no show","cancelled","prioritized","moved to"].some(k => msg.includes(k));
@@ -1995,18 +2119,8 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
                 if (activityFilter === "alert") return msg.includes("alert") || msg.includes("acknowledged");
                 if (activityFilter === "export") return msg.includes("export");
                 return true;
-              });
+              }), [activityLog, activityFilter]);
               if (filtered.length === 0) return <div style={{ textAlign: "center", padding: 16, color: "var(--muted)", fontSize: "var(--font-sm)" }}>{activityLog.length === 0 ? "No activity yet today." : "No activity matching this filter."}</div>;
-              const ACTIVITY_META: Record<Activity["type"], { icon: string; color: string }> = {
-                "patient-registered": { icon: "ti-user-plus",      color: "var(--blue)" },
-                "appointment-booked": { icon: "ti-calendar-plus",  color: "var(--purple)" },
-                "invoice-paid":       { icon: "ti-cash",           color: "var(--green)" },
-                "prescription-issued":{ icon: "ti-pill",           color: "var(--blue)" },
-                "lab-uploaded":       { icon: "ti-test-tube",      color: "var(--amber)" },
-                "consent-signed":     { icon: "ti-file-check",     color: "var(--green)" },
-                "patient-edited":     { icon: "ti-pencil",         color: "var(--muted)" },
-                "file-deleted":       { icon: "ti-trash",          color: "var(--red)" },
-              };
               return filtered.map(activity => {
                 const meta = ACTIVITY_META[activity.type] ?? { icon: "ti-dot", color: "var(--muted)" };
                 const mins = Math.floor((Date.now() - new Date(activity.timestamp).getTime()) / 60_000);
@@ -2031,7 +2145,7 @@ export default function Dashboard({ patients, userRole = "admin", onAction, onUp
       </div>
 
       {/* Tasks & Reminders — full width for admin (already shown in side panel for other roles) */}
-      {userRole === "admin" && (
+      {hasRole(normalizedRole, ["admin"]) && (
         <TasksPanel tasks={tasks} updateTask={updateTask} deleteTask={deleteTask} setConfirmDelete={setConfirmDelete} setShowAddTask={setShowAddTask} setEditTaskModal={setEditTaskModal} userRole={userRole} onAction={onAction} fullWidth />
       )}
 
@@ -2150,23 +2264,6 @@ function TasksPanel({
   fullWidth?: boolean;
   onAction?: (actionId: string) => void;
 }) {
-  const CATEGORY_META: Record<TaskCategory, { icon: string; label: string }> = {
-    "call-patient":       { icon: "ti-phone",          label: "Call Patient" },
-    "upload-lab":         { icon: "ti-test-tube",      label: "Upload Lab Result" },
-    "verify-insurance":   { icon: "ti-shield-check",   label: "Verify Insurance" },
-    "collect-consent":    { icon: "ti-file-check",     label: "Collect Consent" },
-    "send-prescription":  { icon: "ti-pill",           label: "Send Prescription" },
-    "prepare-report":     { icon: "ti-report",         label: "Prepare Report" },
-    "pending-note":       { icon: "ti-notes",          label: "Pending Note" },
-    "payment-pending":    { icon: "ti-currency-dollar",label: "Payment Pending" },
-    "other":              { icon: "ti-checklist",      label: "Task" },
-  };
-  const PRIORITY_COLOR: Record<TaskPriority, string> = {
-    urgent: "var(--red)", high: "var(--amber)", medium: "var(--blue)", low: "var(--muted)",
-  };
-  const STATUS_COLOR: Record<TaskStatus, string> = {
-    pending: "var(--amber)", "in-progress": "var(--blue)", done: "var(--green)",
-  };
 
   const [panelFilter, setPanelFilter] = useState<"all"|"pending"|"in-progress"|"done"|"urgent"|"myrole">("all");
   const [confirmClearCompleted, setConfirmClearCompleted] = useState(false);
@@ -2188,9 +2285,11 @@ function TasksPanel({
     });
   }, [tasks, userRole, panelFilter]);
 
-  const pendingCount = tasks.filter(t => t.status !== "done").length;
-  const doneCount = tasks.filter(t => t.status === "done").length;
-  const urgentCount = tasks.filter(t => t.priority === "urgent" && t.status !== "done").length;
+  const { pendingCount, doneCount, urgentCount } = useMemo(() => ({
+    pendingCount: tasks.filter(t => t.status !== "done").length,
+    doneCount: tasks.filter(t => t.status === "done").length,
+    urgentCount: tasks.filter(t => t.priority === "urgent" && t.status !== "done").length,
+  }), [tasks]);
 
   return (
     <div className="card card-padded" style={fullWidth ? { marginTop: 16 } : undefined}>
@@ -2270,7 +2369,13 @@ function TasksPanel({
                 {t.patientName && (
                   <>
                     <span style={{ margin: "0 4px" }}>·</span>
-                    <button onClick={() => onAction?.(`view-patient:${t.patientId}`)} style={{ color: "var(--accent)", background: "none", border: "none", padding: 0, font: "inherit", cursor: "pointer" }}>
+                    <button onClick={() => {
+                      if (!canOpenPatientProfile) {
+                        handleDeniedAccess("view", "patient profile");
+                        return;
+                      }
+                      onAction?.(`view-patient:${t.patientId}`);
+                    }} style={{ color: "var(--accent)", background: "none", border: "none", padding: 0, font: "inherit", cursor: "pointer" }}>
                       {t.patientName}
                     </button>
                   </>
@@ -2348,24 +2453,15 @@ function QueueActions({
   const next = NEXT_STATUS[status];
   const btnSm: React.CSSProperties = { fontSize: "var(--font-xs)", padding: "5px 10px", minHeight: 32 };
 
-  // Role-based permissions
-  const canCheckIn = userRole === "admin" || userRole === "receptionist";
-  const canStartConsult = userRole === "admin" || userRole === "doctor";
-  const canSendToBilling = userRole === "admin" || userRole === "receptionist";
-  const canMarkPaid = userRole === "admin" || userRole === "receptionist";
-  const canNoShow = userRole === "admin" || userRole === "receptionist";
-  const canCancel = userRole === "admin" || userRole === "receptionist";
-  const canReschedule = userRole === "admin" || userRole === "receptionist";
-
-  // Label for the forward action button
-  const forwardLabel: Partial<Record<QueueStatus, string>> = {
-    "scheduled":       "Check In",
-    "checked-in":      "Start Consult",
-    "waiting":         "Start Consult",
-    "with-doctor":     "Send to Billing",
-    "billing-pending": "Mark Paid & Done",
-    "no-show":         "Reschedule",
-  };
+  // Role-based permissions - using normalizedRole for consistency
+  const normalizedUser = normalizeRole(userRole) as "admin" | "doctor" | "nurse" | "receptionist" | "billing" | "auditor" | "readonly";
+  const canCheckIn = hasRole(normalizedUser, ["admin", "receptionist"]);
+  const canStartConsult = hasRole(normalizedUser, ["admin", "doctor"]);
+  const canSendToBilling = hasRole(normalizedUser, ["admin", "receptionist"]);
+  const canMarkPaid = hasRole(normalizedUser, ["admin", "receptionist"]);
+  const canNoShow = hasRole(normalizedUser, ["admin", "receptionist"]);
+  const canCancel = hasRole(normalizedUser, ["admin", "receptionist"]);
+  const canReschedule = hasRole(normalizedUser, ["admin", "receptionist"]);
 
   // Permission check for forward action
   const canDoForward = (() => {
@@ -2386,15 +2482,15 @@ function QueueActions({
 
   return (
     <div style={{ display: "flex", gap: 4, flexWrap: "nowrap" }}>
-      {next && forwardLabel[status] && canDoForward && (
-        <button 
-          className="btn btn-primary" 
-          style={btnSm} 
+      {next && FORWARD_LABEL[status] && canDoForward && (
+        <button
+          className="btn btn-primary"
+          style={btnSm}
           onClick={() => onTransition(next)}
           disabled={!canDoForward}
           title={!canDoForward ? "Your role doesn't have permission for this action" : undefined}
         >
-          {forwardLabel[status]}
+          {FORWARD_LABEL[status]}
         </button>
       )}
       {(status === "scheduled" || status === "checked-in" || status === "waiting") && (
